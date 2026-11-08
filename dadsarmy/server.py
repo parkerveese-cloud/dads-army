@@ -32,7 +32,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -1022,11 +1022,16 @@ def main():
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
     print("Dads Army %s - reporting for duty" % VERSION, flush=True)
     print("  Data:  %s" % DB_PATH, flush=True)
-    print("  Local: http://localhost:%d" % PORT, flush=True)
-    host = socket.gethostname()
-    print("  Phone: http://%s.local:%d" % (host, PORT), flush=True)
-    for ip in local_addresses():
-        print("         http://%s:%d" % (ip, PORT), flush=True)
+    if os.environ.get("DADSARMY_HOMEASSISTANT"):
+        # Inside a container the hostname and IPs are internal, so don't print them.
+        print("  Open:  Dads Army in the Home Assistant sidebar,", flush=True)
+        print("         or http://<home-assistant-address>:%d on your home network" % PORT, flush=True)
+    else:
+        print("  Local: http://localhost:%d" % PORT, flush=True)
+        host = socket.gethostname()
+        print("  Phone: http://%s.local:%d" % (host, PORT), flush=True)
+        for ip in local_addresses():
+            print("         http://%s:%d" % (ip, PORT), flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

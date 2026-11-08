@@ -12,6 +12,7 @@ COPY static /app/static
 # and is included in Home Assistant backups.
 ENV DADSARMY_DATA=/data \
     DADSARMY_PORT=8080 \
+    DADSARMY_HOMEASSISTANT=1 \
     PYTHONUNBUFFERED=1
 
 # Plain process under Docker's own init (the base image's s6 isn't needed).

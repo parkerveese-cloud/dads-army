@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1
+
+- The app's log now tells you how to open Dads Army from Home Assistant, instead of showing internal container addresses.
+
 ## 1.1.0
 
 - Installs from the Dads Army app repository, so updates arrive in **Settings → Updates** like any other app.
