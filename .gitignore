@@ -1,0 +1,10 @@
+# Your stores database and backups never go in the repository.
+data/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,3 @@
+# The Pi and Home Assistant are Linux: keep text files with Unix line endings.
+* text=auto eol=lf
+*.png binary
