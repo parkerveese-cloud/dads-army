@@ -3,7 +3,7 @@
 A stores tracker for food, water and emergency kit. It runs on a Raspberry Pi or a Home Assistant box on your home network, and it's built to be used from your phone.
 
 - **Sitrep:** how many days the household could hold out, whether food or water runs out first, what's expired or expiring soon, and what to use first.
-- **Stores:** everything you hold, grouped by category, with search and filters. Tap **−** to use one or **+** to add stock.
+- **Stores:** everything you hold, grouped by category, with search and filters. Tap **−** to use one or **+** to add stock. **Select to delete** clears out things you don't want to keep, several at a time.
 - **Batches and rotation:** the same item can have several batches with different best-before dates and locations. Using stock always takes the oldest first.
 - **Supply run:** an automatic shopping list of everything below target, plus your own extras. **Got it** puts the shopping straight into the stores.
 - **HQ:** household size, calorie and water needs, readiness target (3 days to a year), backups, a printed hard copy, a starter list of about 95 essentials, light/dark mode, and the activity log.

@@ -41,7 +41,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -699,6 +699,44 @@ def api_item_delete(body, query, item_id):
     return {"undo": snap}
 
 
+def name_list(names, limit=8):
+    """A readable list for the log, cut short when it's long."""
+    names = list(names)
+    if len(names) <= limit:
+        return and_join(names)
+    return "%s and %d more" % (", ".join(names[:limit]), len(names) - limit)
+
+
+@route("POST", "/api/items/delete")
+def api_items_delete(body, query):
+    """Delete several items at once. The undo puts them all back."""
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not ids:
+        raise ApiError(400, "Pick something to delete")
+    if len(ids) > 5000:
+        raise ApiError(400, "That's too many at once")
+    wanted = []
+    for v in ids:
+        i = as_int_id(v)
+        if i not in wanted:
+            wanted.append(i)
+    snaps = []
+    with tx() as db:
+        for item_id in wanted:
+            if not db.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone():
+                continue   # already gone (deleted on another phone)
+            snaps.append(snapshot(db, item_id))
+            db.execute("DELETE FROM items WHERE id = ?", (item_id,))
+        if not snaps:
+            raise ApiError(404, "Those items no longer exist")
+        names = [sn["item"]["name"] for sn in snaps]
+        if len(snaps) == 1:
+            add_log("removed", names[0], "Item deleted")
+        else:
+            add_log("removed", "%d items" % len(snaps), name_list(names))
+    return {"deleted": len(snaps), "name": names[0], "undo": {"many": snaps}}
+
+
 @route("POST", r"/api/items/(\d+)/stock")
 def api_stock_add(body, query, item_id):
     item_id = as_int_id(item_id)
@@ -803,37 +841,53 @@ def api_batch_delete(body, query, batch_id):
 
 @route("POST", "/api/restore-item")
 def api_restore_item(body, query):
-    """Undo: put an item and its batches back exactly as they were."""
-    item = body.get("item")
-    batches = body.get("batches")
-    if not isinstance(item, dict) or not isinstance(batches, list):
+    """Undo: put an item (or several, as {"many": [...]}) and its batches back exactly as they were."""
+    many = body.get("many")
+    if many is None:
+        snaps = [body]
+    elif isinstance(many, list) and many and len(many) <= 5000:
+        snaps = many
+    else:
         raise ApiError(400, "Nothing to restore")
+    for snap in snaps:
+        if not isinstance(snap, dict) or not isinstance(snap.get("item"), dict) or not isinstance(snap.get("batches"), list):
+            raise ApiError(400, "Nothing to restore")
+    with tx() as db:
+        names = [restore_snapshot(db, snap) for snap in snaps]
+        if len(names) == 1:
+            add_log("undo", names[0], "Change undone")
+        else:
+            add_log("undo", "%d items" % len(names), "Put back: " + name_list(names))
+    return {"ok": True, "restored": len(names)}
+
+
+def restore_snapshot(db, snap):
+    item = snap["item"]
+    batches = snap["batches"]
     item_id = as_int_id(item.get("id"))
     data = clean_item(item)
     created = clean_text(item.get("created_at"), 30) or now_iso()
-    with tx() as db:
-        exists = db.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone()
-        if exists:
-            cols = ", ".join("%s = ?" % k for k in data)
-            db.execute("UPDATE items SET %s, updated_at = ? WHERE id = ?" % cols,
-                       list(data.values()) + [now_iso(), item_id])
-        else:
-            db.execute(
-                "INSERT INTO items(id, name, category, unit, kcal_per_unit, litres_per_unit, target_qty, notes,"
-                " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (item_id, data["name"], data["category"], data["unit"], data["kcal_per_unit"],
-                 data["litres_per_unit"], data["target_qty"], data["notes"], created, now_iso()))
-        db.execute("DELETE FROM batches WHERE item_id = ?", (item_id,))
-        for b in batches:
-            if not isinstance(b, dict):
-                continue
-            q = clean_num(b.get("qty"), 0, 0, 1e7)
-            if q > 0:
-                db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
-                           (item_id, q, clean_date(b.get("expiry")), clean_text(b.get("location"), 80),
-                            clean_text(b.get("added_at"), 30) or now_iso()))
-        add_log("undo", data["name"], "Change undone")
-    return {"ok": True}
+    exists = db.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone()
+    if exists:
+        cols = ", ".join("%s = ?" % k for k in data)
+        db.execute("UPDATE items SET %s, updated_at = ? WHERE id = ?" % cols,
+                   list(data.values()) + [now_iso(), item_id])
+    else:
+        db.execute(
+            "INSERT INTO items(id, name, category, unit, kcal_per_unit, litres_per_unit, target_qty, notes,"
+            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (item_id, data["name"], data["category"], data["unit"], data["kcal_per_unit"],
+             data["litres_per_unit"], data["target_qty"], data["notes"], created, now_iso()))
+    db.execute("DELETE FROM batches WHERE item_id = ?", (item_id,))
+    for b in batches:
+        if not isinstance(b, dict):
+            continue
+        q = clean_num(b.get("qty"), 0, 0, 1e7)
+        if q > 0:
+            db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
+                       (item_id, q, clean_date(b.get("expiry")), clean_text(b.get("location"), 80),
+                        clean_text(b.get("added_at"), 30) or now_iso()))
+    return data["name"]
 
 
 @route("POST", "/api/shopping")

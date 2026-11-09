@@ -255,6 +255,13 @@ button.li { width: 100%; background: none; border-left: 0; border-right: 0; bord
 .filters { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
 .filters select { min-height: 42px; padding: 8px 10px; font-size: 15px; }
 .result-count { font-size: 13px; color: var(--muted); margin: 0 2px 8px; }
+.list-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: -4px 2px 4px; }
+.list-bar .result-count { margin: 0; }
+.list-bar .link {
+  display: inline-flex; align-items: center; gap: 5px; min-height: 40px; padding: 0 2px;
+  font-size: 14px; font-weight: 600; color: var(--olive); text-decoration: none;
+}
+.list-bar .link svg { width: 16px; height: 16px; stroke-width: 2.2; }
 
 .group-head { display: flex; align-items: center; gap: 8px; padding: 14px 16px 6px; }
 .group-head .n { color: var(--muted); font-weight: 600; }
@@ -281,6 +288,29 @@ button.li { width: 100%; background: none; border-left: 0; border-right: 0; bord
 .qbtn:active { background: var(--olive-tint); }
 .qbtn:disabled { opacity: .35; }
 .qbtn.add { background: var(--olive); border-color: var(--olive); color: var(--on-olive); }
+
+/* Picking items to delete */
+.row-main[role="checkbox"] { min-height: 44px; gap: 12px; }
+.row-main[role="checkbox"] .row-ico { margin-left: -4px; }
+.row-main[aria-checked="true"] .box { background: var(--olive); border-color: var(--olive); color: var(--on-olive); }
+.row-main[aria-checked="true"] .box svg { opacity: 1; }
+.row.picked { background: var(--olive-tint); }
+.selbar {
+  position: fixed; z-index: 40; left: 12px; right: 12px;
+  bottom: calc(var(--nav-h) + env(safe-area-inset-bottom) + 10px);
+  max-width: 520px; margin: 0 auto;
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 10px 10px 16px; border-radius: 16px;
+  background: var(--surface); border: 1px solid var(--line-strong);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .22);
+  animation: rise-sm .2s ease;
+}
+.selbar-n { flex: 1; font-size: 15px; color: var(--ink-2); }
+.selbar-n b { color: var(--ink); font-size: 17px; }
+.btn.del { background: var(--bad); border-color: var(--bad); color: var(--surface); }
+.btn.del:disabled { opacity: .4; }
+body.selecting { padding-bottom: calc(var(--nav-h) + env(safe-area-inset-bottom) + 96px); }
+body.selecting .toast { bottom: calc(var(--nav-h) + env(safe-area-inset-bottom) + 84px); }
 
 .badge {
   display: inline-flex; align-items: center; gap: 3px;

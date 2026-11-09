@@ -50,6 +50,7 @@
   var view = 'sitrep';
   var offline = false;
   var F = { q: '', cat: 'all', show: 'all', sort: 'category' };   // Stores filters
+  var SEL = null;               // Stores: ids picked for deleting ({id: 1}), or null when not picking
   var stack = [];               // open bottom sheets
   var toastTimer = null;
   var settingsQueue = {};
@@ -429,7 +430,7 @@
     ['short', 'Sort: most needed'], ['recent', 'Sort: recently changed']];
 
   function renderStores(el) {
-    if (!S.items.length) { el.dataset.view = ''; el.innerHTML = emptyCard(); return; }
+    if (!S.items.length) { endSelect(); el.dataset.view = ''; el.innerHTML = emptyCard(); return; }
     if (el.dataset.view !== 'stores' || !$('#q', el)) {
       el.dataset.view = 'stores';
       el.innerHTML =
@@ -507,11 +508,17 @@
       amount = '<b>' + fq(i.total) + '</b>' + (it.target_qty > 0 ? ' of ' + fq(it.target_qty) : '') +
         (it.unit ? ' ' + esc(plural(it.unit, it.target_qty > 0 ? it.target_qty : i.total)) : '');
     }
-    return '<div class="row' + (i.out ? ' is-out' : '') + '">' +
-      '<button class="row-main" data-act="open" data-id="' + it.id + '">' +
-      (showIcon ? '<span class="row-ico">' + cat(it.category).icon + '</span>' : '') +
+    var body = (showIcon ? '<span class="row-ico">' + cat(it.category).icon + '</span>' : '') +
       '<span class="row-text"><span class="row-name">' + esc(it.name) + '</span>' +
-      '<span class="row-sub"><span>' + amount + '</span>' + (where ? '<span>· ' + esc(where) + '</span>' : '') + badges + '</span></span></button>' +
+      '<span class="row-sub"><span>' + amount + '</span>' + (where ? '<span>· ' + esc(where) + '</span>' : '') + badges + '</span></span>';
+    if (SEL) {   // picking items to delete: the whole row is a tick box
+      var on = !!SEL[it.id];
+      return '<div class="row' + (on ? ' picked' : '') + (i.out ? ' is-out' : '') + '">' +
+        '<button class="row-main" role="checkbox" aria-checked="' + on + '" data-act="sel-toggle" data-id="' + it.id + '">' +
+        '<span class="box">' + ICON.check + '</span>' + body + '</button></div>';
+    }
+    return '<div class="row' + (i.out ? ' is-out' : '') + '">' +
+      '<button class="row-main" data-act="open" data-id="' + it.id + '">' + body + '</button>' +
       '<div class="row-ctl">' +
       '<button class="qbtn" data-act="use" data-id="' + it.id + '" aria-label="Use one ' + esc(it.name) + '"' + (i.out ? ' disabled' : '') + '>' + ICON.minus + '</button>' +
       '<button class="qbtn add" data-act="stock" data-id="' + it.id + '" aria-label="Add ' + esc(it.name) + '">' + ICON.plus + '</button>' +
@@ -522,11 +529,20 @@
     var box = $('#storeList');
     if (!box) return;
     var list = filtered();
+    if (SEL) Object.keys(SEL).forEach(function (k) { if (!byId(+k)) delete SEL[k]; });   // deleted on another phone
+    var bar = SEL ? '<div class="selbar" role="region" aria-label="Delete items"><span class="selbar-n" id="selCount" aria-live="polite"></span>' +
+      '<button class="btn small" data-act="sel-cancel">Cancel</button>' +
+      '<button class="btn small del" id="selDelete" data-act="sel-delete"></button></div>' : '';
     if (!list.length) {
-      box.innerHTML = '<div class="card empty"><div class="crate">🔍</div><h2>Nothing here</h2><p>No items match that search or filter.</p><button class="btn" data-act="clear-filters">Clear filters</button></div>';
+      box.innerHTML = '<div class="card empty"><div class="crate">🔍</div><h2>Nothing here</h2><p>No items match that search or filter.</p><button class="btn" data-act="clear-filters">Clear filters</button></div>' + bar;
+      syncSel();
       return;
     }
-    var html = '<div class="result-count">' + list.length + ' item' + (list.length === 1 ? '' : 's') + '</div><div class="card flush">';
+    var html = '<div class="list-bar"><span class="result-count">' +
+      (SEL ? 'Tap the items to delete' : list.length + ' item' + (list.length === 1 ? '' : 's')) + '</span>' +
+      (SEL ? '<button class="link" id="selAll" data-act="sel-all"></button>'
+        : '<button class="link" data-act="sel-start">' + ICON.trash + ' Select to delete</button>') +
+      '</div><div class="card flush">';
     if (F.sort === 'category') {
       var cur = null;
       list.forEach(function (x) {
@@ -540,7 +556,63 @@
     } else {
       list.forEach(function (x) { html += rowHtml(x.it, x.i, true); });
     }
-    box.innerHTML = html + '</div>';
+    box.innerHTML = html + '</div>' + bar;
+    syncSel();
+  }
+
+  // Picking several items to delete at once.
+  function startSelect() {
+    SEL = {};
+    document.body.classList.add('selecting');
+    try { history.pushState({ daSel: 1 }, ''); } catch (e) { /* ignore */ }   // Back leaves picking
+  }
+  function endSelect() {
+    if (!SEL) return;
+    SEL = null;
+    document.body.classList.remove('selecting');
+    if (history.state && history.state.daSel) history.back();
+  }
+  function syncSel() {
+    if (!SEL) return;
+    $$('[data-act="sel-toggle"]').forEach(function (b) {
+      var on = !!SEL[b.dataset.id];
+      b.setAttribute('aria-checked', String(on));
+      b.parentNode.classList.toggle('picked', on);
+    });
+    var shown = filtered();
+    var all = shown.length && shown.every(function (x) { return SEL[x.it.id]; });
+    var sa = $('#selAll');
+    if (sa) sa.textContent = (all ? 'Unselect all ' : 'Select all ') + shown.length;
+    var n = Object.keys(SEL).length;
+    $('#selCount').innerHTML = n ? '<b>' + n + '</b> picked' : 'None picked';
+    var del = $('#selDelete');
+    del.disabled = !n;
+    del.innerHTML = ICON.trash + ' Delete' + (n ? ' ' + n : '');
+  }
+  function nameList(names, limit) {
+    var more = names.length - limit;
+    if (more > 0) return names.slice(0, limit).join(', ') + ' and ' + more + ' more';
+    return names.length < 2 ? names.join('') : names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1];
+  }
+  function deletePicked(btn) {
+    var picked = S.items.filter(function (it) { return SEL && SEL[it.id]; }).sort(byName);
+    if (!picked.length) return;
+    var stocked = picked.filter(function (it) { return total(it) > 0; });
+    var msg = picked.length === 1 ? 'Delete ' + picked[0].name + ' from the stores?'
+      : 'Delete these ' + picked.length + ' items from the stores?\n\n' + nameList(picked.map(function (it) { return it.name; }), 12) + '.';
+    if (stocked.length) {
+      msg += '\n\n' + (picked.length === 1 ? 'Its stock is deleted too: ' : 'Their stock is deleted too: ') +
+        nameList(stocked.map(function (it) { return it.name + ' (' + qu(total(it), it.unit) + ')'; }), 6) + '.';
+    }
+    if (!confirm(msg + '\n\nYou can undo this straight afterwards.')) return;
+    return run(function () {
+      return api('POST', 'api/items/delete', { ids: picked.map(function (it) { return it.id; }) }).then(function (res) {
+        endSelect();
+        return refresh().then(function () {
+          toast(res.deleted === 1 ? 'Deleted ' + res.name : 'Deleted ' + res.deleted + ' items', { undo: res.undo, ms: 10000 });
+        });
+      });
+    }, btn);
   }
 
   // ------------------------------------------------------------------
@@ -685,7 +757,7 @@
 
     html += '<section class="card"><div class="card-head"><h2>Starter list</h2></div>' +
       '<p class="small muted">Adds about 95 suggested essentials at zero stock, with targets sized for your household and ' + target + '-day goal. ' +
-      'Anything you already have is skipped, and you can delete what you don\'t need.</p>' +
+      'Anything you already have is skipped. To clear out what you don\'t need, use <b>Select to delete</b> in Stores.</p>' +
       '<button class="btn block" data-act="seed">Load starter list</button></section>';
 
     html += haCard();
@@ -805,6 +877,7 @@
   }
   window.addEventListener('popstate', function () {
     if (stack.length) { stack.pop(); showSheet(true); }
+    else if (SEL) { endSelect(); renderStoreList(); }
   });
   function showSheet(resetScroll) {
     var root = $('#sheet-root');
@@ -990,7 +1063,7 @@
     t.hidden = false;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(function () { t.hidden = true; t._undo = null; },
-      opts.undo ? 6500 : opts.error ? Math.max(5000, msg.length * 60) : 2600);
+      opts.ms || (opts.undo ? 6500 : opts.error ? Math.max(5000, msg.length * 60) : 2600));
   }
 
   // ------------------------------------------------------------------
@@ -1054,6 +1127,25 @@
           });
         }, a);
       }
+      case 'sel-start':
+        startSelect();
+        return renderStoreList();
+      case 'sel-cancel':
+        endSelect();
+        return renderStoreList();
+      case 'sel-toggle':
+        if (!SEL) return;
+        if (SEL[id]) delete SEL[id]; else SEL[id] = 1;
+        return syncSel();
+      case 'sel-all': {
+        if (!SEL) return;
+        var shown = filtered();
+        var every = shown.every(function (x) { return SEL[x.it.id]; });
+        shown.forEach(function (x) { if (every) delete SEL[x.it.id]; else SEL[x.it.id] = 1; });
+        return syncSel();
+      }
+      case 'sel-delete':
+        return deletePicked(a);
       case 'del-batch':
         return run(function () {
           return api('DELETE', 'api/batches/' + id).then(function (res) {
@@ -1080,7 +1172,7 @@
         F.q = ''; F.cat = 'all'; F.show = 'all';
         return renderStores($('#view'));
       case 'seed':
-        if (!confirm('Load the starter list?\n\nAbout 95 suggested essentials are added at zero stock, with targets sized for your household. You can delete anything you don\'t need.')) return;
+        if (!confirm('Load the starter list?\n\nAbout 95 suggested essentials are added at zero stock, with targets sized for your household. To clear out anything you don\'t need, use Select to delete in Stores.')) return;
         return run(function () {
           return api('POST', 'api/seed', {}).then(function (res) {
             return refresh().then(function () {
@@ -1232,6 +1324,7 @@
   function setView(v) {
     if (VIEWS.indexOf(v) < 0) v = 'sitrep';
     var changed = view !== v;
+    if (v !== 'stores') endSelect();
     view = v;
     document.body.dataset.view = v;
     render();
@@ -1302,7 +1395,9 @@
   });
 
   document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape' && stack.length) closeSheet();
+    if (e.key !== 'Escape') return;
+    if (stack.length) closeSheet();
+    else if (SEL) { endSelect(); renderStoreList(); }
   });
 
   window.addEventListener('hashchange', function () { setView(location.hash.slice(1)); });
