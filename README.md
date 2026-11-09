@@ -29,6 +29,15 @@ You can then open it in two ways:
 - **Dads Army** in the Home Assistant sidebar. This also works in the Companion app.
 - `http://<home-assistant-address>:8080` in your phone's browser. Use **Add to Home Screen** to give it its own app icon.
 
+**Dashboard:** Dads Army publishes `sensor.dads_army_*` entities to Home Assistant, covering:
+
+- hold-out days
+- out of stock and running low
+- expired and expiring soon
+- the supply run
+
+You can use them on dashboards, in automations and in Companion app widgets. A ready-made dashboard card is on the app's **Documentation** tab (see [DOCS.md](dadsarmy/DOCS.md)). Outside Home Assistant, `GET /api/summary` returns the same figures as JSON.
+
 **Updates** appear in **Settings → Updates**, like any other app. Home Assistant shows what's changed and can take a backup before updating. Your data is kept, and it's included in your Home Assistant backups.
 
 ## Install on Raspberry Pi OS

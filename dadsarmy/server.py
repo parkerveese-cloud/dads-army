@@ -14,6 +14,10 @@ Environment variables (all optional):
     DADSARMY_HOST          address to bind                (default 0.0.0.0 = whole home network)
     DADSARMY_DATA          folder for database + backups  (default ./data)
     DADSARMY_KEEP_BACKUPS  daily backups to keep          (default 14)
+
+Running as a Home Assistant app, it also publishes sensor.dads_army_* entities
+(hold-out days, out of stock, running low, expired, expiring soon and more).
+GET /api/summary returns the same figures as JSON for anything else.
 """
 import csv
 import datetime as dt
@@ -29,10 +33,12 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -363,6 +369,49 @@ def fq(q):
     return ("%.3f" % q).rstrip("0").rstrip(".")
 
 
+# Same wording as the phone app (static/app.js: plural, qu, span, expiryWords).
+NO_PLURAL = {"each", "kg", "g", "ml", "l", "kcal", "oz", "lb", "lbs", "cl"}
+
+
+def plural(unit, q):
+    if (not unit or q == 1 or unit.lower() in NO_PLURAL or not re.match(r"^[a-z]+$", unit, re.I)
+            or len(unit) < 3 or unit.lower().endswith("s")):
+        return unit
+    if re.search(r"(x|ch|sh)$", unit, re.I):
+        return unit + "es"
+    if re.search(r"[^aeiou]y$", unit, re.I):
+        return unit[:-1] + "ies"
+    return unit + "s"
+
+
+def qu(q, unit):
+    if unit in ("£", "$", "€"):
+        return unit + fq(q)
+    return "%s %s" % (fq(q), plural(unit, q)) if unit else fq(q)
+
+
+def _round(x):
+    return int(math.floor(x + 0.5))
+
+
+def span(n):
+    if n < 14:
+        return "%d day%s" % (n, "" if n == 1 else "s")
+    if n < 60:
+        return "%d weeks" % _round(n / 7.0)
+    if n < 730:
+        return "%d months" % _round(n / 30.44)
+    return "%s years" % fq(round(n / 365.25, 1))
+
+
+def expiry_words(days):
+    if days < 0:
+        return "Expired %s ago" % span(-days)
+    if days == 0:
+        return "Expires today"
+    return "%s left" % span(days)
+
+
 def as_int_id(value):
     try:
         return int(value)
@@ -398,6 +447,122 @@ def all_items():
     for it in items:
         it["batches"] = by_item.get(it["id"], [])
     return items
+
+
+LIST_LIMIT = 30  # longest list sent to Home Assistant, to keep its database lean
+
+
+def _num(x):
+    """3.0 -> 3, 2.5 -> 2.5 (tidier in dashboards)."""
+    x = round(float(x), 3)
+    return int(x) if x == int(x) else x
+
+
+def _days(x):
+    """Round days down to one decimal, like the app: never overstate how long you'd last."""
+    return _num(min(9999.0, math.floor(x * 10) / 10.0))
+
+
+def _days_until(ymd, today):
+    try:
+        return (dt.date(int(ymd[0:4]), int(ymd[5:7]), int(ymd[8:10])) - today).days
+    except (TypeError, ValueError):
+        return None
+
+
+def summary():
+    """What matters at a glance: the same figures the Sitrep screen shows."""
+    today = dt.date.today()
+    with LOCK:
+        st = get_settings()
+        items = all_items()
+        extras = [r["text"] for r in DB.execute("SELECT text FROM shopping WHERE done = 0 ORDER BY id")]
+    warn = st["warn_days"]
+    people = st["adults"] + st["children"]
+    kcal_day = st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]
+    water_day = people * st["water_per_person"]
+    kcal = litres = 0.0
+    kit_n, kit_sum = 0, 0.0
+    low, out, expired, soon, upcoming = [], [], [], [], []
+
+    for it in items:
+        unit, cat = it["unit"] or "", it["category"]
+        total = sum(b["qty"] for b in it["batches"])
+        target = it["target_qty"] or 0
+        food = cat == "food" and (it["kcal_per_unit"] or 0) > 0
+        water = cat == "water" and (it["litres_per_unit"] or 0) > 0
+        dated = []
+        for b in it["batches"]:
+            d = _days_until(b["expiry"], today) if b["expiry"] else None
+            fresh = d is None or d >= 0
+            if food and fresh:
+                kcal += b["qty"] * it["kcal_per_unit"]
+            if water and fresh:
+                litres += b["qty"] * it["litres_per_unit"]
+            if d is not None and b["qty"] > 0:
+                dated.append((d, b))
+                if d >= 0:
+                    upcoming.append((d, it, b))
+
+        if target > 0 and cat not in ("food", "water"):
+            kit_n += 1
+            kit_sum += min(1.0, total / target)
+        if target > 0 and total < target:
+            get = round(target - total, 3)
+            entry = {"name": it["name"], "category": cat, "have": _num(total), "target": _num(target),
+                     "unit": unit, "get": _num(get),
+                     "text": "Get %s" % qu(get, unit) + (" · have %s of %s" % (fq(total), fq(target))
+                                                          if total > 0 else "")}
+            (out if total <= 0 else low).append((total / target, entry))
+
+        # Like the app, an item's expiry state comes from its soonest-dated batch.
+        if dated:
+            d0, b0 = min(dated, key=lambda x: (x[0], x[1]["id"]))
+            if d0 < 0:
+                hit, bucket = [b for d, b in dated if d < 0], expired
+            elif d0 <= warn:
+                hit, bucket = [b for d, b in dated if 0 <= d <= warn], soon
+            else:
+                hit, bucket = None, None
+            if hit:
+                qty = sum(b["qty"] for b in hit)
+                bits = [qu(qty, unit), expiry_words(d0)] + ([b0["location"]] if b0["location"] else [])
+                bucket.append((d0, {"name": it["name"], "category": cat, "qty": _num(qty), "unit": unit,
+                                    "expiry": b0["expiry"], "days": d0, "location": b0["location"] or "",
+                                    "text": " · ".join(bits)}))
+
+    food_days = kcal / kcal_day if kcal_day > 0 else 0.0
+    water_days = litres / water_day if water_day > 0 else 0.0
+    hold = min(food_days, water_days)
+    upcoming.sort(key=lambda x: (x[0], x[1]["name"].lower()))
+    nxt = None
+    if upcoming:
+        d, it, b = upcoming[0]
+        nxt = {"name": it["name"], "date": b["expiry"], "days": d, "qty": _num(b["qty"]), "unit": it["unit"] or "",
+               "location": b["location"] or "", "text": "%s · %s" % (qu(b["qty"], it["unit"] or ""), expiry_words(d))}
+
+    def ordered(rows):
+        return [e for _, e in sorted(rows, key=lambda r: (r[0], r[1]["name"].lower()))]
+
+    return {
+        "version": VERSION,
+        "date": today.isoformat(),
+        "people": people,
+        "target_days": st["target_days"],
+        "warn_days": warn,
+        "hold_out_days": _days(hold),
+        "food_days": _days(food_days),
+        "water_days": _days(water_days),
+        "runs_out_first": "food" if food_days < water_days else "water" if water_days < food_days else "",
+        "kit_stocked_pct": _round(100.0 * kit_sum / kit_n) if kit_n else 0,
+        "items_total": len(items),
+        "out_of_stock": ordered(out),
+        "low_stock": ordered(low),
+        "expired": ordered(expired),
+        "expiring_soon": ordered(soon),
+        "next_expiry": nxt,
+        "supply_run": {"below_target": ordered(out) + ordered(low), "extras": extras},
+    }
 
 
 def get_item(db, item_id):
@@ -449,6 +614,11 @@ def api_state(body, query):
             "server": {"version": VERSION, "time": now_iso(), "last_backup": LAST_BACKUP["at"],
                        "backup_dir": BACKUP_DIR},
         }
+
+
+@route("GET", "/api/summary")
+def api_summary(body, query):
+    return summary()
 
 
 @route("POST", "/api/items")
@@ -862,6 +1032,125 @@ def backup_loop():
 
 
 # --------------------------------------------------------------------------
+# Home Assistant sensors (only when running as a Home Assistant app)
+# --------------------------------------------------------------------------
+HA_TOKEN = os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HASSIO_TOKEN") or ""
+HA_API = os.environ.get("DADSARMY_HA_API", "http://supervisor/core/api").rstrip("/")
+HA_WAKE = threading.Event()
+HA_LAST = {}  # entity_id -> last body sent
+
+
+def ha_call(method, path, body=None, timeout=10):
+    """Call Home Assistant's REST API through the Supervisor. Returns the HTTP status."""
+    req = urllib.request.Request(
+        HA_API + path, method=method,
+        data=None if body is None else json.dumps(body).encode("utf-8"),
+        headers={"Authorization": "Bearer " + HA_TOKEN, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            r.read()
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def _ha_list(rows):
+    return {"items": rows[:LIST_LIMIT], "total": len(rows), "more": max(0, len(rows) - LIST_LIMIT)}
+
+
+def ha_entities(s):
+    """Turn a summary() into Home Assistant entity states."""
+    ents = {}
+
+    def put(eid, state, name, icon, unit=None, attrs=None, measurement=True, device_class=None):
+        a = {"friendly_name": name, "icon": icon}
+        if unit:
+            a["unit_of_measurement"] = unit
+        if measurement:
+            a["state_class"] = "measurement"
+        if device_class:
+            a["device_class"] = device_class
+        a.update(attrs or {})
+        ents[eid] = {"state": str(state), "attributes": a}
+
+    put("sensor.dads_army_hold_out", s["hold_out_days"], "Dads Army hold-out", "mdi:shield-home", "days", {
+        "food_days": s["food_days"], "water_days": s["water_days"], "runs_out_first": s["runs_out_first"],
+        "target_days": s["target_days"], "target_met": s["hold_out_days"] >= s["target_days"],
+        "people": s["people"]})
+    put("sensor.dads_army_food_days", s["food_days"], "Dads Army food", "mdi:food-drumstick", "days")
+    put("sensor.dads_army_water_days", s["water_days"], "Dads Army water", "mdi:water", "days")
+    put("sensor.dads_army_kit_stocked", s["kit_stocked_pct"], "Dads Army kit stocked", "mdi:toolbox", "%")
+    put("sensor.dads_army_out_of_stock", len(s["out_of_stock"]), "Dads Army out of stock",
+        "mdi:package-variant-remove", "items", _ha_list(s["out_of_stock"]))
+    put("sensor.dads_army_low_stock", len(s["low_stock"]), "Dads Army running low", "mdi:package-down", "items",
+        dict(_ha_list(s["low_stock"]), below_target_total=len(s["low_stock"]) + len(s["out_of_stock"])))
+    put("sensor.dads_army_expired", len(s["expired"]), "Dads Army expired", "mdi:calendar-remove", "items",
+        _ha_list(s["expired"]))
+    put("sensor.dads_army_expiring_soon", len(s["expiring_soon"]), "Dads Army expiring soon", "mdi:calendar-alert",
+        "items", dict(_ha_list(s["expiring_soon"]), warn_days=s["warn_days"]))
+    nxt = s["next_expiry"]
+    put("sensor.dads_army_next_expiry", nxt["date"] if nxt else "unknown", "Dads Army next to expire",
+        "mdi:calendar-clock", attrs=nxt or {}, measurement=False, device_class="date")
+    run = s["supply_run"]
+    put("sensor.dads_army_supply_run", len(run["below_target"]) + len(run["extras"]), "Dads Army supply run",
+        "mdi:cart", "items", dict(_ha_list(run["below_target"]), extras=run["extras"][:LIST_LIMIT]))
+    reasons = []
+    if s["expired"]:
+        reasons.append("%d expired" % len(s["expired"]))
+    if s["out_of_stock"]:
+        reasons.append("%d out of stock" % len(s["out_of_stock"]))
+    put("binary_sensor.dads_army_attention", "on" if reasons else "off", "Dads Army needs attention",
+        "mdi:alert-circle" if reasons else "mdi:check-circle", attrs={"reasons": reasons},
+        measurement=False, device_class="problem")
+    return ents
+
+
+def ha_loop():
+    """Keep Home Assistant's Dads Army sensors up to date."""
+    probe = "sensor.dads_army_hold_out"
+    sent, failing, last_full = {}, False, None
+    HA_WAKE.set()  # first push straight away
+    while True:
+        HA_WAKE.wait(15 if failing else 60)
+        HA_WAKE.clear()
+        time.sleep(1)  # let a burst of changes settle
+        try:
+            ents = ha_entities(summary())
+            full = last_full is None or time.monotonic() - last_full > 1800
+            if not full and ha_call("GET", "/states/" + probe, timeout=5) == 404:
+                full = True  # Home Assistant restarted and forgot them
+            for eid, body in ents.items():
+                payload = json.dumps(body, sort_keys=True)
+                if full or sent.get(eid) != payload:
+                    status = ha_call("POST", "/states/" + eid, body)
+                    if status not in (200, 201):
+                        raise RuntimeError("Home Assistant answered %s" % status)
+                    sent[eid] = payload
+                    HA_LAST[eid] = body
+            if full:
+                last_full = time.monotonic()
+            if failing:
+                print("Home Assistant sensors: connected again", flush=True)
+            failing = False
+        except Exception as e:
+            if not failing:
+                print("Home Assistant sensors: can't update them yet (%s). Will keep trying." % e, flush=True)
+            failing, last_full = True, None
+            sent.clear()
+
+
+def ha_mark_unavailable():
+    """On shutdown, show the sensors as unavailable rather than leaving old numbers up."""
+    for eid, body in list(HA_LAST.items()):
+        attrs = {k: v for k, v in body["attributes"].items() if k in
+                 ("friendly_name", "icon", "unit_of_measurement", "state_class", "device_class")}
+        try:
+            ha_call("POST", "/states/" + eid, {"state": "unavailable", "attributes": attrs}, timeout=2)
+        except Exception:
+            return
+
+
+# --------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------
 MIME = {
@@ -969,6 +1258,8 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 body = self.read_json() if method in ("POST", "PUT") else {}
                 result = fn(body, query, *match.groups())
+                if method != "GET":
+                    HA_WAKE.set()  # something changed: refresh the Home Assistant sensors
                 if isinstance(result, Raw):
                     extra = {"Cache-Control": "no-store"}
                     if result.filename:
@@ -1017,6 +1308,8 @@ def main():
         sys.exit("Dads Army needs Python 3.7 or newer")
     init_db()
     threading.Thread(target=backup_loop, name="backups", daemon=True).start()
+    if HA_TOKEN:
+        threading.Thread(target=ha_loop, name="homeassistant", daemon=True).start()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     httpd.daemon_threads = True
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
@@ -1038,6 +1331,8 @@ def main():
         pass
     finally:
         httpd.server_close()
+        if HA_TOKEN:
+            ha_mark_unavailable()
         with LOCK:
             DB.close()
         print("Dismissed.", flush=True)

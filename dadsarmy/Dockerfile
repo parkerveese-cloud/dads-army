@@ -1,8 +1,8 @@
 ARG BUILD_FROM=ghcr.io/home-assistant/aarch64-base:3.23
 FROM ${BUILD_FROM}
 
-# Python's standard library is all Dads Army needs.
-RUN apk add --no-cache python3
+# Python's standard library is all Dads Army needs (tzdata so "today" is your local date).
+RUN apk add --no-cache python3 tzdata
 
 WORKDIR /app
 COPY server.py /app/server.py
