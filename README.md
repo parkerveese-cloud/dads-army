@@ -29,14 +29,23 @@ You can then open it in two ways:
 - **Dads Army** in the Home Assistant sidebar. This also works in the Companion app.
 - `http://<home-assistant-address>:8080` in your phone's browser. Use **Add to Home Screen** to give it its own app icon.
 
-**Dashboard:** Dads Army publishes `sensor.dads_army_*` entities to Home Assistant, covering:
+**Working with Home Assistant:**
 
-- hold-out days
-- out of stock and running low
-- expired and expiring soon
-- the supply run
+- **Dashboard.** Dads Army publishes `sensor.dads_army_*` entities to Home Assistant, covering:
+  - readiness against your target
+  - hold-out days
+  - out of stock and running low
+  - expired and expiring soon
+  - the supply run
 
-You can use them on dashboards, in automations and in Companion app widgets. A ready-made dashboard card is on the app's **Documentation** tab (see [DOCS.md](dadsarmy/DOCS.md)). Outside Home Assistant, `GET /api/summary` returns the same figures as JSON.
+  You can use them on dashboards, in automations and in Companion app widgets. A ready-made dashboard card is on the app's **Documentation** tab.
+- **Phone alerts.** Two blueprints in [blueprints/automation](blueprints/automation) send notifications to your phone:
+  - when something runs out
+  - each morning, anything that went out of date overnight
+  - a weekly round-up of what to use first
+- **To-do list.** The supply run can stay in step with a Home Assistant to-do list. You can tick things off there and add to it by voice. Turn it on in **HQ → Home Assistant**.
+
+The details are in [DOCS.md](dadsarmy/DOCS.md). Outside Home Assistant, `GET /api/summary` returns the same figures as JSON.
 
 **Updates** appear in **Settings → Updates**, like any other app. Home Assistant shows what's changed and can take a backup before updating. Your data is kept, and it's included in your Home Assistant backups.
 

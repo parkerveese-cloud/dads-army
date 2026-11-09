@@ -411,7 +411,7 @@
   }
 
   var LOG_VERB = { added: 'Added', stocked: 'Stocked', used: 'Used', adjusted: 'Adjusted', edited: 'Edited', removed: 'Deleted',
-    undo: 'Undone', starter: 'Starter list', restored: 'Restored', settings: 'Settings' };
+    undo: 'Undone', starter: 'Starter list', restored: 'Restored', settings: 'Settings', supply: 'Supply run' };
   function logHtml(entries) {
     return entries.map(function (l) {
       return '<div class="log-item"><span class="log-dot ' + esc(l.action) + '"></span><div class="log-text"><b>' +
@@ -556,8 +556,11 @@
     var short = shortList();
     var todo = S.shopping.filter(function (s) { return !s.done; }).length;
     var done = S.shopping.length - todo;
+    var ha = S.server.ha && S.server.ha.todo ? S.server.ha : null;
+    var ticked = ha ? ha.ticked || [] : [];
     var html = '<section class="card"><div class="card-head"><h2>Supply run</h2><span class="small muted">' + (short.length + todo) + ' to get</span></div>' +
-      '<p class="small muted">Everything below target, plus anything you add. Back from the shops? Tap <b>Got it</b> to put it in the stores.</p>' +
+      '<p class="small muted">Everything below target, plus anything you add. Back from the shops? Tap <b>Got it</b> to put it in the stores.' +
+      (ha ? ' It\'s also on your Home Assistant list <b>' + esc(ha.todo_name) + '</b>.' : '') + '</p>' +
       '<div class="btn-row"><button class="btn" data-act="copy-list">' + ICON.copy + ' Copy list</button>' +
       '<button class="btn" data-act="print-list">' + ICON.print + ' Print</button></div></section>';
 
@@ -572,7 +575,8 @@
           html += '<div class="group-head">' + cat(cur).icon + ' ' + esc(cat(cur).label) + '</div>';
         }
         html += '<div class="li"><button class="li-main" data-act="open" data-id="' + x.it.id + '"><div class="li-title">' + esc(x.it.name) + '</div>' +
-          '<div class="need">Get <b>' + esc(qu(x.i.short, x.it.unit)) + '</b> · have ' + esc(fq(x.i.total)) + ' of ' + esc(fq(x.it.target_qty)) + '</div></button>' +
+          '<div class="need">Get <b>' + esc(qu(x.i.short, x.it.unit)) + '</b> · have ' + esc(fq(x.i.total)) + ' of ' + esc(fq(x.it.target_qty)) + '</div>' +
+          (ticked.indexOf(x.it.id) >= 0 ? '<span class="badge ok ha-tick">' + ICON.check + ' Ticked off in Home Assistant</span>' : '') + '</button>' +
           '<button class="btn small" data-act="stock" data-id="' + x.it.id + '" data-qty="' + x.i.short + '">Got it</button></div>';
       });
     }
@@ -684,6 +688,8 @@
       'Anything you already have is skipped, and you can delete what you don\'t need.</p>' +
       '<button class="btn block" data-act="seed">Load starter list</button></section>';
 
+    html += haCard();
+
     html += '<section class="card"><div class="card-head"><h2>Appearance</h2></div><div class="seg" role="group" aria-label="Theme">' +
       [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']].map(function (t) {
         return '<button data-act="theme" data-val="' + t[0] + '" aria-pressed="' + (theme === t[0]) + '">' + t[1] + '</button>';
@@ -693,6 +699,28 @@
       (S.log.length ? logHtml(S.log) : '<p class="small muted">Nothing yet.</p>') + '</section>';
     html += '<p class="tagline">Dads Army v' + esc(S.server.version) + ' · Don\'t panic</p>';
     el.innerHTML = html;
+  }
+
+  // Only shown when Dads Army runs as a Home Assistant app.
+  function haCard() {
+    var ha = S.server.ha;
+    if (!ha) return '';
+    var html = '<section class="card"><div class="card-head"><h2>Home Assistant</h2></div>';
+    if (!ha.todo) {
+      html += '<p class="small muted">Put the supply run on a Home Assistant to-do list. Tick things off there, and add to it from anywhere, ' +
+        'including by voice: <i>“Add matches to the supply run list”</i>.</p>' +
+        '<div class="btn-stack"><button class="btn primary block" data-act="ha-make">' + ICON.list + ' Make a “Supply run” list</button>' +
+        '<button class="btn block" data-act="ha-pick">Use a list I already have…</button></div>';
+    } else {
+      var state = ha.ok === false ? pill('bad', 'Not syncing') : ha.ok ? pill('good', 'In step') : pill('warn', 'Starting');
+      html += '<div class="ha-link"><div class="li-main"><span class="li-title">' + esc(ha.todo_name) + '</span>' +
+        '<span class="small muted">' + esc(ha.todo) + (ha.synced_at ? ' · checked ' + esc(ago(ha.synced_at)) : '') + '</span></div>' + state + '</div>' +
+        (ha.ok === false && ha.error ? '<p class="small ha-error">' + esc(ha.error) + '</p>' : '') +
+        '<p class="small muted">Everything on the supply run is on that list. Tick extras off on either side. ' +
+        'Tick off a below-target item there and it\'s marked here, ready to put away with <b>Got it</b>.</p>' +
+        '<div class="btn-row"><button class="btn" data-act="ha-pick">Change list</button><button class="btn" data-act="ha-stop">Stop syncing</button></div>';
+    }
+    return html + '<p class="small muted" style="margin:12px 0 0">For dashboard cards and phone alerts, open the app\'s <b>Documentation</b> tab in Home Assistant.</p></section>';
   }
 
   function queueSetting(key, value) {
@@ -799,7 +827,7 @@
     var s = stack[stack.length - 1];
     if (!s) return;
     var html = {
-      item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText
+      item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText, halists: sheetHaLists
     }[s.type](s);
     if (html === null) {   // the item was deleted elsewhere
       closeSheet();
@@ -932,6 +960,24 @@
       '<textarea readonly rows="12" style="font-family:ui-monospace,monospace;font-size:14px">' + esc(s.text) + '</textarea>';
   }
 
+  function sheetHaLists(s) {
+    var d = s.data, body;
+    var current = S.server.ha ? S.server.ha.todo : '';
+    if (!d) body = '<p class="small muted">Asking Home Assistant…</p>';
+    else if (d.error) body = '<p class="small ha-error">' + esc(d.error) + '</p>';
+    else if (!d.lists.length) body = '<p class="small muted">Home Assistant hasn\'t got any to-do lists yet. Close this and use <b>Make a “Supply run” list</b> instead.</p>';
+    else {
+      body = '<p class="small muted">Best to pick a list just for Dads Army. Whatever is on it now is left alone. Anything added to it later goes on the supply run.</p><div class="list">' +
+        d.lists.map(function (l) {
+          var on = l.entity_id === current;
+          return '<div class="li"><button class="li-main" data-act="ha-use" data-entity="' + esc(l.entity_id) + '" data-name="' + esc(l.name) + '">' +
+            '<span class="li-title">' + esc(l.name) + '</span><span class="small muted">' + esc(l.entity_id) + '</span></button>' +
+            (on ? '<span class="badge ok">' + ICON.check + ' In use</span>' : '') + '</div>';
+        }).join('') + '</div>';
+    }
+    return sheetHead('Choose a to-do list', 'From Home Assistant', '📋') + body;
+  }
+
   // ------------------------------------------------------------------
   // Toast + undo
   // ------------------------------------------------------------------
@@ -943,7 +989,8 @@
     t._undo = opts.undo || null;
     t.hidden = false;
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () { t.hidden = true; t._undo = null; }, opts.undo ? 6500 : opts.error ? 5000 : 2600);
+    toastTimer = setTimeout(function () { t.hidden = true; t._undo = null; },
+      opts.undo ? 6500 : opts.error ? Math.max(5000, msg.length * 60) : 2600);
   }
 
   // ------------------------------------------------------------------
@@ -1073,6 +1120,35 @@
         return run(function () { return api('DELETE', 'api/shopping/' + id).then(refresh); }, a);
       case 'shop-clear':
         return run(function () { return api('POST', 'api/shopping/clear-done', {}).then(refresh); }, a);
+      case 'ha-make':
+        return run(function () {
+          toast('Making the list in Home Assistant…');
+          return api('POST', 'api/homeassistant/todo-list', {}).then(refresh).then(function () {
+            toast('The supply run is now on your Home Assistant list “' + S.server.ha.todo_name + '”');
+          });
+        }, a);
+      case 'ha-pick': {
+        var sh = { type: 'halists', data: null };
+        openSheet(sh);
+        return api('GET', 'api/homeassistant').then(function (d) { sh.data = d; }, function (e) {
+          sh.data = { error: e.message, lists: [] };
+        }).then(function () { if (stack[stack.length - 1] === sh) renderSheet(); });
+      }
+      case 'ha-use': {
+        var name = a.dataset.name;
+        if (S.server.ha && S.server.ha.todo === a.dataset.entity) return closeSheet();
+        return run(function () {
+          return api('PUT', 'api/homeassistant', { todo_list: a.dataset.entity }).then(function () {
+            closeSheet();
+            return refresh().then(function () { toast('The supply run is now on “' + name + '”'); });
+          });
+        }, a);
+      }
+      case 'ha-stop':
+        if (!confirm('Stop putting the supply run on “' + S.server.ha.todo_name + '”?\n\nDads Army takes its below-target items off that list. Your extras stay on it.')) return;
+        return run(function () {
+          return api('PUT', 'api/homeassistant', { todo_list: '' }).then(refresh).then(function () { toast('Stopped syncing'); });
+        }, a);
     }
   }
 

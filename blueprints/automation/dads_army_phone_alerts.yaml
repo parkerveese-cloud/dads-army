@@ -1,0 +1,127 @@
+blueprint:
+  name: "Dads Army: phone alerts"
+  description: >-
+    Sends Dads Army news to your phone.
+
+
+    - **Run out:** straight away, when the last of something is used up.
+
+    - **Morning check:** once a day, anything that went out of date overnight,
+    and anything on its last day.
+
+
+    Needs Dads Army 1.3.0 or later, and the Home Assistant Companion app on
+    your phone. For a second phone, make a second automation from this
+    blueprint.
+  domain: automation
+  author: Parker Veese Development
+  source_url: https://github.com/parkerveese-cloud/dads-army/blob/main/blueprints/automation/dads_army_phone_alerts.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    phone:
+      name: Phone
+      description: The phone to notify. It needs the Home Assistant Companion app.
+      selector:
+        device:
+          filter:
+            - integration: mobile_app
+    run_out:
+      name: Tell me when something runs out
+      default: true
+      selector:
+        boolean: {}
+    morning:
+      name: Morning expiry check
+      description: Tell me about anything that went out of date overnight.
+      default: true
+      selector:
+        boolean: {}
+    last_day:
+      name: Include things on their last day
+      description: Their best-before date is today, so use them up.
+      default: true
+      selector:
+        boolean: {}
+    morning_time:
+      name: Time for the morning check
+      default: "08:30:00"
+      selector:
+        time: {}
+    open_path:
+      name: Open when tapped
+      description: >-
+        The page the notification opens. Leave it as it is to open Dads Army
+        from the Home Assistant sidebar.
+      default: /40ee45c0_dadsarmy
+      selector:
+        text: {}
+
+mode: queued
+max: 10
+
+triggers:
+  - trigger: event
+    event_type: dads_army_ran_out
+    id: run_out
+  - trigger: time
+    at: !input morning_time
+    id: morning
+
+variables:
+  want_run_out: !input run_out
+  want_morning: !input morning
+  want_last_day: !input last_day
+  open_path: !input open_path
+  gone_off: "{{ state_attr('sensor.dads_army_expired', 'newly_expired') or [] }}"
+  use_today: >-
+    {{ (state_attr('sensor.dads_army_expiring_soon', 'expires_today') or []) if want_last_day else [] }}
+
+conditions:
+  - condition: template
+    value_template: >-
+      {{ (trigger.id == 'run_out' and want_run_out)
+         or (trigger.id == 'morning' and want_morning and (gone_off | count + use_today | count) > 0) }}
+
+actions:
+  - choose:
+      - conditions: "{{ trigger.id == 'run_out' }}"
+        sequence:
+          - device_id: !input phone
+            domain: mobile_app
+            type: notify
+            title: "Dads Army: run out"
+            message: "{{ trigger.event.data.message }}"
+            data:
+              clickAction: "{{ open_path }}"
+              url: "{{ open_path }}"
+              group: dads-army
+              channel: Dads Army
+              notification_icon: mdi:package-variant-remove
+    default:
+      - device_id: !input phone
+        domain: mobile_app
+        type: notify
+        title: >-
+          {{ 'Dads Army: gone out of date' if gone_off | count else 'Dads Army: use it today' }}
+        message: |-
+          {%- set ns = namespace(out=[]) -%}
+          {%- for title, rows in [('Gone out of date overnight:', gone_off), ('Last day, use it up:', use_today)] -%}
+            {%- if rows | count -%}
+              {%- set ns.out = ns.out + [title] -%}
+              {%- for i in rows[:6] -%}
+                {%- set ns.out = ns.out + ['• ' ~ i.name ~ ': ' ~ i.text] -%}
+              {%- endfor -%}
+              {%- if rows | count > 6 -%}
+                {%- set ns.out = ns.out + ['…and ' ~ (rows | count - 6) ~ ' more'] -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ ns.out | join('\n') }}
+        data:
+          clickAction: "{{ open_path }}"
+          url: "{{ open_path }}"
+          tag: dads-army-morning
+          group: dads-army
+          channel: Dads Army
+          notification_icon: mdi:calendar-alert

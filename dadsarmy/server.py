@@ -15,8 +15,11 @@ Environment variables (all optional):
     DADSARMY_DATA          folder for database + backups  (default ./data)
     DADSARMY_KEEP_BACKUPS  daily backups to keep          (default 14)
 
-Running as a Home Assistant app, it also publishes sensor.dads_army_* entities
-(hold-out days, out of stock, running low, expired, expiring soon and more).
+Running as a Home Assistant app, it also:
+  - publishes sensor.dads_army_* entities (readiness, hold-out days, out of stock,
+    running low, expired, expiring soon and more)
+  - fires a dads_army_ran_out event when something runs out, for phone alerts
+  - can keep the supply run in step with a Home Assistant to-do list (HQ screen)
 GET /api/summary returns the same figures as JSON for anything else.
 """
 import csv
@@ -38,7 +41,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -110,6 +113,14 @@ CREATE TABLE IF NOT EXISTS log (
     action TEXT NOT NULL,
     item   TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT ''
+);
+-- Links between the supply run and a Home Assistant to-do list (see todo_sync).
+--   key: i:<item id> (below target), s:<shopping id> (extra), x:<uid> (not ours, left alone)
+CREATE TABLE IF NOT EXISTS ha_todo (
+    key     TEXT PRIMARY KEY,
+    uid     TEXT    NOT NULL DEFAULT '',
+    summary TEXT    NOT NULL DEFAULT '',
+    done    INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -439,6 +450,21 @@ def get_settings():
     return out
 
 
+def setting_raw(key, default=None):
+    """A stored value outside the household settings (not in backups)."""
+    row = DB.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    if not row:
+        return default
+    try:
+        return json.loads(row["value"])
+    except ValueError:
+        return default
+
+
+def set_setting_raw(db, key, value):
+    db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(value)))
+
+
 def all_items():
     items = [dict(r) for r in DB.execute("SELECT * FROM items ORDER BY name COLLATE NOCASE")]
     by_item = {}
@@ -509,7 +535,7 @@ def summary():
             kit_sum += min(1.0, total / target)
         if target > 0 and total < target:
             get = round(target - total, 3)
-            entry = {"name": it["name"], "category": cat, "have": _num(total), "target": _num(target),
+            entry = {"id": it["id"], "name": it["name"], "category": cat, "have": _num(total), "target": _num(target),
                      "unit": unit, "get": _num(get),
                      "text": "Get %s" % qu(get, unit) + (" · have %s of %s" % (fq(total), fq(target))
                                                           if total > 0 else "")}
@@ -544,12 +570,15 @@ def summary():
     def ordered(rows):
         return [e for _, e in sorted(rows, key=lambda r: (r[0], r[1]["name"].lower()))]
 
+    target_days = st["target_days"]
     return {
         "version": VERSION,
         "date": today.isoformat(),
         "people": people,
-        "target_days": st["target_days"],
+        "target_days": target_days,
         "warn_days": warn,
+        # Hold-out against the readiness target; 100 means the target is met.
+        "readiness_pct": min(100, int(math.floor(100.0 * hold / target_days))) if target_days > 0 else 0,
         "hold_out_days": _days(hold),
         "food_days": _days(food_days),
         "water_days": _days(water_days),
@@ -560,6 +589,9 @@ def summary():
         "low_stock": ordered(low),
         "expired": ordered(expired),
         "expiring_soon": ordered(soon),
+        # Best-before was yesterday, so it went out of date at midnight / it's the last day.
+        "newly_expired": ordered([r for r in expired if r[0] == -1]),
+        "expires_today": ordered([r for r in soon if r[0] == 0]),
         "next_expiry": nxt,
         "supply_run": {"below_target": ordered(out) + ordered(low), "extras": extras},
     }
@@ -612,7 +644,7 @@ def api_state(body, query):
             "settings": get_settings(),
             "log": [dict(r) for r in DB.execute("SELECT * FROM log ORDER BY id DESC LIMIT 60")],
             "server": {"version": VERSION, "time": now_iso(), "last_backup": LAST_BACKUP["at"],
-                       "backup_dir": BACKUP_DIR},
+                       "backup_dir": BACKUP_DIR, "ha": ha_status()},
         }
 
 
@@ -980,6 +1012,7 @@ def api_restore(body, query):
                 db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
                            (key, json.dumps(int(round(v)) if integer else v)))
         add_log("restored", "", "Restored %d items from backup" % len(clean_items))
+    HA_REBASE.set()  # a restore isn't things running out
     return {"items": len(clean_items)}
 
 
@@ -1032,26 +1065,58 @@ def backup_loop():
 
 
 # --------------------------------------------------------------------------
-# Home Assistant sensors (only when running as a Home Assistant app)
+# Home Assistant (only when running as a Home Assistant app)
 # --------------------------------------------------------------------------
 HA_TOKEN = os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HASSIO_TOKEN") or ""
 HA_API = os.environ.get("DADSARMY_HA_API", "http://supervisor/core/api").rstrip("/")
 HA_WAKE = threading.Event()
+HA_REBASE = threading.Event()  # set after a restore: those stock changes aren't things running out
 HA_LAST = {}  # entity_id -> last body sent
+TODO_LOCK = threading.Lock()
+TODO_STATUS = {"ok": None, "error": "", "synced_at": None, "name": ""}
+TODO_RE = re.compile(r"^todo\.[a-z0-9_]+$")
+TODO_LIST_NAME = "Supply run"
 
 
-def ha_call(method, path, body=None, timeout=10):
-    """Call Home Assistant's REST API through the Supervisor. Returns the HTTP status."""
+class HAError(Exception):
+    pass
+
+
+def ha_request(method, path, body=None, timeout=10):
+    """Call Home Assistant's REST API through the Supervisor. Returns (HTTP status, JSON or text)."""
     req = urllib.request.Request(
         HA_API + path, method=method,
         data=None if body is None else json.dumps(body).encode("utf-8"),
         headers={"Authorization": "Bearer " + HA_TOKEN, "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            r.read()
-            return r.status
+            status, raw = r.status, r.read()
     except urllib.error.HTTPError as e:
-        return e.code
+        status = e.code
+        try:
+            raw = e.read()
+        except Exception:
+            raw = b""
+    text = raw.decode("utf-8", "replace")
+    try:
+        return status, (json.loads(text) if text else None)
+    except ValueError:
+        return status, text
+
+
+def ha_call(method, path, body=None, timeout=10):
+    return ha_request(method, path, body, timeout)[0]
+
+
+def ha_service(domain, service, data, response=False, timeout=15):
+    """Run a Home Assistant action (service). Raises HAError if it fails."""
+    path = "/services/%s/%s%s" % (domain, service, "?return_response" if response else "")
+    status, out = ha_request("POST", path, data, timeout)
+    if status != 200:
+        why = out.get("message") if isinstance(out, dict) else (out or "")
+        raise HAError("%s.%s: Home Assistant answered %s%s" % (domain, service, status,
+                                                              (" - " + str(why)[:150]) if why else ""))
+    return out
 
 
 def _ha_list(rows):
@@ -1073,10 +1138,12 @@ def ha_entities(s):
         a.update(attrs or {})
         ents[eid] = {"state": str(state), "attributes": a}
 
+    target_met = s["hold_out_days"] >= s["target_days"]
+    put("sensor.dads_army_readiness", s["readiness_pct"], "Dads Army readiness", "mdi:gauge", "%", {
+        "hold_out_days": s["hold_out_days"], "target_days": s["target_days"], "target_met": target_met})
     put("sensor.dads_army_hold_out", s["hold_out_days"], "Dads Army hold-out", "mdi:shield-home", "days", {
         "food_days": s["food_days"], "water_days": s["water_days"], "runs_out_first": s["runs_out_first"],
-        "target_days": s["target_days"], "target_met": s["hold_out_days"] >= s["target_days"],
-        "people": s["people"]})
+        "target_days": s["target_days"], "target_met": target_met, "people": s["people"]})
     put("sensor.dads_army_food_days", s["food_days"], "Dads Army food", "mdi:food-drumstick", "days")
     put("sensor.dads_army_water_days", s["water_days"], "Dads Army water", "mdi:water", "days")
     put("sensor.dads_army_kit_stocked", s["kit_stocked_pct"], "Dads Army kit stocked", "mdi:toolbox", "%")
@@ -1085,9 +1152,10 @@ def ha_entities(s):
     put("sensor.dads_army_low_stock", len(s["low_stock"]), "Dads Army running low", "mdi:package-down", "items",
         dict(_ha_list(s["low_stock"]), below_target_total=len(s["low_stock"]) + len(s["out_of_stock"])))
     put("sensor.dads_army_expired", len(s["expired"]), "Dads Army expired", "mdi:calendar-remove", "items",
-        _ha_list(s["expired"]))
+        dict(_ha_list(s["expired"]), newly_expired=s["newly_expired"][:LIST_LIMIT]))
     put("sensor.dads_army_expiring_soon", len(s["expiring_soon"]), "Dads Army expiring soon", "mdi:calendar-alert",
-        "items", dict(_ha_list(s["expiring_soon"]), warn_days=s["warn_days"]))
+        "items", dict(_ha_list(s["expiring_soon"]), warn_days=s["warn_days"],
+                      expires_today=s["expires_today"][:LIST_LIMIT]))
     nxt = s["next_expiry"]
     put("sensor.dads_army_next_expiry", nxt["date"] if nxt else "unknown", "Dads Army next to expire",
         "mdi:calendar-clock", attrs=nxt or {}, measurement=False, device_class="date")
@@ -1105,17 +1173,377 @@ def ha_entities(s):
     return ents
 
 
+# -- "You've run out" events, for phone alerts ------------------------------
+def stock_levels():
+    with LOCK:
+        rows = DB.execute("SELECT i.id, i.name, i.unit, i.target_qty, IFNULL(SUM(b.qty), 0) AS total "
+                          "FROM items i LEFT JOIN batches b ON b.item_id = i.id GROUP BY i.id").fetchall()
+    return {r["id"]: dict(r) for r in rows}
+
+
+def and_join(words):
+    """['a', 'b', 'c'] -> 'a, b and c'."""
+    words = list(words)
+    if len(words) < 2:
+        return "".join(words)
+    return ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def ran_out(before, now):
+    """Event data for items that had stock last time and have none now (None if nothing ran out)."""
+    gone = sorted((now[i] for i in now if i in before and before[i]["total"] > 0 and now[i]["total"] <= 0),
+                  key=lambda r: r["name"].lower())
+    if not gone:
+        return None
+    items = [{"name": g["name"], "unit": g["unit"] or "", "target": _num(g["target_qty"] or 0),
+              "on_supply_run": (g["target_qty"] or 0) > 0} for g in gone]
+    names = [g["name"] for g in gone]
+    shown = names[:8] + (["%d more" % (len(names) - 8)] if len(names) > 8 else [])
+    if len(gone) == 1:
+        g = gone[0]
+        message = "%s has run out." % g["name"]
+        if g["target_qty"] > 0:
+            message += " It's on the supply run: get %s." % qu(g["target_qty"], g["unit"] or "")
+    else:
+        message = "%d things have run out: %s." % (len(gone), and_join(shown))
+        on_run = sum(1 for i in items if i["on_supply_run"])
+        if on_run == len(items):
+            message += " They're on the supply run."
+        elif on_run:
+            message += " The ones with a target are on the supply run."
+    return {"count": len(gone), "names": and_join(shown), "message": message, "items": items[:LIST_LIMIT]}
+
+
+# -- Supply run <-> Home Assistant to-do list ---------------------------------
+def todo_entity():
+    with LOCK:
+        return setting_raw("ha_todo_list", "") or ""
+
+
+def todo_line(e):
+    """How a below-target item reads on the to-do list, e.g. 'Bottled water (5L): 16 bottles'."""
+    return "%s: %s" % (e["name"], qu(e["get"], e["unit"]))
+
+
+def todo_items(entity):
+    out = ha_service("todo", "get_items", {"entity_id": entity, "status": ["needs_action", "completed"]},
+                     response=True)
+    try:
+        items = out["service_response"][entity]["items"]
+    except (KeyError, TypeError):
+        raise HAError("Home Assistant didn't send the list's items")
+    return [i for i in items if isinstance(i, dict) and i.get("uid")]
+
+
+def ha_status():
+    """For the app: is the supply run linked to a Home Assistant list, and how's it going?"""
+    if not HA_TOKEN:
+        return None
+    with LOCK:
+        entity = setting_raw("ha_todo_list", "") or ""
+        ticked = [int(r["key"][2:]) for r in DB.execute(
+            "SELECT key FROM ha_todo WHERE key LIKE 'i:%' AND uid != '' AND done = 1")] if entity else []
+    return {"todo": entity, "todo_name": TODO_STATUS["name"] or entity, "ok": TODO_STATUS["ok"],
+            "error": TODO_STATUS["error"], "synced_at": TODO_STATUS["synced_at"], "ticked": ticked}
+
+
+def todo_sync(entity, s):
+    """Two-way sync between the supply run and a Home Assistant to-do list.
+
+    Below-target items belong to Dads Army: they're added, renamed and removed to
+    match the stores. Ticking one off in Home Assistant shows on the supply run
+    (put it away with Got it, which asks for the date); deleting one there keeps
+    it off the list until the amount needed changes.
+    Extras ("Also get") are shared: adding, ticking, renaming or deleting on
+    either side is copied to the other. Returns True if the supply run changed.
+    """
+    status, st = ha_request("GET", "/states/" + entity, timeout=8)
+    if status == 404:
+        raise HAError("the list %s isn't in Home Assistant any more" % entity)
+    if status != 200 or not isinstance(st, dict):
+        raise HAError("Home Assistant answered %s" % status)
+    TODO_STATUS["name"] = (st.get("attributes") or {}).get("friendly_name") or entity
+    ha_items = todo_items(entity)
+    by_uid = {i["uid"]: i for i in ha_items}
+    lines = {"i:%d" % e["id"]: todo_line(e) for e in s["supply_run"]["below_target"]}
+    with LOCK:
+        extras = {r["id"]: dict(r) for r in DB.execute("SELECT id, text, done FROM shopping")}
+        tracked = {r["key"]: dict(r) for r in DB.execute("SELECT key, uid, summary, done FROM ha_todo")}
+        fresh = bool(setting_raw("ha_todo_fresh", 0))
+    linked = [t for t in tracked.values() if t["uid"] and not t["key"].startswith("x:")]
+    if len(linked) > 3 and not any(t["uid"] in by_uid for t in linked):
+        # Every linked item has gone at once: the list was emptied or made again. Start
+        # afresh rather than deleting the extras here too.
+        print("Home Assistant to-do list: %s looks new or emptied, so filling it again" % entity, flush=True)
+        tracked = {}
+
+    def done_of(i):
+        return 1 if i.get("status") == "completed" else 0
+
+    track = {}       # key -> [uid, summary as Home Assistant has it, done]
+    claimed = set()  # Home Assistant items accounted for
+    orphans = {}     # uid -> item whose Dads Army side has gone (removed unless something takes it over)
+    ha_ops = []      # (action, data) to run in Home Assistant
+    app_ops = []     # (sql, args, log text or None, item name)
+    dropped = set()  # extras deleted in Home Assistant
+
+    # 1. Everything linked last time.
+    for key, t in tracked.items():
+        kind, _, ref = key.partition(":")
+        it = by_uid.get(t["uid"]) if t["uid"] else None
+        if kind == "x":                      # was there before we linked, or already ticked: not ours
+            if it:
+                claimed.add(it["uid"])
+                track[key] = [it["uid"], "", 0]
+            continue
+        if kind == "i":
+            want = lines.get(key)
+            if it is None:                   # deleted there: stay off until the amount changes
+                if want is not None and want == t["summary"]:
+                    track[key] = ["", want, 1]
+                continue
+            claimed.add(it["uid"])
+            if want is None:                 # back up to target
+                orphans[it["uid"]] = it
+                continue
+            if it.get("summary") != want:
+                ha_ops.append(("update_item", {"item": it["uid"], "rename": want}))
+            track[key] = [it["uid"], want, done_of(it)]
+        elif kind == "s":
+            ex = extras.get(int(ref)) if ref.isdigit() else None
+            if it is None:                   # deleted there, so delete it here
+                if ex:
+                    dropped.add(ex["id"])
+                    app_ops.append(("DELETE FROM shopping WHERE id = ?", (ex["id"],),
+                                    "Removed in Home Assistant", ex["text"]))
+                continue
+            claimed.add(it["uid"])
+            if ex is None:                   # deleted or cleared here
+                orphans[it["uid"]] = it
+                continue
+            text, done = ex["text"], ex["done"]
+            ha_text, ha_done = it.get("summary") or "", done_of(it)
+            if ha_text != t["summary"] and clean_text(ha_text, 200):     # renamed there
+                if clean_text(ha_text, 200) != text:
+                    text = clean_text(ha_text, 200)
+                    app_ops.append(("UPDATE shopping SET text = ? WHERE id = ?", (text, ex["id"]), None, ""))
+            elif text != clean_text(t["summary"], 200):                   # renamed here
+                ha_ops.append(("update_item", {"item": it["uid"], "rename": text}))
+                ha_text = text
+            if ha_done != t["done"]:                                      # ticked there
+                if ha_done != done:
+                    done = ha_done
+                    app_ops.append(("UPDATE shopping SET done = ? WHERE id = ?", (done, ex["id"]),
+                                    "Ticked off in Home Assistant" if done else None, text))
+            elif done != ha_done:                                         # ticked here
+                ha_ops.append(("update_item", {"item": it["uid"],
+                                               "status": "completed" if done else "needs_action"}))
+            track[key] = [it["uid"], ha_text, done]
+
+    # 2. New lines: take over a matching item already on the list (no duplicates), or add one.
+    pool = list(orphans.values()) + [i for i in ha_items if i["uid"] not in claimed]
+
+    def adopt(text):
+        for i in pool:
+            if (i.get("summary") or "") == text:
+                pool.remove(i)
+                orphans.pop(i["uid"], None)
+                claimed.add(i["uid"])
+                return i
+        return None
+
+    adds = []
+    for key, want in lines.items():
+        if key not in track:
+            i = adopt(want)
+            if i:
+                track[key] = [i["uid"], want, done_of(i)]
+            else:
+                adds.append((key, want))
+    for sid, ex in extras.items():
+        key = "s:%d" % sid
+        if key in track or sid in dropped or ex["done"]:
+            continue
+        i = adopt(ex["text"])
+        if i:
+            if done_of(i):
+                ha_ops.append(("update_item", {"item": i["uid"], "status": "needs_action"}))
+            track[key] = [i["uid"], ex["text"], 0]
+        else:
+            adds.append((key, ex["text"]))
+
+    # 3. Whatever's left on the list: added there (becomes an extra here), or not ours.
+    imports = []
+    for i in pool:
+        if i["uid"] in orphans:
+            continue
+        text = clean_text(i.get("summary"), 200)
+        if fresh or done_of(i) or not text:
+            track["x:" + i["uid"]] = [i["uid"], "", 0]
+        else:
+            imports.append((i, text))
+
+    # 4. Bring Home Assistant up to date.
+    for action, data in ha_ops:
+        ha_service("todo", action, dict(data, entity_id=entity))
+    if orphans:
+        ha_service("todo", "remove_item", {"entity_id": entity, "item": list(orphans)})
+    for _, text in adds:
+        ha_service("todo", "add_item", {"entity_id": entity, "item": text})
+    if adds:
+        taken = claimed | set(i["uid"] for i, _ in imports) | set(k[2:] for k in track if k.startswith("x:"))
+        latest = todo_items(entity)
+        for key, text in adds:
+            for i in latest:
+                if i["uid"] not in taken and i.get("summary") == text:
+                    taken.add(i["uid"])
+                    track[key] = [i["uid"], text, 0]
+                    break
+
+    # 5. Then the supply run, and remember the links.
+    changed = bool(app_ops or imports)
+    with tx() as db:
+        for sql, args, note, name in app_ops:
+            db.execute(sql, args)
+            if note:
+                add_log("supply", name, note)
+        for i, text in imports:
+            cur = db.execute("INSERT INTO shopping(text, done, created_at) VALUES (?, 0, ?)", (text, now_iso()))
+            track["s:%d" % cur.lastrowid] = [i["uid"], i.get("summary") or "", 0]
+            add_log("supply", text, "Added in Home Assistant")
+        db.execute("DELETE FROM ha_todo")
+        db.executemany("INSERT INTO ha_todo(key, uid, summary, done) VALUES (?, ?, ?, ?)",
+                       [(k, v[0], v[1], v[2]) for k, v in track.items()])
+        if fresh:
+            set_setting_raw(db, "ha_todo_fresh", 0)
+    return changed
+
+
+def todo_tick(s):
+    entity = todo_entity()
+    if not entity:
+        return
+    with TODO_LOCK:
+        if todo_entity() != entity:
+            return
+        try:
+            changed = todo_sync(entity, s)
+        except Exception as e:
+            if not isinstance(e, (HAError, OSError)):
+                traceback.print_exc()
+            if TODO_STATUS["ok"] is not False:
+                print("Home Assistant to-do list: can't sync with %s yet (%s). Will keep trying." % (entity, e),
+                      flush=True)
+            TODO_STATUS.update(ok=False, error=str(e))
+            return
+        if TODO_STATUS["ok"] is False:
+            print("Home Assistant to-do list: syncing again", flush=True)
+        TODO_STATUS.update(ok=True, error="", synced_at=now_iso())
+    if changed:
+        HA_WAKE.set()
+
+
+def todo_link(entity):
+    """Sync the supply run with a different Home Assistant to-do list ('' to stop)."""
+    with TODO_LOCK:
+        with LOCK:
+            old = setting_raw("ha_todo_list", "") or ""
+            mine = set(r["uid"] for r in DB.execute("SELECT uid FROM ha_todo WHERE key LIKE 'i:%' AND uid != ''"))
+        if old == entity:
+            return
+        if old and mine:
+            # Take Dads Army's own lines off the old list. Extras stay: they're yours.
+            try:
+                there = [i["uid"] for i in todo_items(old) if i["uid"] in mine]
+                if there:
+                    ha_service("todo", "remove_item", {"entity_id": old, "item": there})
+            except Exception as e:
+                print("Home Assistant to-do list: couldn't tidy up %s (%s)" % (old, e), flush=True)
+        with tx() as db:
+            db.execute("DELETE FROM ha_todo")
+            set_setting_raw(db, "ha_todo_list", entity)
+            set_setting_raw(db, "ha_todo_fresh", 1 if entity else 0)
+            add_log("settings", "", ("Supply run linked to Home Assistant (%s)" % entity) if entity
+                    else "Supply run no longer linked to Home Assistant")
+        TODO_STATUS.update(ok=None, error="", synced_at=None, name="")
+
+
+def ha_todo_lists():
+    status, data = ha_request("GET", "/states", timeout=10)
+    if status != 200 or not isinstance(data, list):
+        raise HAError("Home Assistant answered %s" % status)
+    out = [{"entity_id": e["entity_id"], "name": (e.get("attributes") or {}).get("friendly_name") or e["entity_id"]}
+           for e in data if isinstance(e, dict) and str(e.get("entity_id", "")).startswith("todo.")]
+    return sorted(out, key=lambda x: x["name"].lower())
+
+
+MAKE_LIST_HELP = ("Home Assistant didn't let Dads Army make the list. You can make it yourself: "
+                  "Settings > Devices & services > Add integration > Local To-do, call it Supply run, "
+                  "then choose it here.")
+
+
+def ha_make_list(name):
+    """Make a Local To-do list in Home Assistant (or find one with that name). Returns its entity id."""
+    def find():
+        for lst in ha_todo_lists():
+            if lst["name"].strip().lower() == name.lower():
+                return lst["entity_id"]
+        return None
+
+    try:
+        found = find()
+        if found:
+            return found
+        status, flow = ha_request("POST", "/config/config_entries/flow",
+                                  {"handler": "local_todo", "show_advanced_options": False})
+        if status != 200 or not isinstance(flow, dict) or not flow.get("flow_id"):
+            raise HAError("starting the Local To-do setup: %s %s" % (status, str(flow)[:200]))
+        if flow.get("type") == "form":
+            field = "todo_list_name"
+            for f in flow.get("data_schema") or []:
+                if isinstance(f, dict) and f.get("name"):
+                    field = f["name"]
+                    break
+            status, res = ha_request("POST", "/config/config_entries/flow/" + flow["flow_id"], {field: name})
+            if status != 200 or not isinstance(res, dict) or res.get("type") not in ("create_entry", "abort"):
+                ha_request("DELETE", "/config/config_entries/flow/" + flow["flow_id"])
+                raise HAError("finishing the Local To-do setup: %s %s" % (status, str(res)[:200]))
+        for _ in range(30):
+            found = find()
+            if found:
+                return found
+            time.sleep(0.5)
+    except (HAError, OSError) as e:
+        print("Home Assistant to-do list: couldn't make one (%s)" % e, flush=True)
+        raise ApiError(502, MAKE_LIST_HELP)
+    raise ApiError(502, "Home Assistant made the list, but it hasn't appeared yet. Try again in a minute.")
+
+
+# -- The background loop -------------------------------------------------------
 def ha_loop():
-    """Keep Home Assistant's Dads Army sensors up to date."""
+    """Keep Home Assistant's Dads Army sensors and to-do list up to date."""
     probe = "sensor.dads_army_hold_out"
-    sent, failing, last_full = {}, False, None
+    sent, failing, last_full, levels = {}, False, None, None
     HA_WAKE.set()  # first push straight away
     while True:
-        HA_WAKE.wait(15 if failing else 60)
+        HA_WAKE.wait(15 if failing else 30 if todo_entity() else 60)
         HA_WAKE.clear()
         time.sleep(1)  # let a burst of changes settle
         try:
-            ents = ha_entities(summary())
+            s = summary()
+            now = stock_levels()
+        except Exception:
+            traceback.print_exc()
+            continue
+        if HA_REBASE.is_set():
+            HA_REBASE.clear()
+            levels = None
+        try:
+            ev = ran_out(levels, now) if levels is not None and not failing else None
+            levels = now
+            if ev:
+                ha_call("POST", "/events/dads_army_ran_out", ev)
+            ents = ha_entities(s)
             full = last_full is None or time.monotonic() - last_full > 1800
             if not full and ha_call("GET", "/states/" + probe, timeout=5) == 404:
                 full = True  # Home Assistant restarted and forgot them
@@ -1137,6 +1565,8 @@ def ha_loop():
                 print("Home Assistant sensors: can't update them yet (%s). Will keep trying." % e, flush=True)
             failing, last_full = True, None
             sent.clear()
+        if not failing:
+            todo_tick(s)
 
 
 def ha_mark_unavailable():
@@ -1148,6 +1578,40 @@ def ha_mark_unavailable():
             ha_call("POST", "/states/" + eid, {"state": "unavailable", "attributes": attrs}, timeout=2)
         except Exception:
             return
+
+
+# -- API for the HQ screen -------------------------------------------------------
+def need_ha():
+    if not HA_TOKEN:
+        raise ApiError(409, "This only works when Dads Army runs as a Home Assistant app")
+
+
+@route("GET", "/api/homeassistant")
+def api_ha(body, query):
+    need_ha()
+    try:
+        lists, error = ha_todo_lists(), ""
+    except Exception as e:
+        lists, error = [], "Couldn't get the lists from Home Assistant (%s)" % e
+    return {"lists": lists, "error": error, "status": ha_status()}
+
+
+@route("PUT", "/api/homeassistant")
+def api_ha_set(body, query):
+    need_ha()
+    entity = clean_text(body.get("todo_list"), 120)
+    if entity and not TODO_RE.match(entity):
+        raise ApiError(400, "That isn't a Home Assistant to-do list")
+    todo_link(entity)
+    return {"status": ha_status()}
+
+
+@route("POST", "/api/homeassistant/todo-list")
+def api_ha_make_list(body, query):
+    need_ha()
+    entity = ha_make_list(TODO_LIST_NAME)
+    todo_link(entity)
+    return {"status": ha_status(), "entity_id": entity}
 
 
 # --------------------------------------------------------------------------

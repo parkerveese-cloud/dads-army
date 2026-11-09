@@ -1,0 +1,126 @@
+blueprint:
+  name: "Dads Army: weekly round-up"
+  description: >-
+    Once a week, a note on your phone from Dads Army: what to use first
+    (things expiring soon), anything out of date, the supply run, and how long
+    you could hold out.
+
+
+    Needs Dads Army 1.2.0 or later, and the Home Assistant Companion app on
+    your phone. For a second phone, make a second automation from this
+    blueprint.
+  domain: automation
+  author: Parker Veese Development
+  source_url: https://github.com/parkerveese-cloud/dads-army/blob/main/blueprints/automation/dads_army_weekly_roundup.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    phone:
+      name: Phone
+      description: The phone to notify. It needs the Home Assistant Companion app.
+      selector:
+        device:
+          filter:
+            - integration: mobile_app
+    days:
+      name: Day
+      description: You can pick more than one.
+      default: [sun]
+      selector:
+        select:
+          multiple: true
+          mode: list
+          options:
+            - label: Monday
+              value: mon
+            - label: Tuesday
+              value: tue
+            - label: Wednesday
+              value: wed
+            - label: Thursday
+              value: thu
+            - label: Friday
+              value: fri
+            - label: Saturday
+              value: sat
+            - label: Sunday
+              value: sun
+    at:
+      name: Time
+      default: "18:00:00"
+      selector:
+        time: {}
+    skip_quiet:
+      name: Skip it when there's nothing to use up
+      description: Only send it if something is expiring soon or out of date.
+      default: false
+      selector:
+        boolean: {}
+    open_path:
+      name: Open when tapped
+      description: >-
+        The page the notification opens. Leave it as it is to open Dads Army
+        from the Home Assistant sidebar.
+      default: /40ee45c0_dadsarmy
+      selector:
+        text: {}
+
+mode: single
+
+triggers:
+  - trigger: time
+    at: !input at
+
+variables:
+  skip_quiet: !input skip_quiet
+  open_path: !input open_path
+  running: "{{ states('sensor.dads_army_hold_out') not in ['unavailable', 'unknown'] }}"
+  soon: "{{ state_attr('sensor.dads_army_expiring_soon', 'items') or [] }}"
+  soon_n: "{{ states('sensor.dads_army_expiring_soon') | int(0) }}"
+  expired_n: "{{ states('sensor.dads_army_expired') | int(0) }}"
+  run_n: "{{ states('sensor.dads_army_supply_run') | int(0) }}"
+
+conditions:
+  - condition: time
+    weekday: !input days
+  - condition: template
+    value_template: "{{ not running or not skip_quiet or soon_n > 0 or expired_n > 0 }}"
+
+actions:
+  - device_id: !input phone
+    domain: mobile_app
+    type: notify
+    title: "Dads Army: weekly round-up"
+    message: |-
+      {%- if not running -%}
+        Dads Army isn't sending updates. Check the app is running in Home Assistant.
+      {%- else -%}
+        {%- set ns = namespace(out=[]) -%}
+        {%- if soon_n > 0 -%}
+          {%- set ns.out = ns.out + ['Use these first:'] -%}
+          {%- for i in soon[:5] -%}
+            {%- set ns.out = ns.out + ['• ' ~ i.name ~ ': ' ~ i.text] -%}
+          {%- endfor -%}
+          {%- if soon_n > 5 -%}
+            {%- set ns.out = ns.out + ['…and ' ~ (soon_n - 5) ~ ' more'] -%}
+          {%- endif -%}
+        {%- else -%}
+          {%- set ns.out = ns.out + ['Nothing is close to its best-before date.'] -%}
+        {%- endif -%}
+        {%- if expired_n > 0 -%}
+          {%- set ns.out = ns.out + [expired_n ~ (' thing is' if expired_n == 1 else ' things are') ~ ' out of date.'] -%}
+        {%- endif -%}
+        {%- if run_n > 0 -%}
+          {%- set ns.out = ns.out + ['Supply run: ' ~ run_n ~ ' to get.'] -%}
+        {%- endif -%}
+        {%- set ns.out = ns.out + ['You could hold out for ' ~ states('sensor.dads_army_hold_out') ~ ' days (target '
+              ~ state_attr('sensor.dads_army_hold_out', 'target_days') ~ ').'] -%}
+        {{ ns.out | join('\n') }}
+      {%- endif -%}
+    data:
+      clickAction: "{{ open_path }}"
+      url: "{{ open_path }}"
+      tag: dads-army-weekly
+      group: dads-army
+      channel: Dads Army
+      notification_icon: mdi:shield-home
