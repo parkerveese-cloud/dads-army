@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.5.0
+
+- **New Plan tab: routine checks.** Keep track of the jobs that keep your kit ready, such as testing the smoke alarms, charging the power banks, rotating stored water and checking the grab bag.
+  - Tap **Done** when you've done one, and Dads Army works out when it's next due.
+  - **Add suggested checks** gives you nine to start with, based on the usual advice.
+  - Checks that are due show on the Sitrep, with a count on the Plan tab.
+- **Household emergency plan.** Also on the Plan tab: contacts (tap to call), where to meet, how to turn off the water, gas and electricity, medical needs, pets, documents and local radio.
+  - **Add UK emergency numbers** fills in 999, 111, 105, the gas emergency line, Floodline and 101.
+  - It works with the internet down, and **Print** puts it on paper for the grab bag, with the checks.
+- **How long things last.** Set **Used a day** on things like tablets, nappies or toilet roll.
+  - Dads Army shows how long each one lasts, counting only stock that's still in date.
+  - A new **Daily supplies** bar on the Sitrep shows the first thing to run out.
+  - The form suggests a target that covers your readiness period.
+  - The starter list now sets this for toilet roll, wet wipes, tea bags and gas canisters.
+- **Prices.** Set **Price each** on an item. The Sitrep then shows what the stores are worth, and the supply run shows what it should cost.
+- **Like last time.** When you add stock, a new button sets the best-before date as far ahead as last time.
+- **Home Assistant.**
+  - New sensors: `sensor.dads_army_checks_due`, `sensor.dads_army_supplies` and `sensor.dads_army_stores_value`.
+  - The supply run sensor has a `cost`.
+  - **Needs attention** also comes on when a check is due.
+  - The phone alerts blueprint tells you each morning about checks that fall due that day.
+  - The weekly round-up lists the checks that are due and what runs out first.
+  - Re-import both blueprints to get these changes. The dashboard card on the Documentation tab has the new tiles.
+- Backups and the spreadsheet export include the new details. Restoring a backup from an older version leaves your checks and plan as they are.
+
 ## 1.4.0
 
 - **Delete several items at once.** In Stores, tap **Select to delete**, then tick the items you don't want to keep. **Select all** picks everything showing, so you can clear out a whole category or a search in one go. Before anything is deleted, Dads Army lists what's going and warns you about any stock that goes with it. **Undo** puts it all back.

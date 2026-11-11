@@ -5,7 +5,11 @@ A stores tracker for food, water and emergency kit. It runs on a Raspberry Pi or
 - **Sitrep:** how many days the household could hold out, whether food or water runs out first, what's expired or expiring soon, and what to use first.
 - **Stores:** everything you hold, grouped by category, with search and filters. Tap **−** to use one or **+** to add stock. **Select to delete** clears out things you don't want to keep, several at a time.
 - **Batches and rotation:** the same item can have several batches with different best-before dates and locations. Using stock always takes the oldest first.
-- **Supply run:** an automatic shopping list of everything below target, plus your own extras. **Got it** puts the shopping straight into the stores.
+- **Daily use:** say how many tablets, nappies or toilet rolls you get through a day, and Dads Army shows how long each will last and what runs out first.
+- **Supply run:** an automatic shopping list of everything below target, plus your own extras. **Got it** puts the shopping straight into the stores. Set prices to see what it'll cost and what the stores are worth.
+- **Plan:**
+  - **Routine checks:** test the smoke alarms, charge the power banks, rotate the water. Dads Army tells you when each is due.
+  - **Household emergency plan:** contacts, meeting places, how to turn off the water, gas and electricity, and medical needs. It's ready to print for the grab bag.
 - **HQ:** household size, calorie and water needs, readiness target (3 days to a year), backups, a printed hard copy, a starter list of about 95 essentials, light/dark mode, and the activity log.
 - **Undo** on anything you use or delete. Several phones can use it at once.
 
@@ -37,11 +41,14 @@ You can then open it in two ways:
   - out of stock and running low
   - expired and expiring soon
   - the supply run
+  - checks due
+  - daily supplies
+  - what the stores are worth
 
   You can use them on dashboards, in automations and in Companion app widgets. A ready-made dashboard card is on the app's **Documentation** tab.
 - **Phone alerts.** Two blueprints in [blueprints/automation](blueprints/automation) send notifications to your phone:
   - when something runs out
-  - each morning, anything that went out of date overnight
+  - each morning, anything that went out of date overnight and any check that's due
   - a weekly round-up of what to use first
 - **To-do list.** The supply run can stay in step with a Home Assistant to-do list. You can tick things off there and add to it by voice. Turn it on in **HQ → Home Assistant**.
 
@@ -90,7 +97,7 @@ To update, run `git pull` and then `bash install.sh` again. Your data is kept.
 - **Automatic:** once a day, Dads Army saves a copy of its database and keeps the last 14.
 - **Download a backup:** HQ → **Download backup** saves a `.json` file to your phone. HQ → **Restore from a backup…** brings it back.
 - **Spreadsheet:** HQ → **Export spreadsheet (CSV)**.
-- **Print it:** HQ → **Print full inventory** gives a paper list with a tick column. Keep it with the stores, in case the power or the Pi goes down.
+- **Print it:** HQ → **Print full inventory** gives a paper list with a tick column. Keep it with the stores, in case the power or the Pi goes down. **Print emergency plan & checks** does the same for the plan.
 
 ## Security
 

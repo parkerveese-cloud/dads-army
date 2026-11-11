@@ -17,7 +17,7 @@ Environment variables (all optional):
 
 Running as a Home Assistant app, it also:
   - publishes sensor.dads_army_* entities (readiness, hold-out days, out of stock,
-    running low, expired, expiring soon and more)
+    running low, expired, expiring soon, checks due, daily supplies and more)
   - fires a dads_army_ran_out event when something runs out, for phone alerts
   - can keep the supply run in step with a Home Assistant to-do list (HQ screen)
 GET /api/summary returns the same figures as JSON for anything else.
@@ -41,7 +41,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS items (
     kcal_per_unit   REAL    NOT NULL DEFAULT 0,
     litres_per_unit REAL    NOT NULL DEFAULT 0,
     target_qty      REAL    NOT NULL DEFAULT 0,
+    per_day         REAL    NOT NULL DEFAULT 0,
+    price           REAL    NOT NULL DEFAULT 0,
     notes           TEXT    NOT NULL DEFAULT '',
     created_at      TEXT    NOT NULL,
     updated_at      TEXT    NOT NULL
@@ -122,7 +124,20 @@ CREATE TABLE IF NOT EXISTS ha_todo (
     summary TEXT    NOT NULL DEFAULT '',
     done    INTEGER NOT NULL DEFAULT 0
 );
+-- Routine checks: test the alarms, charge the power banks, rotate the water...
+CREATE TABLE IF NOT EXISTS checks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL,
+    every_days INTEGER NOT NULL DEFAULT 90,
+    last_done  TEXT,
+    notes      TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL
+);
 """
+# Columns added to items after 1.0, for databases made by older versions.
+ITEM_UPGRADES = [("per_day", "REAL NOT NULL DEFAULT 0"), ("price", "REAL NOT NULL DEFAULT 0")]
+ITEM_FIELDS = ("name", "category", "unit", "kcal_per_unit", "litres_per_unit", "target_qty", "per_day", "price",
+               "notes")
 
 # --------------------------------------------------------------------------
 # Starter list. Targets scale to the household (see resolve_target).
@@ -307,6 +322,10 @@ def init_db():
     DB.execute("PRAGMA foreign_keys = ON")
     DB.execute("PRAGMA journal_mode = WAL")
     DB.executescript(SCHEMA)
+    have = set(r[1] for r in DB.execute("PRAGMA table_info(items)"))
+    for col, decl in ITEM_UPGRADES:
+        if col not in have:
+            DB.execute("ALTER TABLE items ADD COLUMN %s %s" % (col, decl))
     for key, value in DEFAULT_SETTINGS.items():
         DB.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(value)))
 
@@ -364,12 +383,20 @@ def clean_item(body, partial=False):
         out["category"] = cat if cat in CATEGORIES else "other"
     if not partial or "unit" in body:
         out["unit"] = clean_text(body.get("unit"), 30)
-    for field, label in (("kcal_per_unit", "Calories"), ("litres_per_unit", "Litres"), ("target_qty", "Target")):
+    for field, label in (("kcal_per_unit", "Calories"), ("litres_per_unit", "Litres"), ("target_qty", "Target"),
+                         ("per_day", "Daily use"), ("price", "Price")):
         if not partial or field in body:
             out[field] = clean_num(body.get(field), 0, 0, 1e7, label)
     if not partial or "notes" in body:
         out["notes"] = clean_text(body.get("notes"), 2000)
     return out
+
+
+def insert_item(db, data, created, updated, item_id=None):
+    cols = (("id",) if item_id is not None else ()) + ITEM_FIELDS + ("created_at", "updated_at")
+    vals = ([item_id] if item_id is not None else []) + [data[k] for k in ITEM_FIELDS] + [created, updated]
+    return db.execute("INSERT INTO items(%s) VALUES (%s)" % (", ".join(cols), ", ".join("?" * len(cols))),
+                      vals).lastrowid
 
 
 def fq(q):
@@ -496,6 +523,57 @@ def _days_until(ymd, today):
         return None
 
 
+def human_date(d):
+    """2027-03-05 -> '5 Mar 2027' (like the app)."""
+    return "%d %s %d" % (d.day, d.strftime("%b"), d.year)
+
+
+def lasts_words(days):
+    if days <= 0:
+        return "Run out"
+    if days < 1:
+        return "Less than a day"
+    return span(int(math.floor(days)))
+
+
+def every_words(n):
+    """How often a check comes round: 30 -> 'every month', 182 -> 'every 6 months'."""
+    n = int(n)
+    if n == 1:
+        return "every day"
+    if n % 7 == 0 and n < 28:
+        return "every week" if n == 7 else "every %d weeks" % (n // 7)
+    months = n / 30.44
+    m = _round(months)
+    if m >= 1 and abs(months - m) <= 0.08 * m + 0.05:
+        if m % 12 == 0:
+            return "every year" if m == 12 else "every %d years" % (m // 12)
+        return "every month" if m == 1 else "every %d months" % m
+    return "every %d days" % n
+
+
+CHECK_SOON = 7  # days before a check is due that it shows on the Sitrep
+
+
+def check_status(c, today):
+    """(next due date or None, days until it's due or None, words) for a routine check."""
+    due = None
+    if c["last_done"]:
+        try:
+            due = dt.date(int(c["last_done"][:4]), int(c["last_done"][5:7]), int(c["last_done"][8:10])) \
+                + dt.timedelta(days=int(c["every_days"]))
+        except (TypeError, ValueError):
+            due = None
+    if due is None:
+        return None, None, "Not done yet"
+    days = (due - today).days
+    if days < 0:
+        return due, days, "Overdue by %s" % span(-days)
+    if days == 0:
+        return due, days, "Due today"
+    return due, days, "Due in %s" % span(days)
+
+
 def summary():
     """What matters at a glance: the same figures the Sitrep screen shows."""
     today = dt.date.today()
@@ -503,24 +581,32 @@ def summary():
         st = get_settings()
         items = all_items()
         extras = [r["text"] for r in DB.execute("SELECT text FROM shopping WHERE done = 0 ORDER BY id")]
+        checks = [dict(r) for r in DB.execute("SELECT * FROM checks")]
     warn = st["warn_days"]
     people = st["adults"] + st["children"]
     kcal_day = st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]
     water_day = people * st["water_per_person"]
     kcal = litres = 0.0
     kit_n, kit_sum = 0, 0.0
-    low, out, expired, soon, upcoming = [], [], [], [], []
+    value = cost = 0.0
+    priced = 0
+    low, out, expired, soon, upcoming, supplies = [], [], [], [], [], []
 
     for it in items:
         unit, cat = it["unit"] or "", it["category"]
         total = sum(b["qty"] for b in it["batches"])
         target = it["target_qty"] or 0
+        price = it.get("price") or 0
+        per_day = it.get("per_day") or 0
         food = cat == "food" and (it["kcal_per_unit"] or 0) > 0
         water = cat == "water" and (it["litres_per_unit"] or 0) > 0
         dated = []
+        in_date = 0.0
         for b in it["batches"]:
             d = _days_until(b["expiry"], today) if b["expiry"] else None
             fresh = d is None or d >= 0
+            if fresh:
+                in_date += b["qty"]
             if food and fresh:
                 kcal += b["qty"] * it["kcal_per_unit"]
             if water and fresh:
@@ -530,15 +616,30 @@ def summary():
                 if d >= 0:
                     upcoming.append((d, it, b))
 
+        if price > 0:
+            priced += 1
+            value += total * price
+        if per_day > 0:
+            # Out-of-date stock doesn't count, just as for food and water.
+            lasts = in_date / per_day
+            text = "%s · %s left, %s a day" % (lasts_words(lasts), qu(in_date, unit), fq(per_day))
+            if total - in_date > 0:
+                text += " (+%s out of date)" % fq(total - in_date)
+            supplies.append((lasts, {"id": it["id"], "name": it["name"], "category": cat, "unit": unit,
+                                     "have": _num(in_date), "per_day": _num(per_day), "days": _days(lasts),
+                                     "text": text}))
         if target > 0 and cat not in ("food", "water"):
             kit_n += 1
             kit_sum += min(1.0, total / target)
         if target > 0 and total < target:
             get = round(target - total, 3)
+            cost += get * price
             entry = {"id": it["id"], "name": it["name"], "category": cat, "have": _num(total), "target": _num(target),
                      "unit": unit, "get": _num(get),
                      "text": "Get %s" % qu(get, unit) + (" · have %s of %s" % (fq(total), fq(target))
                                                           if total > 0 else "")}
+            if price > 0:
+                entry["cost"] = round(get * price, 2)
             (out if total <= 0 else low).append((total / target, entry))
 
         # Like the app, an item's expiry state comes from its soonest-dated batch.
@@ -570,6 +671,26 @@ def summary():
     def ordered(rows):
         return [e for _, e in sorted(rows, key=lambda r: (r[0], r[1]["name"].lower()))]
 
+    checks_due, checks_soon, checks_today, checks_later = [], [], [], []
+    for c in checks:
+        due, d, text = check_status(c, today)
+        e = {"id": c["id"], "name": c["name"], "every_days": c["every_days"], "every": every_words(c["every_days"]),
+             "last_done": c["last_done"], "due": due.isoformat() if due else None, "days": d,
+             "text": text + " · " + every_words(c["every_days"])}
+        if d is None or d <= 0:
+            checks_due.append((d if d is not None else 0, e))   # overdue longest first
+            if d == 0:
+                checks_today.append((0, e))
+        else:
+            (checks_soon if d <= CHECK_SOON else checks_later).append((d, e))
+    later = ordered(checks_soon + checks_later)
+    next_check = None
+    if later:
+        n = later[0]
+        next_check = {"name": n["name"], "date": n["due"], "days": n["days"],
+                      "text": "%s · %s" % (n["name"], human_date(dt.date.fromisoformat(n["due"])))}
+
+    sup = ordered(supplies)
     target_days = st["target_days"]
     return {
         "version": VERSION,
@@ -593,7 +714,18 @@ def summary():
         "newly_expired": ordered([r for r in expired if r[0] == -1]),
         "expires_today": ordered([r for r in soon if r[0] == 0]),
         "next_expiry": nxt,
-        "supply_run": {"below_target": ordered(out) + ordered(low), "extras": extras},
+        "supply_run": {"below_target": ordered(out) + ordered(low), "extras": extras, "cost": round(cost, 2)},
+        # Things with a daily use: how long each lasts, shortest first.
+        "supplies": {"days": sup[0]["days"] if sup else None, "runs_out_first": sup[0]["name"] if sup else "",
+                     "items": sup},
+        "stores_value": round(value, 2),
+        "priced_items": priced,
+        # Routine checks: due (or never done), due within a week, and due today exactly.
+        "checks_total": len(checks),
+        "checks_due": ordered(checks_due),
+        "checks_soon": ordered(checks_soon),
+        "checks_due_today": ordered(checks_today),
+        "next_check": next_check,
     }
 
 
@@ -641,6 +773,9 @@ def api_state(body, query):
         return {
             "items": all_items(),
             "shopping": [dict(r) for r in DB.execute("SELECT * FROM shopping ORDER BY done, id")],
+            "checks": all_checks(),
+            "check_suggestions": [c[0] for c in CHECK_SUGGESTIONS],
+            "plan": get_plan(),
             "settings": get_settings(),
             "log": [dict(r) for r in DB.execute("SELECT * FROM log ORDER BY id DESC LIMIT 60")],
             "server": {"version": VERSION, "time": now_iso(), "last_backup": LAST_BACKUP["at"],
@@ -661,12 +796,7 @@ def api_item_create(body, query):
     location = clean_text(body.get("location"), 80)
     ts = now_iso()
     with tx() as db:
-        cur = db.execute(
-            "INSERT INTO items(name, category, unit, kcal_per_unit, litres_per_unit, target_qty, notes,"
-            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (data["name"], data["category"], data["unit"], data["kcal_per_unit"], data["litres_per_unit"],
-             data["target_qty"], data["notes"], ts, ts))
-        item_id = cur.lastrowid
+        item_id = insert_item(db, data, ts, ts)
         if qty > 0:
             db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
                        (item_id, qty, expiry, location, ts))
@@ -873,11 +1003,7 @@ def restore_snapshot(db, snap):
         db.execute("UPDATE items SET %s, updated_at = ? WHERE id = ?" % cols,
                    list(data.values()) + [now_iso(), item_id])
     else:
-        db.execute(
-            "INSERT INTO items(id, name, category, unit, kcal_per_unit, litres_per_unit, target_qty, notes,"
-            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (item_id, data["name"], data["category"], data["unit"], data["kcal_per_unit"],
-             data["litres_per_unit"], data["target_qty"], data["notes"], created, now_iso()))
+        insert_item(db, data, created, now_iso(), item_id)
     db.execute("DELETE FROM batches WHERE item_id = ?", (item_id,))
     for b in batches:
         if not isinstance(b, dict):
@@ -925,6 +1051,189 @@ def api_shop_clear(body, query):
     with tx() as db:
         n = db.execute("DELETE FROM shopping WHERE done = 1").rowcount
     return {"cleared": n}
+
+
+# -- Routine checks ------------------------------------------------------------
+# Stores are only any use if the kit works when you need it. Suggestions follow
+# the usual advice: test alarms monthly, rotate water you've bottled yourself
+# every six months, and go through the grab bag and the plan once a year.
+CHECK_SUGGESTIONS = [
+    ("Test the smoke and carbon monoxide alarms", 30, "Press the test button on each one."),
+    ("Charge the power banks", 30, "Top them up so they're full when the power goes."),
+    ("Test the torches, radio and batteries", 91, "Swap out any batteries that are flat or leaking."),
+    ("Rotate tap water you've stored", 182,
+     "Water you've bottled yourself: empty, rinse and refill the containers every six months."),
+    ("Check the first aid kit", 182, "Replace anything used up or out of date."),
+    ("Try the camping stove", 182, "Light it outdoors, and check the gas canisters aren't empty."),
+    ("Check the fire extinguisher", 182, "The gauge needle should be in the green, and the pin and seal in place."),
+    ("Check the grab bag", 365, "Food and water in date, clothes still fit, cash and copies of documents current."),
+    ("Go through the emergency plan together", 365,
+     "Everyone knows where to meet and who to call. Update any numbers that have changed."),
+]
+
+
+def all_checks():
+    return [dict(r) for r in DB.execute("SELECT * FROM checks ORDER BY name COLLATE NOCASE")]
+
+
+def get_check(db, cid):
+    row = db.execute("SELECT * FROM checks WHERE id = ?", (cid,)).fetchone()
+    if not row:
+        raise ApiError(404, "That check no longer exists")
+    return dict(row)
+
+
+def not_future(d):
+    if d and d > dt.date.today().isoformat():
+        raise ApiError(400, "That date hasn't happened yet")
+    return d
+
+
+def clean_check(body, partial=False):
+    out = {}
+    if not partial or "name" in body:
+        name = clean_text(body.get("name"), 120)
+        if not name:
+            raise ApiError(400, "Give the check a name")
+        out["name"] = name
+    if not partial or "every_days" in body:
+        out["every_days"] = int(round(clean_num(body.get("every_days"), 90, 1, 3650, "How often")))
+    if not partial or "last_done" in body:
+        out["last_done"] = not_future(clean_date(body.get("last_done")))
+    if not partial or "notes" in body:
+        out["notes"] = clean_text(body.get("notes"), 1000)
+    return out
+
+
+@route("POST", "/api/checks")
+def api_check_create(body, query):
+    data = clean_check(body)
+    with tx() as db:
+        cid = db.execute("INSERT INTO checks(name, every_days, last_done, notes, created_at) VALUES (?, ?, ?, ?, ?)",
+                         (data["name"], data["every_days"], data["last_done"], data["notes"], now_iso())).lastrowid
+        add_log("added", data["name"], "New check, " + every_words(data["every_days"]))
+    return {"id": cid}
+
+
+@route("PUT", r"/api/checks/(\d+)")
+def api_check_update(body, query, cid):
+    cid = as_int_id(cid)
+    data = clean_check(body, partial=True)
+    if not data:
+        raise ApiError(400, "Nothing to change")
+    with tx() as db:
+        get_check(db, cid)
+        cols = ", ".join("%s = ?" % k for k in data)
+        db.execute("UPDATE checks SET %s WHERE id = ?" % cols, list(data.values()) + [cid])
+        add_log("edited", get_check(db, cid)["name"], "Check updated")
+    return {"ok": True}
+
+
+@route("POST", r"/api/checks/(\d+)/done")
+def api_check_done(body, query, cid):
+    """Tick a check off (today, unless a date is given). It's next due a full period later."""
+    cid = as_int_id(cid)
+    when = not_future(clean_date(body.get("date"))) or dt.date.today().isoformat()
+    with tx() as db:
+        before = get_check(db, cid)
+        db.execute("UPDATE checks SET last_done = ? WHERE id = ?", (when, cid))
+        due = dt.date.fromisoformat(when) + dt.timedelta(days=before["every_days"])
+        add_log("checked", before["name"], "Next due %s" % human_date(due))
+    return {"undo": {"check": before}, "next_due": due.isoformat()}
+
+
+@route("DELETE", r"/api/checks/(\d+)")
+def api_check_delete(body, query, cid):
+    cid = as_int_id(cid)
+    with tx() as db:
+        before = get_check(db, cid)
+        db.execute("DELETE FROM checks WHERE id = ?", (cid,))
+        add_log("removed", before["name"], "Check deleted")
+    return {"undo": {"check": before}}
+
+
+@route("POST", "/api/checks/restore")
+def api_check_restore(body, query):
+    """Undo for checks: put one back exactly as it was."""
+    c = body.get("check")
+    if not isinstance(c, dict):
+        raise ApiError(400, "Nothing to restore")
+    cid = as_int_id(c.get("id"))
+    data = clean_check(c)
+    with tx() as db:
+        db.execute("INSERT OR REPLACE INTO checks(id, name, every_days, last_done, notes, created_at)"
+                   " VALUES (?, ?, ?, ?, ?, ?)", (cid, data["name"], data["every_days"], data["last_done"],
+                                                  data["notes"], clean_text(c.get("created_at"), 30) or now_iso()))
+        add_log("undo", data["name"], "Change undone")
+    return {"ok": True}
+
+
+@route("POST", "/api/checks/seed")
+def api_checks_seed(body, query):
+    """Add the suggested checks, skipping any you already have. They start as not done yet."""
+    with tx() as db:
+        existing = set(r[0].lower() for r in db.execute("SELECT name FROM checks"))
+        added = 0
+        for name, every, notes in CHECK_SUGGESTIONS:
+            if name.lower() in existing:
+                continue
+            db.execute("INSERT INTO checks(name, every_days, last_done, notes, created_at) VALUES (?, ?, NULL, ?, ?)",
+                       (name, every, notes, now_iso()))
+            added += 1
+        if added:
+            add_log("starter", "", "Added %d suggested checks" % added)
+    return {"added": added}
+
+
+# -- Household emergency plan ------------------------------------------------------
+# What everyone needs to know when it happens, kept where it still works with the
+# internet down (and printable). Follows the UK Government's household plan:
+# contacts, where to meet, how to turn things off, and who needs what.
+PLAN_TEXT = (("meet_near", 300), ("meet_far", 300), ("water_off", 600), ("gas_off", 600), ("power_off", 600),
+             ("medical", 2000), ("pets", 1000), ("documents", 600), ("radio", 200), ("notes", 3000))
+MAX_CONTACTS = 60
+
+
+def clean_plan(body):
+    contacts = body.get("contacts")
+    if contacts is None:
+        contacts = []
+    if not isinstance(contacts, list):
+        raise ApiError(400, "Contacts should be a list")
+    if len(contacts) > MAX_CONTACTS:
+        raise ApiError(400, "That's too many contacts (%d at most)" % MAX_CONTACTS)
+    plan = {"contacts": []}
+    for c in contacts:
+        if not isinstance(c, dict):
+            raise ApiError(400, "Contacts should each have a name and number")
+        row = {"name": clean_text(c.get("name"), 80), "role": clean_text(c.get("role"), 80),
+               "phone": clean_text(c.get("phone"), 40)}
+        if row["name"] or row["role"] or row["phone"]:
+            plan["contacts"].append(row)
+    for key, maxlen in PLAN_TEXT:
+        plan[key] = clean_text(body.get(key), maxlen)
+    return plan
+
+
+def get_plan():
+    raw = setting_raw("plan", None)
+    raw = raw if isinstance(raw, dict) else {}
+    try:
+        plan = clean_plan(raw)
+    except ApiError:
+        plan = clean_plan({})
+    plan["updated_at"] = raw.get("updated_at") if isinstance(raw.get("updated_at"), str) else None
+    return plan
+
+
+@route("PUT", "/api/plan")
+def api_plan(body, query):
+    plan = clean_plan(body)
+    plan["updated_at"] = now_iso()
+    with tx() as db:
+        set_setting_raw(db, "plan", plan)
+        add_log("plan", "", "Emergency plan updated")
+    return {"plan": plan}
 
 
 @route("PUT", "/api/settings")
@@ -977,10 +1286,11 @@ def api_seed(body, query):
         for name, cat, unit, kcal, litres, target, notes in STARTER:
             if name.lower() in existing:
                 continue
-            db.execute(
-                "INSERT INTO items(name, category, unit, kcal_per_unit, litres_per_unit, target_qty, notes,"
-                " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (name, cat, unit, kcal, litres, resolve_target(target, kcal, litres, ctx), notes, ts, ts))
+            # Things used every day also say how long they'll last.
+            per_day = round(people * target[1], 3) if isinstance(target, tuple) and target[0] == "perday" else 0
+            insert_item(db, {"name": name, "category": cat, "unit": unit, "kcal_per_unit": kcal,
+                             "litres_per_unit": litres, "target_qty": resolve_target(target, kcal, litres, ctx),
+                             "per_day": per_day, "price": 0, "notes": notes}, ts, ts)
             added += 1
         if added:
             add_log("starter", "", "Loaded %d suggested items" % added)
@@ -994,13 +1304,15 @@ def api_export_csv(body, query):
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["Category", "Item", "Quantity", "Unit", "Best before", "Location",
-                "Target", "Kcal per unit", "Litres per unit", "Notes"])
+                "Target", "Kcal per unit", "Litres per unit", "Used a day", "Price each", "Notes"])
     for it in sorted(items, key=lambda i: (CATEGORIES.index(i["category"]) if i["category"] in CATEGORIES else 99,
                                            i["name"].lower())):
         rows = it["batches"] or [{"qty": 0, "expiry": "", "location": ""}]
         for b in rows:
             w.writerow([it["category"], it["name"], fq(b["qty"]), it["unit"], b["expiry"] or "", b["location"],
-                        fq(it["target_qty"]), fq(it["kcal_per_unit"]), fq(it["litres_per_unit"]), it["notes"]])
+                        fq(it["target_qty"]), fq(it["kcal_per_unit"]), fq(it["litres_per_unit"]),
+                        fq(it["per_day"]) if it["per_day"] else "", "%.2f" % it["price"] if it["price"] else "",
+                        it["notes"]])
     data = ("﻿" + buf.getvalue()).encode("utf-8")  # BOM so Excel opens it as UTF-8
     return Raw(data, "text/csv; charset=utf-8", "dadsarmy-stores-%s.csv" % dt.date.today().isoformat())
 
@@ -1015,6 +1327,8 @@ def api_backup(body, query):
             "settings": get_settings(),
             "items": all_items(),
             "shopping": [dict(r) for r in DB.execute("SELECT * FROM shopping ORDER BY id")],
+            "checks": all_checks(),
+            "plan": get_plan(),
         }
     data = json.dumps(payload, indent=1, ensure_ascii=False).encode("utf-8")
     return Raw(data, "application/json; charset=utf-8", "dadsarmy-backup-%s.json" % dt.date.today().isoformat())
@@ -1041,6 +1355,18 @@ def api_restore(body, query):
                     bl.append((q, clean_date(b.get("expiry")), clean_text(b.get("location"), 80),
                                clean_text(b.get("added_at"), 30) or now_iso()))
         clean_items.append((data, clean_text(it.get("created_at"), 30) or now_iso(), bl))
+    # Checks and the plan arrived in 1.5.0: an older backup leaves the ones you have alone.
+    checks = None
+    if isinstance(body.get("checks"), list):
+        checks = []
+        for c in body["checks"]:
+            if not isinstance(c, dict):
+                raise ApiError(400, "Backup file is damaged")
+            checks.append((clean_check(c), clean_text(c.get("created_at"), 30) or now_iso()))
+    plan = None
+    if isinstance(body.get("plan"), dict):
+        plan = clean_plan(body["plan"])
+        plan["updated_at"] = clean_text(body["plan"].get("updated_at"), 30) or None
     make_backup("pre-restore")
     ts = now_iso()
     with tx() as db:
@@ -1048,14 +1374,10 @@ def api_restore(body, query):
         db.execute("DELETE FROM items")
         db.execute("DELETE FROM shopping")
         for data, created, bl in clean_items:
-            cur = db.execute(
-                "INSERT INTO items(name, category, unit, kcal_per_unit, litres_per_unit, target_qty, notes,"
-                " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (data["name"], data["category"], data["unit"], data["kcal_per_unit"], data["litres_per_unit"],
-                 data["target_qty"], data["notes"], created, ts))
+            new_id = insert_item(db, data, created, ts)
             for q, exp, loc, added in bl:
                 db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
-                           (cur.lastrowid, q, exp, loc, added))
+                           (new_id, q, exp, loc, added))
         for s in shopping:
             if isinstance(s, dict) and clean_text(s.get("text"), 200):
                 db.execute("INSERT INTO shopping(text, done, created_at) VALUES (?, ?, ?)",
@@ -1065,6 +1387,13 @@ def api_restore(body, query):
                 v = clean_num(settings.get(key), DEFAULT_SETTINGS[key], lo, hi, key)
                 db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
                            (key, json.dumps(int(round(v)) if integer else v)))
+        if checks is not None:
+            db.execute("DELETE FROM checks")
+            for c, created in checks:
+                db.execute("INSERT INTO checks(name, every_days, last_done, notes, created_at) VALUES (?, ?, ?, ?, ?)",
+                           (c["name"], c["every_days"], c["last_done"], c["notes"], created))
+        if plan is not None:
+            set_setting_raw(db, "plan", plan)
         add_log("restored", "", "Restored %d items from backup" % len(clean_items))
     HA_REBASE.set()  # a restore isn't things running out
     return {"items": len(clean_items)}
@@ -1215,12 +1544,25 @@ def ha_entities(s):
         "mdi:calendar-clock", attrs=nxt or {}, measurement=False, device_class="date")
     run = s["supply_run"]
     put("sensor.dads_army_supply_run", len(run["below_target"]) + len(run["extras"]), "Dads Army supply run",
-        "mdi:cart", "items", dict(_ha_list(run["below_target"]), extras=run["extras"][:LIST_LIMIT]))
+        "mdi:cart", "items", dict(_ha_list(run["below_target"]), extras=run["extras"][:LIST_LIMIT], cost=run["cost"]))
+    sup = s["supplies"]
+    put("sensor.dads_army_supplies", sup["days"] if sup["items"] else "unknown", "Dads Army daily supplies",
+        "mdi:timer-sand", "days", dict(_ha_list(sup["items"]), runs_out_first=sup["runs_out_first"],
+                                       target_days=s["target_days"]))
+    put("sensor.dads_army_checks_due", len(s["checks_due"]), "Dads Army checks due", "mdi:clipboard-check-outline",
+        "checks", dict(_ha_list(s["checks_due"]), due_today=s["checks_due_today"][:LIST_LIMIT],
+                       due_soon=s["checks_soon"][:LIST_LIMIT], next_check=s["next_check"],
+                       checks_total=s["checks_total"]))
+    put("sensor.dads_army_stores_value", s["stores_value"], "Dads Army stores value", "mdi:cash", "£", {
+        "supply_run_cost": run["cost"], "priced_items": s["priced_items"], "items_total": s["items_total"]})
     reasons = []
     if s["expired"]:
         reasons.append("%d expired" % len(s["expired"]))
     if s["out_of_stock"]:
         reasons.append("%d out of stock" % len(s["out_of_stock"]))
+    if s["checks_due"]:
+        n = len(s["checks_due"])
+        reasons.append("%d check%s due" % (n, "" if n == 1 else "s"))
     put("binary_sensor.dads_army_attention", "on" if reasons else "off", "Dads Army needs attention",
         "mdi:alert-circle" if reasons else "mdi:check-circle", attrs={"reasons": reasons},
         measurement=False, device_class="problem")

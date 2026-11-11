@@ -2,8 +2,8 @@ blueprint:
   name: "Dads Army: weekly round-up"
   description: >-
     Once a week, a note on your phone from Dads Army: what to use first
-    (things expiring soon), anything out of date, the supply run, and how long
-    you could hold out.
+    (things expiring soon), anything out of date, routine checks that are due,
+    the supply run, and how long you could hold out.
 
 
     Needs Dads Army 1.2.0 or later, and the Home Assistant Companion app on
@@ -79,6 +79,8 @@ variables:
   soon_n: "{{ states('sensor.dads_army_expiring_soon') | int(0) }}"
   expired_n: "{{ states('sensor.dads_army_expired') | int(0) }}"
   run_n: "{{ states('sensor.dads_army_supply_run') | int(0) }}"
+  checks: "{{ state_attr('sensor.dads_army_checks_due', 'items') or [] }}"
+  checks_n: "{{ states('sensor.dads_army_checks_due') | int(0) }}"
 
 conditions:
   - condition: time
@@ -110,8 +112,18 @@ actions:
         {%- if expired_n > 0 -%}
           {%- set ns.out = ns.out + [expired_n ~ (' thing is' if expired_n == 1 else ' things are') ~ ' out of date.'] -%}
         {%- endif -%}
+        {%- if checks_n > 0 -%}
+          {%- set ns.out = ns.out + ['Checks due: ' ~ (checks[:4] | map(attribute='name') | join(', '))
+                ~ (' and ' ~ (checks_n - 4) ~ ' more' if checks_n > 4 else '') ~ '.'] -%}
+        {%- endif -%}
         {%- if run_n > 0 -%}
           {%- set ns.out = ns.out + ['Supply run: ' ~ run_n ~ ' to get.'] -%}
+        {%- endif -%}
+        {%- set sup = states('sensor.dads_army_supplies') -%}
+        {%- set sup_target = state_attr('sensor.dads_army_supplies', 'target_days') | int(0) -%}
+        {%- if sup not in ['unknown', 'unavailable'] and sup_target > 0 and sup | float(0) < sup_target -%}
+          {%- set ns.out = ns.out + [state_attr('sensor.dads_army_supplies', 'runs_out_first')
+                ~ (' has run out.' if sup | float(0) <= 0 else ' runs out first, in ' ~ sup ~ ' days.')] -%}
         {%- endif -%}
         {%- set ns.out = ns.out + ['You could hold out for ' ~ states('sensor.dads_army_hold_out') ~ ' days (target '
               ~ state_attr('sensor.dads_army_hold_out', 'target_days') ~ ').'] -%}

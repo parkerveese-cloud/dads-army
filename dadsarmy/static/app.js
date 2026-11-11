@@ -23,7 +23,30 @@
   CATS.forEach(function (c) { CAT[c.id] = c; });
   var UNITS = ['tin', 'jar', 'pack', 'bag', 'bottle', 'box', 'carton', 'bar', 'roll', 'kg', 'g', 'litre',
     'each', 'pair', 'set', 'kit', 'tube', 'tub', 'canister', '£'];
-  var VIEWS = ['sitrep', 'stores', 'supply', 'hq'];
+  var VIEWS = ['sitrep', 'stores', 'supply', 'plan', 'hq'];
+
+  // Household emergency plan: [field, heading, prompt, max length]. Same fields as the server's PLAN_TEXT.
+  var PLAN_PARTS = [
+    ['meet_near', 'Meeting place near home', 'If you can\'t get home or have to leave in a hurry, e.g. the church car park on Mill Lane', 300],
+    ['meet_far', 'Meeting place further away', 'If the whole area has to leave, e.g. Gran\'s house in Harrogate', 300],
+    ['water_off', 'Water stopcock', 'Where it is and how to turn it off, e.g. under the kitchen sink, turn clockwise', 600],
+    ['gas_off', 'Gas', 'Usually a lever next to the gas meter: turn it so it points across the pipe', 600],
+    ['power_off', 'Electricity', 'Where the fuse box is, e.g. cupboard under the stairs, main switch on the left', 600],
+    ['medical', 'Medical needs', 'Allergies, medicines and doses, equipment that needs power. Is anyone on the Priority Services Register?', 2000],
+    ['pets', 'Pets', 'Food, medicines, carriers, and where they can go if you have to leave', 1000],
+    ['documents', 'Important documents', 'Where the passports, insurance papers and deeds are kept', 600],
+    ['radio', 'Local radio', 'The station for local emergency news, and its frequency', 200],
+    ['notes', 'Anything else', 'Who collects the children, a neighbour who needs checking on…', 3000]
+  ];
+  // Offered in the plan's contacts. All free to call in the UK.
+  var UK_NUMBERS = [
+    ['Emergency services', 'Police, fire, ambulance, coastguard', '999'],
+    ['NHS 111', 'Urgent medical help that isn\'t a 999 emergency', '111'],
+    ['Power cut', 'Any electricity network in the UK', '105'],
+    ['Gas emergency', 'If you smell gas or suspect carbon monoxide (Great Britain)', '0800 111 999'],
+    ['Floodline', 'Flood warnings for England, Scotland and Wales', '0345 988 1188'],
+    ['Police (not an emergency)', '', '101']
+  ];
 
   var ICON = {
     plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
@@ -40,7 +63,8 @@
     copy: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>',
     trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
     edit: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4z"/></svg>',
-    list: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>'
+    list: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>',
+    phone: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 3.5h3l1.5 4.5-2 1.3a11 11 0 0 0 5.7 5.7l1.3-2 4.5 1.5v3a2 2 0 0 1-2 2A16.5 16.5 0 0 1 4.5 5.5a2 2 0 0 1 2-2z"/></svg>'
   };
 
   // ------------------------------------------------------------------
@@ -144,6 +168,22 @@
     if (d >= 10) return nf0.format(Math.floor(d));
     return String(Math.floor(d * 10) / 10);
   }
+  function addDays(s, n) { var d = parseYmd(s); d.setDate(d.getDate() + n); return ymd(d); }
+  var nf2 = new Intl.NumberFormat('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  function money(v) { return '£' + (v >= 100 ? nf0.format(Math.round(v)) : nf2.format(v)); }
+  function lastsWords(d) { return d <= 0 ? 'run out' : d < 1 ? 'less than a day' : span(Math.floor(d)); }
+  // How often a check comes round. Same wording as the server's every_words.
+  function everyWords(n) {
+    if (n === 1) return 'every day';
+    if (n % 7 === 0 && n < 28) return n === 7 ? 'every week' : 'every ' + (n / 7) + ' weeks';
+    var months = n / 30.44, m = Math.round(months);
+    if (m >= 1 && Math.abs(months - m) <= 0.08 * m + 0.05) {
+      if (m % 12 === 0) return m === 12 ? 'every year' : 'every ' + (m / 12) + ' years';
+      return m === 1 ? 'every month' : 'every ' + m + ' months';
+    }
+    return 'every ' + n + ' days';
+  }
+  function monthsWords(m) { return m === 1 ? '1 month' : m < 24 || m % 12 ? m + ' months' : (m / 12) + ' years'; }
   function stateOf(frac) { return frac >= 1 ? 'good' : frac >= 0.5 ? 'warn' : 'bad'; }
   function statusIcon(state) { return state === 'good' ? ICON.check : state === 'warn' ? ICON.alert : ICON.cross; }
   function pill(state, text) {
@@ -185,6 +225,39 @@
     (it ? it.batches : []).forEach(function (b) { if (!best || b.id > best.id) best = b; });
     return best ? best.location : '';
   }
+  // Stock that's still in date: what daily supplies count, as for food and water.
+  function inDate(it) {
+    return it.batches.reduce(function (a, b) { return a + (b.expiry && daysUntil(b.expiry) < 0 ? 0 : b.qty); }, 0);
+  }
+  function daysLeft(it) { return it.per_day > 0 ? inDate(it) / it.per_day : null; }
+  // How long the last dated batch was kept for, in months: offered as "Like last time" when adding stock.
+  function usualLife(it) {
+    var best = null;
+    it.batches.forEach(function (b) { if (b.expiry && b.added_at && (!best || b.id > best.id)) best = b; });
+    if (!best) return 0;
+    var m = Math.round((parseYmd(best.expiry) - parseYmd(best.added_at)) / 864e5 / 30.44);
+    return m >= 1 ? m : 0;
+  }
+  function stockValue() {
+    return S.items.reduce(function (a, it) { return a + (it.price > 0 ? total(it) * it.price : 0); }, 0);
+  }
+
+  // Routine checks
+  function checkInfo(c) {
+    if (!c.last_done) return { due: null, days: null, state: 'never', text: 'Not done yet' };
+    var due = addDays(c.last_done, c.every_days), d = daysUntil(due);
+    if (d < 0) return { due: due, days: d, state: 'bad', text: 'Overdue by ' + span(-d) };
+    if (d === 0) return { due: due, days: 0, state: 'bad', text: 'Due today' };
+    return { due: due, days: d, state: d <= 7 ? 'warn' : 'ok', text: 'Due in ' + span(d) };
+  }
+  function isDue(i) { return i.days === null || i.days <= 0; }
+  function sortedChecks() {
+    return (S.checks || []).map(function (c) { return { c: c, i: checkInfo(c) }; }).sort(function (a, b) {
+      var da = a.i.days === null ? 0 : a.i.days, db = b.i.days === null ? 0 : b.i.days;
+      return da - db || byName(a.c, b.c);
+    });
+  }
+  function checksDue() { return sortedChecks().filter(function (x) { return isDue(x.i); }).length; }
 
   function readiness() {
     var st = S.settings;
@@ -214,6 +287,10 @@
     r.kitPct = kit.length ? kit.reduce(function (a, it) { return a + Math.min(1, total(it) / it.target_qty); }, 0) / kit.length : 0;
     r.hold = Math.min(r.foodDays, r.waterDays);
     r.limit = r.foodDays < r.waterDays ? 'food' : r.waterDays < r.foodDays ? 'water' : '';
+    // Things with a daily use, shortest-lasting first.
+    r.supplies = S.items.filter(function (it) { return it.per_day > 0; }).map(function (it) {
+      return { it: it, days: daysLeft(it) };
+    }).sort(function (a, b) { return a.days - b.days || byName(a.it, b.it); });
     return r;
   }
 
@@ -273,6 +350,7 @@
     else {
       el.dataset.view = view;
       if (view === 'supply') renderSupply(el);
+      else if (view === 'plan') renderPlan(el);
       else if (view === 'hq') renderHQ(el);
       else renderSitrep(el);
     }
@@ -285,6 +363,9 @@
     var b = $('#supplyBadge');
     b.hidden = n === 0;
     b.textContent = n > 99 ? '99+' : String(n);
+    var due = checksDue(), pb = $('#planBadge');
+    pb.hidden = due === 0;
+    pb.textContent = String(due);
   }
 
   function updateDatalists() {
@@ -340,6 +421,12 @@
       if (r.noKcal) foodNote += ' · ' + r.noKcal + ' item' + (r.noKcal === 1 ? '' : 's') + ' with no calories set';
       var waterNote = fq(Math.round(r.litres * 10) / 10) + ' L stored · ' + fq(r.waterDay) + ' L needed a day';
       if (r.waterOldDays >= 0.1) waterNote += ' · +' + fmtDays(r.waterOldDays) + ' days past best-before';
+      var sup = r.supplies[0], supNote = '';
+      if (sup) {
+        supNote = '<button class="link" data-act="open" data-id="' + sup.it.id + '">' + esc(sup.it.name) + '</button> ' +
+          (sup.days > 0 ? 'runs out first' : 'has run out') +
+          (r.supplies.length > 1 ? ' · ' + r.supplies.length + ' things with a daily use' : '');
+      }
       html += '<section class="card hero">' +
         '<div class="eyebrow">You could hold out for</div>' +
         '<div class="hero-num">' + fmtDays(r.hold) + '<small>' + (fmtDays(r.hold) === '1' ? 'day' : 'days') + '</small></div>' +
@@ -348,7 +435,8 @@
         '<div class="meters">' +
         meter('🥫 Food', fmtDays(r.foodDays) + ' of ' + target + ' days', r.foodDays / target, foodNote) +
         meter('💧 Water', fmtDays(r.waterDays) + ' of ' + target + ' days', r.waterDays / target, waterNote) +
-        (r.kit ? meter('🧰 Kit &amp; supplies', Math.round(r.kitPct * 100) + '% stocked', r.kitPct, 'Medical, power, hygiene, tools and the rest against their targets') : '') +
+        (sup ? meter('⏳ Daily supplies', fmtDays(sup.days) + ' of ' + target + ' days', sup.days / target, supNote) : '') +
+        (r.kit ? meter('🧰 Kit', Math.round(r.kitPct * 100) + '% stocked', r.kitPct, 'Medical, power, hygiene, tools and the rest against their targets') : '') +
         '</div></section>';
     }
 
@@ -386,6 +474,14 @@
       html += '</div></section>';
     }
 
+    // Routine checks that are due, or due within a week
+    var due = sortedChecks().filter(function (x) { return x.i.days === null || x.i.days <= 7; });
+    if (due.length) {
+      html += '<section class="card flush"><div class="card-head"><h2>Checks due</h2><button class="link" data-tab="plan">All checks</button></div><div class="list">' +
+        due.slice(0, 4).map(checkRow).join('') + '</div>' +
+        (due.length > 4 ? '<button class="li more" data-tab="plan">' + (due.length - 4) + ' more ' + ICON.chev + '</button>' : '') + '</section>';
+    }
+
     // Categories
     html += '<section class="card flush"><div class="card-head"><h2>Stores by category</h2><span class="small muted">at target</span></div><div class="list">';
     CATS.forEach(function (c) {
@@ -400,7 +496,13 @@
         (pct !== null ? '<span class="catbar"><i style="width:' + (pct * 100).toFixed(1) + '%"></i></span>' : '') + '</span>' +
         '<span class="cat-pct">' + (pct !== null ? Math.round(pct * 100) + '%' : '') + '</span>' + ICON.chev + '</button>';
     });
-    html += '</div></section>';
+    html += '</div>';
+    var priced = S.items.filter(function (it) { return it.price > 0; }).length;
+    if (priced) {
+      html += '<div class="li worth"><span class="li-main"><span class="li-title">Worth about ' + esc(money(stockValue())) + '</span>' +
+        '<span class="li-sub">From the prices on ' + priced + ' of ' + S.items.length + ' items</span></span></div>';
+    }
+    html += '</section>';
 
     // Recent activity
     if (S.log.length) {
@@ -412,7 +514,8 @@
   }
 
   var LOG_VERB = { added: 'Added', stocked: 'Stocked', used: 'Used', adjusted: 'Adjusted', edited: 'Edited', removed: 'Deleted',
-    undo: 'Undone', starter: 'Starter list', restored: 'Restored', settings: 'Settings', supply: 'Supply run' };
+    undo: 'Undone', starter: 'Starter list', restored: 'Restored', settings: 'Settings', supply: 'Supply run', checked: 'Checked',
+    plan: 'Emergency plan' };
   function logHtml(entries) {
     return entries.map(function (l) {
       return '<div class="log-item"><span class="log-dot ' + esc(l.action) + '"></span><div class="log-text"><b>' +
@@ -508,9 +611,11 @@
       amount = '<b>' + fq(i.total) + '</b>' + (it.target_qty > 0 ? ' of ' + fq(it.target_qty) : '') +
         (it.unit ? ' ' + esc(plural(it.unit, it.target_qty > 0 ? it.target_qty : i.total)) : '');
     }
+    var left = daysLeft(it);
+    var lasts = left > 0 ? '<span>· lasts ' + esc(lastsWords(left)) + '</span>' : '';
     var body = (showIcon ? '<span class="row-ico">' + cat(it.category).icon + '</span>' : '') +
       '<span class="row-text"><span class="row-name">' + esc(it.name) + '</span>' +
-      '<span class="row-sub"><span>' + amount + '</span>' + (where ? '<span>· ' + esc(where) + '</span>' : '') + badges + '</span></span>';
+      '<span class="row-sub"><span>' + amount + '</span>' + (where ? '<span>· ' + esc(where) + '</span>' : '') + lasts + badges + '</span></span>';
     if (SEL) {   // picking items to delete: the whole row is a tick box
       var on = !!SEL[it.id];
       return '<div class="row' + (on ? ' picked' : '') + (i.out ? ' is-out' : '') + '">' +
@@ -624,13 +729,22 @@
       .sort(function (a, b) { return catIndex(a.it.category) - catIndex(b.it.category) || byName(a.it, b.it); });
   }
 
+  // What the below-target items should cost, from the prices set on them.
+  function supplyCost(short) {
+    var c = { sum: 0, priced: 0 };
+    short.forEach(function (x) { if (x.it.price > 0) { c.sum += x.i.short * x.it.price; c.priced++; } });
+    return c;
+  }
+
   function renderSupply(el) {
     var short = shortList();
     var todo = S.shopping.filter(function (s) { return !s.done; }).length;
     var done = S.shopping.length - todo;
     var ha = S.server.ha && S.server.ha.todo ? S.server.ha : null;
     var ticked = ha ? ha.ticked || [] : [];
-    var html = '<section class="card"><div class="card-head"><h2>Supply run</h2><span class="small muted">' + (short.length + todo) + ' to get</span></div>' +
+    var cost = supplyCost(short);
+    var html = '<section class="card"><div class="card-head"><h2>Supply run</h2><span class="small muted">' + (short.length + todo) + ' to get' +
+      (cost.priced ? ' · about ' + esc(money(cost.sum)) : '') + '</span></div>' +
       '<p class="small muted">Everything below target, plus anything you add. Back from the shops? Tap <b>Got it</b> to put it in the stores.' +
       (ha ? ' It\'s also on your Home Assistant list <b>' + esc(ha.todo_name) + '</b>.' : '') + '</p>' +
       '<div class="btn-row"><button class="btn" data-act="copy-list">' + ICON.copy + ' Copy list</button>' +
@@ -647,7 +761,8 @@
           html += '<div class="group-head">' + cat(cur).icon + ' ' + esc(cat(cur).label) + '</div>';
         }
         html += '<div class="li"><button class="li-main" data-act="open" data-id="' + x.it.id + '"><div class="li-title">' + esc(x.it.name) + '</div>' +
-          '<div class="need">Get <b>' + esc(qu(x.i.short, x.it.unit)) + '</b> · have ' + esc(fq(x.i.total)) + ' of ' + esc(fq(x.it.target_qty)) + '</div>' +
+          '<div class="need">Get <b>' + esc(qu(x.i.short, x.it.unit)) + '</b> · have ' + esc(fq(x.i.total)) + ' of ' + esc(fq(x.it.target_qty)) +
+          (x.it.price > 0 ? ' · ' + esc(money(x.i.short * x.it.price)) : '') + '</div>' +
           (ticked.indexOf(x.it.id) >= 0 ? '<span class="badge ok ha-tick">' + ICON.check + ' Ticked off in Home Assistant</span>' : '') + '</button>' +
           '<button class="btn small" data-act="stock" data-id="' + x.it.id + '" data-qty="' + x.i.short + '">Got it</button></div>';
       });
@@ -681,6 +796,8 @@
       extra.forEach(function (s) { lines.push('- ' + s.text); });
     }
     if (!short.length && !extra.length) lines.push('Nothing needed. All squared away.');
+    var cost = supplyCost(short);
+    if (cost.priced) lines.push('', 'About ' + money(cost.sum) + (cost.priced < short.length ? ' for the ' + cost.priced + ' with a price' : ''));
     return lines.join('\n');
   }
 
@@ -704,6 +821,75 @@
       return navigator.clipboard.writeText(text).then(function () { return true; }, function () { return fallback(); });
     }
     return Promise.resolve(fallback());
+  }
+
+  // ------------------------------------------------------------------
+  // Plan: routine checks and the household emergency plan
+  // ------------------------------------------------------------------
+  function checkRow(x) {
+    var c = x.c, cls = x.i.state === 'never' ? 'warn' : x.i.state === 'ok' ? 'plain' : x.i.state;
+    return '<div class="li check-row"><span class="li-ico">📋</span>' +
+      '<button class="li-main" data-act="check-open" data-id="' + c.id + '"><span class="li-title wrap">' + esc(c.name) + '</span>' +
+      '<span class="li-sub"><span class="badge ' + cls + '">' + esc(x.i.text) + '</span><span>' + esc(everyWords(c.every_days)) + '</span></span></button>' +
+      '<button class="btn small" data-act="check-done" data-id="' + c.id + '" aria-label="' + esc(c.name) + ': done">' + ICON.check + ' Done</button></div>';
+  }
+
+  function missingSuggestions() {
+    var have = {};
+    (S.checks || []).forEach(function (c) { have[c.name.toLowerCase()] = 1; });
+    return (S.check_suggestions || []).filter(function (n) { return !have[n.toLowerCase()]; });
+  }
+
+  function renderPlan(el) {
+    var list = sortedChecks();
+    var due = list.filter(function (x) { return isDue(x.i); }).length;
+    var missing = missingSuggestions();
+    var html = '<section class="card' + (list.length ? ' flush' : '') + '"><div class="card-head"><h2>Routine checks</h2>' +
+      (list.length ? '<span class="small muted">' + (due ? due + ' due' : 'All done') + '</span>' : '') + '</div>';
+    if (!list.length) {
+      html += '<p class="small muted">Stores only help if the kit works when you need it. Keep a list of the jobs that come round regularly, ' +
+        'like testing the smoke alarms or charging the power banks. Tick each one off when you\'ve done it and Dads Army works out when it\'s next due.</p>' +
+        '<div class="btn-stack"><button class="btn primary block" data-act="checks-seed">Add suggested checks</button>' +
+        '<button class="btn block" data-act="check-new">' + ICON.plus + ' Add your own</button></div>';
+    } else {
+      html += '<p class="small muted pad">Tick each one off when you\'ve done it. Dads Army works out when it\'s next due.</p>' +
+        '<div class="list">' + list.map(checkRow).join('') + '</div>' +
+        '<div class="card-foot btn-row"><button class="btn" data-act="check-new">' + ICON.plus + ' Add a check</button>' +
+        (missing.length ? '<button class="btn" data-act="checks-seed">Suggestions (' + missing.length + ')</button>' : '') + '</div>';
+    }
+    el.innerHTML = html + '</section>' + planCard();
+  }
+
+  function planEmpty(p) {
+    return !p.contacts.length && PLAN_PARTS.every(function (x) { return !p[x[0]]; });
+  }
+  function telHref(phone) {
+    var d = String(phone || '').replace(/[^0-9+]/g, '');
+    return d.length >= 3 ? 'tel:' + d : '';
+  }
+  function planCard() {
+    var p = S.plan;
+    var html = '<section class="card"><div class="card-head"><h2>Emergency plan</h2>' +
+      (p.updated_at ? '<span class="small muted">updated ' + esc(ago(p.updated_at)) + '</span>' : '') + '</div>';
+    if (planEmpty(p)) {
+      return html + '<p class="small muted">Write down what everyone needs to know if something happens: who to call, where to meet, ' +
+        'and how to turn off the water, gas and electricity. It\'s kept here with the stores, works with the internet down, and prints on a page for the grab bag.</p>' +
+        '<button class="btn primary block" data-act="plan-edit">Make your plan</button></section>';
+    }
+    if (p.contacts.length) {
+      html += '<h3 class="plan-h">Contacts</h3><div class="list contacts">' + p.contacts.map(function (c) {
+        var tel = telHref(c.phone);
+        return '<div class="li"><span class="li-main"><span class="li-title">' + esc(c.name || c.phone) + '</span>' +
+          (c.role ? '<span class="li-sub">' + esc(c.role) + '</span>' : '') + '</span>' +
+          (tel ? '<a class="btn small call" href="' + esc(tel) + '" aria-label="Call ' + esc(c.name || c.phone) + '">' + ICON.phone + esc(c.phone) + '</a>'
+            : c.phone ? '<span class="small">' + esc(c.phone) + '</span>' : '') + '</div>';
+      }).join('') + '</div>';
+    }
+    PLAN_PARTS.forEach(function (x) {
+      if (p[x[0]]) html += '<h3 class="plan-h">' + esc(x[1]) + '</h3><div class="notes">' + esc(p[x[0]]) + '</div>';
+    });
+    return html + '<div class="btn-row" style="margin-top:16px"><button class="btn" data-act="plan-edit">' + ICON.edit + ' Edit plan</button>' +
+      '<button class="btn" data-act="print-plan">' + ICON.print + ' Print</button></div></section>';
   }
 
   // ------------------------------------------------------------------
@@ -749,6 +935,7 @@
       '<p class="small muted">If the power goes, so does the Pi. Keep a printed copy with the stores, and a backup somewhere other than the Pi.</p>' +
       '<div class="btn-stack">' +
       '<button class="btn block" data-act="print">' + ICON.print + ' Print full inventory</button>' +
+      '<button class="btn block" data-act="print-plan">' + ICON.print + ' Print emergency plan &amp; checks</button>' +
       '<a class="btn block" href="api/backup.json" download>' + ICON.download + ' Download backup</a>' +
       '<a class="btn block" href="api/export.csv" download>' + ICON.download + ' Export spreadsheet (CSV)</a>' +
       '<button class="btn block" data-act="restore">' + ICON.upload + ' Restore from a backup…</button></div>' +
@@ -858,6 +1045,36 @@
       extra.forEach(function (s) { html += '<tr><td class="tick">☐</td><td>' + esc(s.text) + '</td></tr>'; });
       html += '</tbody></table>';
     }
+    var cost = supplyCost(short);
+    if (cost.priced) html += '<p class="p-meta" style="margin-top:4mm">About ' + esc(money(cost.sum)) + (cost.priced < short.length ? ' for the ' + cost.priced + ' with a price' : '') + '</p>';
+    $('#print-root').innerHTML = html;
+    window.print();
+  }
+
+  function printPlan() {
+    var p = S.plan;
+    var html = '<h1>Dads Army · Emergency plan</h1><p class="p-meta">Printed ' + esc(new Date().toLocaleDateString('en-GB', { dateStyle: 'medium' })) +
+      (p.updated_at ? ' · plan last updated ' + esc(fmtDate(p.updated_at)) : '') + '</p>';
+    if (p.contacts.length) {
+      html += '<h2>Contacts</h2><table><thead><tr><th>Who</th><th></th><th class="num">Number</th></tr></thead><tbody>';
+      p.contacts.forEach(function (c) {
+        html += '<tr><td><b>' + esc(c.name) + '</b></td><td>' + esc(c.role) + '</td><td class="num"><b>' + esc(c.phone) + '</b></td></tr>';
+      });
+      html += '</tbody></table>';
+    }
+    PLAN_PARTS.forEach(function (x) {
+      if (p[x[0]]) html += '<h2>' + esc(x[1]) + '</h2><p class="p-text">' + esc(p[x[0]]) + '</p>';
+    });
+    var checks = sortedChecks();
+    if (checks.length) {
+      html += '<h2>Routine checks</h2><table><thead><tr><th>Check</th><th>How often</th><th>Last done</th><th>Next due</th><th>Done</th></tr></thead><tbody>';
+      checks.forEach(function (x) {
+        html += '<tr><td>' + esc(x.c.name) + '</td><td>' + esc(everyWords(x.c.every_days).replace(/^every /, 'Every ')) + '</td>' +
+          '<td>' + (x.c.last_done ? esc(fmtDate(x.c.last_done)) : 'Not yet') + '</td>' +
+          '<td class="p-exp">' + (x.i.due ? esc(fmtDate(x.i.due)) : 'Now') + '</td><td class="tick"></td></tr>';
+      });
+      html += '</tbody></table>';
+    }
     $('#print-root').innerHTML = html;
     window.print();
   }
@@ -900,13 +1117,15 @@
     var s = stack[stack.length - 1];
     if (!s) return;
     var html = {
-      item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText, halists: sheetHaLists
+      item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText, halists: sheetHaLists,
+      check: sheetCheck, plan: sheetPlan
     }[s.type](s);
     if (html === null) {   // the item was deleted elsewhere
       closeSheet();
       return;
     }
     $('#sheet-body').innerHTML = html;
+    if (s.type === 'edit') perDayHint($('#itemForm'));
   }
   function sheetHead(title, sub, icon) {
     return '<div class="sheet-head">' + (icon ? '<span class="li-ico">' + icon + '</span>' : '') +
@@ -916,10 +1135,11 @@
   function stat(value, label) {
     return '<div class="stat"><span class="stat-val">' + esc(value) + '</span><span class="stat-lbl">' + esc(label) + '</span></div>';
   }
-  function expiryField(val) {
+  function expiryField(val, usual) {
     return '<div class="field"><span>Best before / expiry</span>' +
       '<input type="date" name="expiry" value="' + esc(val || '') + '" aria-label="Best before date">' +
-      '<div class="quick">' + [[6, '6 months'], [12, '1 year'], [24, '2 years'], [60, '5 years'], [300, '25 years']].map(function (m) {
+      '<div class="quick">' + (usual ? '<button type="button" class="chip" data-exp="' + usual + '">Like last time (+' + monthsWords(usual) + ')</button>' : '') +
+      [[6, '6 months'], [12, '1 year'], [24, '2 years'], [60, '5 years'], [300, '25 years']].map(function (m) {
         return '<button type="button" class="chip" data-exp="' + m[0] + '">+' + m[1] + '</button>';
       }).join('') + '<button type="button" class="chip" data-exp="">No expiry</button></div></div>';
   }
@@ -939,6 +1159,8 @@
     if (it.category === 'water' && it.litres_per_unit > 0) {
       stats.push(stat(fq(Math.round(i.total * it.litres_per_unit * 10) / 10) + ' L', r.waterDay > 0 ? fmtDays(i.total * it.litres_per_unit / r.waterDay) + ' days of water' : 'of water'));
     }
+    if (it.per_day > 0) stats.push(stat(fmtDays(daysLeft(it)), 'days at ' + fq(it.per_day) + ' a day'));
+    if (it.price > 0) stats.push(stat(money(i.total * it.price), 'worth, at ' + money(it.price) + ' each'));
     var batches = it.batches.map(function (b) {
       var es = expState(b.expiry);
       var exp = b.expiry
@@ -965,7 +1187,7 @@
   function sheetEdit(s) {
     var it = s.id ? byId(s.id) : null;
     if (s.id && !it) return null;
-    var v = it || { name: '', category: s.cat || 'food', unit: '', kcal_per_unit: 0, litres_per_unit: 0, target_qty: 0, notes: '' };
+    var v = it || { name: '', category: s.cat || 'food', unit: '', kcal_per_unit: 0, litres_per_unit: 0, target_qty: 0, per_day: 0, price: 0, notes: '' };
     var cats = CATS.map(function (c) {
       return '<label class="cat-opt"><input type="radio" name="category" value="' + c.id + '"' + (c.id === v.category ? ' checked' : '') + '>' +
         '<span><i>' + c.icon + '</i>' + esc(c.short || c.label) + '</span></label>';
@@ -976,6 +1198,9 @@
       '<fieldset class="field"><legend>Category</legend><div class="cat-grid">' + cats + '</div></fieldset>' +
       '<div class="grid2"><label class="field"><span>Unit</span><input type="text" name="unit" value="' + esc(v.unit) + '" list="dl-units" placeholder="tin, pack, kg" maxlength="30" autocomplete="off"></label>' +
       '<label class="field"><span>Target stock</span><input type="number" name="target_qty" value="' + (v.target_qty || '') + '" inputmode="decimal" min="0" step="any" placeholder="0"></label></div>' +
+      '<div class="field"><div class="grid2"><label><span class="sub-label">Used a day</span><input type="number" name="per_day" value="' + (v.per_day || '') + '" inputmode="decimal" min="0" step="any" placeholder="0"></label>' +
+      '<label><span class="sub-label">Price each (£)</span><input type="number" name="price" value="' + (v.price || '') + '" inputmode="decimal" min="0" step="0.01" placeholder="Optional"></label></div>' +
+      '<div class="hint" id="perDayHint"></div></div>' +
       '<div class="only-food"><label class="field"><span>Calories per unit</span><input type="number" name="kcal_per_unit" value="' + (v.kcal_per_unit || '') + '" inputmode="decimal" min="0" step="any" placeholder="e.g. 340">' +
       '<div class="hint">Used to work out how many days your food will last.</div></label>' +
       '<details class="calc"><summary>Work it out from the label</summary><div class="grid2">' +
@@ -993,6 +1218,19 @@
     S.items.forEach(function (it) { if (it.batches.length && (!best || it.updated_at > best.updated_at)) best = it; });
     return best;
   }
+  // Under "Used a day": what that means for the target, with a one-tap way to use it.
+  function perDayHint(f) {
+    var box = f && $('#perDayHint', f);
+    if (!box) return;
+    var pd = num(f.elements.per_day.value), days = S.settings.target_days;
+    if (pd > 0) {
+      var need = Math.ceil(pd * days - 1e-9);
+      box.innerHTML = 'For your ' + days + '-day target that\'s <b>' + esc(fq(need)) + '</b>.' +
+        (num(f.elements.target_qty.value) === need ? '' : ' <button type="button" class="link" data-act="use-target" data-val="' + need + '">Make that the target</button>');
+    } else {
+      box.textContent = 'For things you get through every day, like tablets, nappies or toilet roll: shows how long they\'ll last. A price adds up what the stores are worth.';
+    }
+  }
 
   function sheetStock(s) {
     var it = byId(s.id);
@@ -1000,7 +1238,7 @@
     return sheetHead('Add stock', it.name, cat(it.category).icon) +
       '<form id="stockForm" data-id="' + it.id + '" novalidate>' +
       '<div class="field"><span>' + esc(howMany(it.unit)) + '</span>' + stepperHtml('qty', s.qty || 1, 'Quantity') + '</div>' +
-      expiryField('') + locationField(lastLocation(it) || lastLocation(lastTouched())) +
+      expiryField('', usualLife(it)) + locationField(lastLocation(it) || lastLocation(lastTouched())) +
       '<div class="sheet-actions"><button class="btn primary block" type="submit">' + ICON.plus + ' Add to stores</button></div></form>';
   }
 
@@ -1051,6 +1289,72 @@
     return sheetHead('Choose a to-do list', 'From Home Assistant', '📋') + body;
   }
 
+  var EVERY = [[7, 'Weekly'], [30, 'Monthly'], [91, '3 months'], [182, '6 months'], [365, 'Yearly']];
+  function sheetCheck(s) {
+    var c = s.id ? (S.checks || []).filter(function (x) { return x.id === s.id; })[0] : null;
+    if (s.id && !c) return null;
+    var v = c || { name: '', every_days: 30, last_done: null, notes: '' };
+    var sub = c ? checkInfo(c).text + ' · ' + everyWords(c.every_days) : 'Something that needs doing regularly';
+    return sheetHead(c ? c.name : 'New check', sub, '📋') +
+      '<form id="checkForm" data-id="' + (c ? c.id : '') + '" novalidate>' +
+      (c ? '<div class="btn-row" style="margin-bottom:16px"><button class="btn primary" type="button" data-act="check-done" data-id="' + c.id + '">' + ICON.check + ' Done today</button></div>' : '') +
+      '<label class="field"><span>What needs doing?</span><input type="text" name="name" value="' + esc(v.name) + '" maxlength="120" placeholder="e.g. Run the generator" autocomplete="off"' + (c ? '' : ' data-autofocus') + '></label>' +
+      '<div class="field every"><span>How often (days)</span>' + stepperHtml('every_days', v.every_days, 'Days between checks') +
+      '<div class="quick">' + EVERY.map(function (e) {
+        return '<button type="button" class="chip" data-every="' + e[0] + '" aria-pressed="' + (v.every_days === e[0]) + '">' + e[1] + '</button>';
+      }).join('') + '</div></div>' +
+      '<div class="field"><span>Last done</span><input type="date" name="last_done" value="' + esc(v.last_done || '') + '" max="' + today() + '" aria-label="Last done">' +
+      '<div class="quick"><button type="button" class="chip" data-setdate="today">Today</button><button type="button" class="chip" data-setdate="">Not done yet</button></div></div>' +
+      '<label class="field"><span>Notes</span><textarea name="notes" rows="2" maxlength="1000" placeholder="Optional: how to do it, what to look out for">' + esc(v.notes) + '</textarea></label>' +
+      '<div class="sheet-actions"><button class="btn ' + (c ? '' : 'primary ') + 'block" type="submit">' + (c ? 'Save changes' : 'Add check') + '</button>' +
+      (c ? '<button class="btn danger block" type="button" data-act="check-del" data-id="' + c.id + '">' + ICON.trash + ' Delete this check</button>' : '') + '</div></form>';
+  }
+  function syncEvery(field) {
+    var v = num($('input', field).value);
+    $$('[data-every]', field).forEach(function (b) { b.setAttribute('aria-pressed', String(+b.dataset.every === v)); });
+  }
+
+  function contactRow(c) {
+    c = c || {};
+    return '<div class="contact-row" data-contact>' +
+      '<input type="text" data-c="name" value="' + esc(c.name) + '" placeholder="Name" maxlength="80" aria-label="Name" autocomplete="off">' +
+      '<input type="tel" data-c="phone" value="' + esc(c.phone) + '" placeholder="Number" maxlength="40" aria-label="Phone number" autocomplete="off">' +
+      '<button type="button" class="icon-btn" data-act="contact-del" aria-label="Remove this contact">' + ICON.close + '</button>' +
+      '<input type="text" data-c="role" value="' + esc(c.role) + '" placeholder="Who they are, e.g. out-of-area contact" maxlength="80" aria-label="Who they are" autocomplete="off"></div>';
+  }
+  function sheetPlan() {
+    var p = S.plan;
+    var heads = { meet_near: 'Where to meet', water_off: 'Turning things off', medical: 'People, pets and papers' };
+    return sheetHead('Emergency plan', 'What everyone needs to know', '🗺️') +
+      '<form id="planForm" novalidate>' +
+      '<h3>Contacts</h3><p class="small muted">Family, an out-of-area contact everyone can ring, neighbours, the GP, work and school.</p>' +
+      '<div id="contacts">' + (p.contacts.length ? p.contacts.map(contactRow).join('') : contactRow()) + '</div>' +
+      '<div class="quick" style="margin-bottom:6px"><button type="button" class="chip" data-act="contact-add">' + ICON.plus + ' Add a contact</button>' +
+      '<button type="button" class="chip" data-act="contact-uk">Add UK emergency numbers</button></div>' +
+      PLAN_PARTS.map(function (x) {
+        return (heads[x[0]] ? '<h3>' + heads[x[0]] + '</h3>' : '') +
+          '<label class="field"><span>' + esc(x[1]) + '</span><textarea name="' + x[0] + '" rows="2" maxlength="' + x[3] + '" placeholder="' + esc(x[2]) + '">' + esc(p[x[0]]) + '</textarea></label>';
+      }).join('') +
+      '<div class="sheet-actions"><button class="btn primary block" type="submit">Save plan</button></div></form>';
+  }
+  function addUkNumbers(btn) {
+    var box = $('#contacts'), have = {};
+    $$('[data-contact]', box).forEach(function (row) {
+      var d = $('[data-c="phone"]', row).value.replace(/\D/g, '');
+      if (d) have[d] = 1;
+      // Drop the empty row the form starts with
+      if (!d && !$('[data-c="name"]', row).value.trim() && !$('[data-c="role"]', row).value.trim()) row.remove();
+    });
+    var added = 0;
+    UK_NUMBERS.forEach(function (n) {
+      if (have[n[2].replace(/\D/g, '')]) return;
+      box.insertAdjacentHTML('beforeend', contactRow({ name: n[0], role: n[1], phone: n[2] }));
+      added++;
+    });
+    toast(added ? 'Added ' + added + ' numbers. Save the plan to keep them.' : 'They\'re already on your plan');
+    if (btn) btn.blur();
+  }
+
   // ------------------------------------------------------------------
   // Toast + undo
   // ------------------------------------------------------------------
@@ -1060,6 +1364,7 @@
     t.className = 'toast' + (opts.error ? ' error' : '');
     t.innerHTML = '<span>' + esc(msg) + '</span>' + (opts.undo ? '<button type="button" data-act="undo">Undo</button>' : '');
     t._undo = opts.undo || null;
+    t._undoPath = opts.undoPath || 'api/restore-item';
     t.hidden = false;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(function () { t.hidden = true; t._undo = null; },
@@ -1154,12 +1459,68 @@
           });
         }, a);
       case 'undo': {
-        var t = $('#toast'), snap = t._undo;
+        var t = $('#toast'), snap = t._undo, path = t._undoPath || 'api/restore-item';
         t.hidden = true;
         if (!snap) return;
         return run(function () {
-          return api('POST', 'api/restore-item', snap).then(refresh).then(function () { toast('Undone'); });
+          return api('POST', path, snap).then(refresh).then(function () { toast('Undone'); });
         });
+      }
+      case 'check-new':
+        return openSheet({ type: 'check', id: null });
+      case 'check-open':
+        return openSheet({ type: 'check', id: id });
+      case 'check-done': {
+        var ck = (S.checks || []).filter(function (x) { return x.id === id; })[0];
+        return run(function () {
+          return api('POST', 'api/checks/' + id + '/done', {}).then(function (res) {
+            if (stack.length && stack[stack.length - 1].type === 'check') closeSheet();
+            return refresh().then(function () {
+              toast((ck ? ck.name + ': done. ' : 'Done. ') + 'Next due ' + fmtDate(res.next_due) + '.', { undo: res.undo, undoPath: 'api/checks/restore' });
+            });
+          });
+        }, a);
+      }
+      case 'check-del':
+        return run(function () {
+          return api('DELETE', 'api/checks/' + id).then(function (res) {
+            closeSheet();
+            return refresh().then(function () { toast('Deleted ' + res.undo.check.name, { undo: res.undo, undoPath: 'api/checks/restore' }); });
+          });
+        }, a);
+      case 'checks-seed': {
+        var miss = missingSuggestions();
+        if (!miss.length) return toast('You already have all the suggested checks');
+        if (!confirm('Add ' + miss.length + ' suggested check' + (miss.length === 1 ? '' : 's') + '?\n\n• ' + miss.join('\n• ') +
+          '\n\nThey start as not done yet. Tap Done on each one as you do it, and delete any you don\'t need.')) return;
+        return run(function () {
+          return api('POST', 'api/checks/seed', {}).then(function (res) {
+            return refresh().then(function () { toast('Added ' + res.added + ' check' + (res.added === 1 ? '' : 's')); });
+          });
+        }, a);
+      }
+      case 'plan-edit':
+        return openSheet({ type: 'plan' });
+      case 'print-plan':
+        if (planEmpty(S.plan) && !(S.checks || []).length) return toast('Nothing to print yet: fill in the plan on the Plan tab', { error: true });
+        return printPlan();
+      case 'contact-add': {
+        var box = $('#contacts');
+        box.insertAdjacentHTML('beforeend', contactRow());
+        return $('[data-contact]:last-child [data-c="name"]', box).focus();
+      }
+      case 'contact-del': {
+        var row = a.closest('[data-contact]');
+        if (row) row.remove();
+        if (!$('#contacts [data-contact]')) $('#contacts').insertAdjacentHTML('beforeend', contactRow());
+        return;
+      }
+      case 'contact-uk':
+        return addUkNumbers(a);
+      case 'use-target': {
+        var form = a.closest('form');
+        form.elements.target_qty.value = a.dataset.val;
+        return perDayHint(form);
       }
       case 'go':
         return goStores(a.dataset.sort ? { show: a.dataset.show, sort: a.dataset.sort } : { show: a.dataset.show });
@@ -1261,7 +1622,8 @@
       if (!d.name) { toast('Give the item a name', { error: true }); f.elements.name.focus(); return; }
       var body = {
         name: d.name, category: d.category || 'other', unit: d.unit || '', notes: d.notes || '',
-        target_qty: num(d.target_qty), kcal_per_unit: num(d.kcal_per_unit), litres_per_unit: num(d.litres_per_unit)
+        target_qty: num(d.target_qty), kcal_per_unit: num(d.kcal_per_unit), litres_per_unit: num(d.litres_per_unit),
+        per_day: num(d.per_day), price: num(d.price)
       };
       var id = f.dataset.id;
       if (!id) { body.qty = num(d.qty); body.expiry = d.expiry || null; body.location = d.location || ''; }
@@ -1299,6 +1661,34 @@
         return api('PUT', 'api/batches/' + f.dataset.id, { qty: num(d.qty), expiry: d.expiry || null, location: d.location || '' }).then(function (res) {
           closeSheet();
           return refresh().then(function () { toast(res.removed ? 'Batch removed' : 'Batch saved', res.removed ? { undo: res.undo } : {}); });
+        });
+      }, btn);
+    }
+    if (f.id === 'checkForm') {
+      if (!d.name) { toast('Say what needs doing', { error: true }); f.elements.name.focus(); return; }
+      var every = Math.round(num(d.every_days));
+      if (every < 1) { toast('How many days between checks?', { error: true }); return; }
+      var cid = f.dataset.id;
+      var cbody = { name: d.name, every_days: every, last_done: d.last_done || null, notes: d.notes || '' };
+      return run(function () {
+        return api(cid ? 'PUT' : 'POST', cid ? 'api/checks/' + cid : 'api/checks', cbody).then(function () {
+          closeSheet();
+          return refresh().then(function () { toast(cid ? 'Saved' : 'Check added'); });
+        });
+      }, btn);
+    }
+    if (f.id === 'planForm') {
+      var plan = { contacts: [] };
+      $$('[data-contact]', f).forEach(function (row) {
+        var c = {};
+        ['name', 'role', 'phone'].forEach(function (k) { c[k] = $('[data-c="' + k + '"]', row).value.trim(); });
+        if (c.name || c.role || c.phone) plan.contacts.push(c);
+      });
+      PLAN_PARTS.forEach(function (x) { plan[x[0]] = d[x[0]] || ''; });
+      return run(function () {
+        return api('PUT', 'api/plan', plan).then(function () {
+          closeSheet();
+          return refresh().then(function () { toast('Plan saved'); });
         });
       }, btn);
     }
@@ -1346,6 +1736,17 @@
     }
     var setQty = t.closest('[data-setqty]');
     if (setQty) { setQty.closest('.field').querySelector('input').value = setQty.dataset.setqty; return; }
+    var every = t.closest('[data-every]');
+    if (every) {
+      every.closest('.field').querySelector('input').value = every.dataset.every;
+      syncEvery(every.closest('.field'));
+      return;
+    }
+    var setDate = t.closest('[data-setdate]');
+    if (setDate) {
+      setDate.closest('.field').querySelector('input[type="date"]').value = setDate.dataset.setdate === 'today' ? today() : '';
+      return;
+    }
     var tab = t.closest('[data-tab]');
     if (tab) { if (stack.length) return; go(tab.dataset.tab); return; }
     var a = t.closest('[data-act]');
@@ -1365,6 +1766,8 @@
       var per = num($('[data-calc="per100"]', f).value), g = num($('[data-calc="grams"]', f).value);
       if (per > 0 && g > 0) f.elements.kcal_per_unit.value = Math.round(per * g / 100);
     }
+    if ((t.name === 'per_day' || t.name === 'target_qty') && t.form && t.form.id === 'itemForm') perDayHint(t.form);
+    if (t.name === 'every_days') syncEvery(t.closest('.field'));
   });
 
   document.addEventListener('change', function (e) {
@@ -1377,6 +1780,7 @@
       return;
     }
     if (t.dataset.setting) { queueSetting(t.dataset.setting, num(t.value)); return; }
+    if (t.name === 'every_days') { syncEvery(t.closest('.field')); return; }
     if (t.name === 'category' && t.form) { t.form.dataset.cat = t.value; return; }
     if (t.id === 'restoreFile' && t.files && t.files[0]) {
       var file = t.files[0];

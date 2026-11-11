@@ -23,8 +23,11 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_expired` | Items with stock past its best-before date | `items` (each has `name`, `qty`, `expiry`, `days`, `location` and `text`), `total`, `newly_expired` (went out of date overnight) |
 | `sensor.dads_army_expiring_soon` | Items reaching their best-before date within your warning window (HQ) | `items`, `total`, `warn_days`, `expires_today` (on their last day) |
 | `sensor.dads_army_next_expiry` | Date of the next thing to expire | `name`, `qty`, `location`, `days` |
-| `sensor.dads_army_supply_run` | Number of things on the shopping list | `items`, `extras` |
-| `binary_sensor.dads_army_attention` | **On** if anything has expired or run out | `reasons` |
+| `sensor.dads_army_supply_run` | Number of things on the shopping list | `items`, `extras`, `cost` (from the prices you've set, in £) |
+| `sensor.dads_army_supplies` | Days until the first thing with a daily use runs out (such as tablets or toilet roll). Unknown if nothing has a daily use set. | `items` (each has `name`, `days`, `have`, `per_day` and `text`), `runs_out_first`, `target_days` |
+| `sensor.dads_army_checks_due` | Routine checks that are due, overdue or not done yet | `items` (each has `name`, `due`, `days`, `every` and `text`), `due_today`, `due_soon` (within a week), `next_check`, `checks_total` |
+| `sensor.dads_army_stores_value` | What the stores are worth, in £, from the prices you've set | `supply_run_cost`, `priced_items`, `items_total` |
+| `binary_sensor.dads_army_attention` | **On** if anything has expired or run out, or a check is due | `reasons` |
 
 Each list holds up to 30 entries; `total` gives the full count. The numbers are recorded in Home Assistant's history, so you can chart how your readiness changes over time.
 
@@ -92,6 +95,13 @@ cards:
       - type: tile
         entity: sensor.dads_army_kit_stocked
         name: Kit stocked
+      - type: tile
+        entity: sensor.dads_army_checks_due
+        name: Checks due
+        color: purple
+      - type: tile
+        entity: sensor.dads_army_supplies
+        name: Daily supplies
   - type: markdown
     title: Needs attention
     content: |
@@ -112,13 +122,15 @@ cards:
       {{- part('mdi:calendar-alert', 'Expiring soon', 'sensor.dads_army_expiring_soon', 6) }}
       {{- part('mdi:package-variant-remove', 'Out of stock', 'sensor.dads_army_out_of_stock', 5) }}
       {{- part('mdi:package-down', 'Running low', 'sensor.dads_army_low_stock', 5) }}
+      {{- part('mdi:clipboard-check-outline', 'Checks due', 'sensor.dads_army_checks_due', 5) }}
       {%- if states('sensor.dads_army_expired') in ['unknown', 'unavailable'] -%}
       <ha-icon icon="mdi:lan-disconnect"></ha-icon> Dads Army isn't sending updates. Check the app is running.
       {%- elif states('sensor.dads_army_expired') | int(0) == 0
             and states('sensor.dads_army_expiring_soon') | int(0) == 0
             and states('sensor.dads_army_out_of_stock') | int(0) == 0
-            and states('sensor.dads_army_low_stock') | int(0) == 0 -%}
-      <ha-icon icon="mdi:check-circle"></ha-icon> All squared away: nothing expired, expiring or short.
+            and states('sensor.dads_army_low_stock') | int(0) == 0
+            and states('sensor.dads_army_checks_due') | int(0) == 0 -%}
+      <ha-icon icon="mdi:check-circle"></ha-icon> All squared away: nothing expired, expiring, short or due.
       {%- endif %}
   - type: history-graph
     title: Days you could last
@@ -140,8 +152,10 @@ Two ready-made automations (blueprints) send Dads Army news to your phone. You n
 
 | Blueprint | What it sends |
 |---|---|
-| **Dads Army: phone alerts** | Straight away when something runs out. Every morning (8:30 unless you change it), anything that went out of date overnight and anything on its last day. |
-| **Dads Army: weekly round-up** | Once a week (Sunday 6pm unless you change it): what to use first, anything out of date, the supply run and how long you could hold out. |
+| **Dads Army: phone alerts** | Straight away when something runs out. Every morning (8:30 unless you change it), anything that went out of date overnight, anything on its last day, and any routine check that falls due that day. |
+| **Dads Army: weekly round-up** | Once a week (Sunday 6pm unless you change it): what to use first, anything out of date, checks that are due, the supply run, what runs out first, and how long you could hold out. |
+
+**Already set these up before Dads Army 1.5.0?** Re-import them to get the checks and daily supplies: go to **Settings → Automations & scenes → Blueprints**, open the **⋮** menu next to each Dads Army blueprint, and choose **Re-import blueprint**. Your automations keep their settings.
 
 To set one up:
 
@@ -173,11 +187,21 @@ How it works:
 
 Changes show up on the other side within about half a minute.
 
+## Routine checks, daily use and the emergency plan
+
+The **Plan** tab in Dads Army holds two things:
+
+- **Routine checks:** jobs that come round regularly, such as testing the smoke alarms, charging the power banks or rotating stored water. Tap **Done** when you've done one, and Dads Army works out when it's next due. **Add suggested checks** gives you a starting set. Checks that are due show on the Sitrep, in `sensor.dads_army_checks_due`, and in the phone alerts.
+- **Emergency plan:** who to call, where to meet, how to turn off the water, gas and electricity, medical needs, pets and where the documents are. It's stored with the stores, so it works with the internet down, and it prints on a page for the grab bag. **Add UK emergency numbers** fills in 999, 111, 105 (power cuts), the gas emergency line, Floodline and 101.
+
+When you edit an item, **Used a day** says how many your household gets through each day (tablets, nappies, toilet roll, gas canisters). Dads Army then shows how long each one lasts, and the Sitrep's **Daily supplies** bar shows the first to run out. **Price each** adds up what the stores are worth and what the supply run will cost.
+
 ## Automation ideas
 
-- Use `binary_sensor.dads_army_attention` for a warning light: it's **on** whenever something has expired or run out, and its `reasons` attribute says what.
+- Use `binary_sensor.dads_army_attention` for a warning light: it's **on** whenever something has expired or run out or a check is due, and its `reasons` attribute says what.
 - Flash a light or announce on a speaker when the `dads_army_ran_out` event fires.
 - Get a reminder when `sensor.dads_army_readiness` drops below 100%.
+- Get a warning when `sensor.dads_army_supplies` drops below a week, so there's time to get more of your medicines.
 
 ## Your data
 
@@ -185,7 +209,7 @@ Your data is kept in the app's own storage. It survives restarts and updates, an
 
 - Dads Army saves a copy of its database every day and keeps the last 14.
 - HQ → **Download backup** saves a copy to your phone.
-- HQ → **Print full inventory** gives you a paper copy to keep with the stores.
+- HQ → **Print full inventory** gives you a paper copy to keep with the stores, and **Print emergency plan & checks** gives you the plan.
 
 ## Security
 
