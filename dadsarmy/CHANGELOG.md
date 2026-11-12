@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.6.0
+
+- **Warnings for where you live.** Switch them on under **HQ → Warnings** to see official warnings from:
+  - the Met Office (yellow, amber and red weather warnings for your region)
+  - the Environment Agency (flood alerts and warnings near you, England only)
+  - GOV.UK Emergency Alerts
+  - GDACS, the UN and EU disaster alert system (orange and red alerts within 1,000 km)
+  - optionally, news from the UK Health Security Agency and WHO disease outbreak news
+- The most serious warnings show at the top of the Sitrep. The Plan tab lists them all, with the health news.
+- Tap a warning for the official message and a link to the full details. You also get what to do, and the parts of your emergency plan that matter, such as where to meet and how to turn off the gas, electricity and water.
+- **Private and offline-friendly.** Dads Army downloads the same public files for everyone and works out what's near you on your own machine, so your location is never sent. Without the internet, everything else carries on and the last warnings stay on show with when they were checked.
+- **Home Assistant.**
+  - New `sensor.dads_army_warnings`, and a `dads_army_warning` event when a new warning comes in.
+  - The phone alerts blueprint tells you straight away: amber and worse unless you choose otherwise.
+  - The weekly round-up lists warnings in force, and **Needs attention** comes on for serious ones.
+  - Re-import both blueprints to get these changes.
+
 ## 1.5.0
 
 - **New Plan tab: routine checks.** Keep track of the jobs that keep your kit ready, such as testing the smoke alarms, charging the power banks, rotating stored water and checking the grab bag.

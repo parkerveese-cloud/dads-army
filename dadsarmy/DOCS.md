@@ -27,11 +27,14 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_supplies` | Days until the first thing with a daily use runs out (such as tablets or toilet roll). Unknown if nothing has a daily use set. | `items` (each has `name`, `days`, `have`, `per_day` and `text`), `runs_out_first`, `target_days` |
 | `sensor.dads_army_checks_due` | Routine checks that are due, overdue or not done yet | `items` (each has `name`, `due`, `days`, `every` and `text`), `due_today`, `due_soon` (within a week), `next_check`, `checks_total` |
 | `sensor.dads_army_stores_value` | What the stores are worth, in £, from the prices you've set | `supply_run_cost`, `priced_items`, `items_total` |
-| `binary_sensor.dads_army_attention` | **On** if anything has expired or run out, or a check is due | `reasons` |
+| `sensor.dads_army_warnings` | Official warnings in force for where you live (see **Warnings** below). 0 while warnings are switched off. | `items` (each has `title`, `level`, `severity` 1–3, `source`, `area`, `when`, `url` and `text`), `highest` (yellow, amber or red), `max_severity`, `enabled`, `checked_at`, `health_news` |
+| `binary_sensor.dads_army_attention` | **On** if anything has expired or run out, a check is due, or a serious warning (amber or worse) is in force | `reasons` |
 
 Each list holds up to 30 entries; `total` gives the full count. The numbers are recorded in Home Assistant's history, so you can chart how your readiness changes over time.
 
 Home Assistant doesn't keep these sensors after it restarts, so Dads Army sends them again within a minute. While Dads Army is stopped, they show as unavailable.
+
+When a new warning comes in, Dads Army fires a `dads_army_warning` event. Its data has `message`, `count`, `max_severity` and `items` (each with `title`, `level`, `severity`, `source`, `area` and `url`).
 
 When the last of something is used up, Dads Army also fires a `dads_army_ran_out` event. Its data has `message` (ready to send, such as "Baked beans has run out. It's on the supply run: get 6 tins."), `names`, `count` and `items`. The phone alerts below use it.
 
@@ -105,6 +108,13 @@ cards:
   - type: markdown
     title: Needs attention
     content: |
+      {% set warns = state_attr('sensor.dads_army_warnings', 'items') or [] -%}
+      {% if warns -%}
+      #### <ha-icon icon="mdi:alert-octagon"></ha-icon> Warnings ({{ states('sensor.dads_army_warnings') }})
+      {% for i in warns[:5] -%}
+      - **{{ i.level }}** · {{ i.title }}
+      {% endfor %}
+      {% endif -%}
       {% macro part(icon, title, entity, n) -%}
       {% set rows = state_attr(entity, 'items') or [] -%}
       {% if rows -%}
@@ -129,8 +139,9 @@ cards:
             and states('sensor.dads_army_expiring_soon') | int(0) == 0
             and states('sensor.dads_army_out_of_stock') | int(0) == 0
             and states('sensor.dads_army_low_stock') | int(0) == 0
-            and states('sensor.dads_army_checks_due') | int(0) == 0 -%}
-      <ha-icon icon="mdi:check-circle"></ha-icon> All squared away: nothing expired, expiring, short or due.
+            and states('sensor.dads_army_checks_due') | int(0) == 0
+            and states('sensor.dads_army_warnings') | int(0) == 0 -%}
+      <ha-icon icon="mdi:check-circle"></ha-icon> All squared away: no warnings, and nothing expired, expiring, short or due.
       {%- endif %}
   - type: history-graph
     title: Days you could last
@@ -152,10 +163,10 @@ Two ready-made automations (blueprints) send Dads Army news to your phone. You n
 
 | Blueprint | What it sends |
 |---|---|
-| **Dads Army: phone alerts** | Straight away when something runs out. Every morning (8:30 unless you change it), anything that went out of date overnight, anything on its last day, and any routine check that falls due that day. |
-| **Dads Army: weekly round-up** | Once a week (Sunday 6pm unless you change it): what to use first, anything out of date, checks that are due, the supply run, what runs out first, and how long you could hold out. |
+| **Dads Army: phone alerts** | Straight away when a new warning comes in (amber and worse unless you choose otherwise), and when something runs out. Every morning (8:30 unless you change it), anything that went out of date overnight, anything on its last day, and any routine check that falls due that day. |
+| **Dads Army: weekly round-up** | Once a week (Sunday 6pm unless you change it): any warnings in force, what to use first, anything out of date, checks that are due, the supply run, what runs out first, and how long you could hold out. |
 
-**Already set these up before Dads Army 1.5.0?** Re-import them to get the checks and daily supplies: go to **Settings → Automations & scenes → Blueprints**, open the **⋮** menu next to each Dads Army blueprint, and choose **Re-import blueprint**. Your automations keep their settings.
+**Already set these up before Dads Army 1.6.0?** Re-import them to get warnings, checks and daily supplies: go to **Settings → Automations & scenes → Blueprints**, open the **⋮** menu next to each Dads Army blueprint, and choose **Re-import blueprint**. Your automations keep their settings.
 
 To set one up:
 
@@ -187,6 +198,29 @@ How it works:
 
 Changes show up on the other side within about half a minute.
 
+## Warnings
+
+Dads Army can show official warnings for where you live: on the Sitrep, on the **Plan** tab, in `sensor.dads_army_warnings`, and on your phone through the phone alerts blueprint. They're off until you switch them on under **HQ → Warnings**.
+
+| Source | What you get |
+|---|---|
+| Met Office | Yellow, amber and red weather warnings for your region |
+| Environment Agency | Flood alerts, flood warnings and severe flood warnings near you (England only) |
+| GOV.UK Emergency Alerts | Alerts about a danger to life, while they're being sent and for 12 hours after |
+| GDACS (the UN and EU disaster alert system) | Orange and red alerts for earthquakes, floods, storms, volcanoes and tsunamis within 1,000 km |
+| UK Health Security Agency (optional) | Its latest news, such as cold-weather and heat-health alerts |
+| WHO (optional) | Disease outbreak news |
+
+How it works:
+
+- Dads Army checks every 15 minutes while the internet is up. It downloads the same public files for everyone and works out which warnings are near you on your own machine, so your location is never sent anywhere.
+- Your location comes from Home Assistant's home location. You can set it by hand instead in the warnings settings. The Met Office region is worked out from it, and you can change that too.
+- Tap a warning for the full message, a link to the official page, what to do, and the parts of your emergency plan that matter, such as where to meet and how to turn things off.
+- If the internet goes down, everything else carries on, and the last warnings found stay on show with when they were checked.
+- Keep **Emergency Alerts** switched on in your phone's settings too. They reach the phone directly, much faster than any feed.
+
+Flood warnings outside England come from SEPA (Scotland), Natural Resources Wales and NI Direct, which Dads Army doesn't read yet.
+
 ## Routine checks, daily use and the emergency plan
 
 The **Plan** tab in Dads Army holds two things:
@@ -202,6 +236,7 @@ When you edit an item, **Used a day** says how many your household gets through 
 - Flash a light or announce on a speaker when the `dads_army_ran_out` event fires.
 - Get a reminder when `sensor.dads_army_readiness` drops below 100%.
 - Get a warning when `sensor.dads_army_supplies` drops below a week, so there's time to get more of your medicines.
+- Turn a light red, or announce on a speaker, when `sensor.dads_army_warnings` has a `max_severity` of 3 (a red warning, a severe flood warning or an Emergency Alert).
 
 ## Your data
 

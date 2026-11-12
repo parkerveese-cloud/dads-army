@@ -7,13 +7,14 @@ A stores tracker for food, water and emergency kit. It runs on a Raspberry Pi or
 - **Batches and rotation:** the same item can have several batches with different best-before dates and locations. Using stock always takes the oldest first.
 - **Daily use:** say how many tablets, nappies or toilet rolls you get through a day, and Dads Army shows how long each will last and what runs out first.
 - **Supply run:** an automatic shopping list of everything below target, plus your own extras. **Got it** puts the shopping straight into the stores. Set prices to see what it'll cost and what the stores are worth.
+- **Warnings (optional):** Met Office weather warnings, flood warnings near you, UK Emergency Alerts and major disasters near the UK, with optional UK Health Security Agency and WHO news. Each comes with what to do, and the parts of your emergency plan that matter.
 - **Plan:**
   - **Routine checks:** test the smoke alarms, charge the power banks, rotate the water. Dads Army tells you when each is due.
   - **Household emergency plan:** contacts, meeting places, how to turn off the water, gas and electricity, and medical needs. It's ready to print for the grab bag.
 - **HQ:** household size, calorie and water needs, readiness target (3 days to a year), backups, a printed hard copy, a starter list of about 95 essentials, light/dark mode, and the activity log.
 - **Undo** on anything you use or delete. Several phones can use it at once.
 
-It needs no internet to run. Nothing leaves your network.
+It needs no internet to run, and nothing about you leaves your network. The only time it uses the internet is if you switch on warnings, and then it just downloads the public warning feeds.
 
 ---
 
@@ -44,9 +45,11 @@ You can then open it in two ways:
   - checks due
   - daily supplies
   - what the stores are worth
+  - warnings in force
 
   You can use them on dashboards, in automations and in Companion app widgets. A ready-made dashboard card is on the app's **Documentation** tab.
 - **Phone alerts.** Two blueprints in [blueprints/automation](blueprints/automation) send notifications to your phone:
+  - new warnings for where you live
   - when something runs out
   - each morning, anything that went out of date overnight and any check that's due
   - a weekly round-up of what to use first

@@ -23,6 +23,7 @@
   --good: #3f7a3a;   --good-bg: #dcebd5;
   --warn: #b77600;   --warn-bg: #f5e3bd;  --warn-ink: #7f5200;
   --bad:  #b0342c;   --bad-bg:  #f6d8d3;  --bad-ink:  #8f2822;
+  --yel:  #c9a800;   --yel-bg:  #f4ecb2;  --yel-ink:  #5f5000;
 
   --radius: 16px;
   --nav-h: 64px;
@@ -54,6 +55,7 @@
     --good: #84c472;   --good-bg: #1d2e18;
     --warn: #e6a93c;   --warn-bg: #362a10;  --warn-ink: #f0c066;
     --bad:  #f07b6e;   --bad-bg:  #3a1a16;  --bad-ink:  #f6a197;
+    --yel:  #e3cf4a;   --yel-bg:  #34300f;  --yel-ink:  #ecdc72;
     --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px rgba(0, 0, 0, .35);
     color-scheme: dark;
   }
@@ -78,6 +80,7 @@
   --good: #84c472;   --good-bg: #1d2e18;
   --warn: #e6a93c;   --warn-bg: #362a10;  --warn-ink: #f0c066;
   --bad:  #f07b6e;   --bad-bg:  #3a1a16;  --bad-ink:  #f6a197;
+  --yel:  #e3cf4a;   --yel-bg:  #34300f;  --yel-ink:  #ecdc72;
   --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px rgba(0, 0, 0, .35);
   color-scheme: dark;
 }
@@ -324,6 +327,7 @@ body.selecting .toast { bottom: calc(var(--nav-h) + env(safe-area-inset-bottom) 
 .badge.warn { background: var(--warn-bg); color: var(--warn-ink); }
 .badge.ok { background: var(--good-bg); color: var(--good); }
 .badge.plain { background: var(--surface-2); color: var(--ink-2); }
+.badge.yellow { background: var(--yel-bg); color: var(--yel-ink); }
 
 /* Plan: checks and the emergency plan */
 .card.flush > p.pad { padding: 0 16px; margin: 0 0 12px; }
@@ -348,6 +352,27 @@ body.selecting .toast { bottom: calc(var(--nav-h) + env(safe-area-inset-bottom) 
   display: block; margin-bottom: 6px;
   font: 700 12.5px/1.2 var(--font-cond); letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2);
 }
+
+/* Warnings */
+.warn-card.sev2 { border-color: var(--warn); }
+.warn-card.sev3 { border-color: var(--bad); box-shadow: 0 0 0 1px var(--bad); }
+.warn-row { box-shadow: inset 4px 0 0 var(--yel); }
+.warn-row.sev2 { box-shadow: inset 4px 0 0 var(--warn); }
+.warn-row.sev3 { box-shadow: inset 4px 0 0 var(--bad); }
+.warn-row .li-sub { margin-top: 3px; }
+.warn-health { padding: 0 16px 14px; margin: 10px 0 0; }
+.card.flush > p.li { margin: 0; }
+a.li { color: inherit; text-decoration: none; }
+.warn-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: -4px 0 12px; }
+.btn.ext { margin-top: 12px; }
+ul.tips { margin: 0; padding-left: 20px; display: grid; gap: 6px; font-size: 15px; }
+.plan-bit { margin-bottom: 10px; }
+.opt { display: flex; align-items: center; gap: 12px; min-height: 46px; padding: 4px 0; border-top: 1px solid var(--line); }
+.opt input { flex: none; width: 22px; height: 22px; margin: 0; accent-color: var(--olive); }
+.opt > span { display: flex; flex-direction: column; gap: 2px; }
+.opt.big { border-top: 0; margin-bottom: 6px; font-size: 17px; }
+.src-status { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-top: 1px solid var(--line); font-size: 14px; }
+.src-status .err { color: var(--bad-ink); text-align: right; }
 
 /* Home Assistant link (HQ) */
 .ha-link { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }

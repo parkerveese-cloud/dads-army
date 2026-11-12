@@ -4,6 +4,11 @@ blueprint:
     Sends Dads Army news to your phone.
 
 
+    - **Warnings:** straight away, new official warnings for where you live:
+    Met Office weather warnings, flood warnings, UK Emergency Alerts and major
+    disasters near the UK (switch warnings on in Dads Army under HQ, 1.6.0 or
+    later).
+
     - **Run out:** straight away, when the last of something is used up.
 
     - **Morning check:** once a day, anything that went out of date overnight,
@@ -27,6 +32,23 @@ blueprint:
         device:
           filter:
             - integration: mobile_app
+    warnings:
+      name: Warnings
+      description: >-
+        Which new warnings to tell me about straight away. Dads Army only checks
+        for warnings once they're switched on under HQ → Warnings.
+      default: "2"
+      selector:
+        select:
+          options:
+            - label: Everything, including yellow weather warnings and flood alerts
+              value: "1"
+            - label: Amber, orange and red, flood warnings and Emergency Alerts
+              value: "2"
+            - label: Only the most serious (red, severe flood warnings, Emergency Alerts)
+              value: "3"
+            - label: None
+              value: "99"
     run_out:
       name: Tell me when something runs out
       default: true
@@ -74,6 +96,9 @@ triggers:
   - trigger: event
     event_type: dads_army_ran_out
     id: run_out
+  - trigger: event
+    event_type: dads_army_warning
+    id: warning
   - trigger: time
     at: !input morning_time
     id: morning
@@ -83,7 +108,11 @@ variables:
   want_morning: !input morning
   want_last_day: !input last_day
   want_checks: !input checks
+  want_warnings: !input warnings
   open_path: !input open_path
+  warn_rows: >-
+    {{ (trigger.event.data['items'] | default([]) | selectattr('severity', '>=', want_warnings | int) | list)
+       if trigger.id == 'warning' else [] }}
   gone_off: >-
     {{ (state_attr('sensor.dads_army_expired', 'newly_expired') or []) if want_morning else [] }}
   use_today: >-
@@ -95,10 +124,38 @@ conditions:
   - condition: template
     value_template: >-
       {{ (trigger.id == 'run_out' and want_run_out)
+         or (trigger.id == 'warning' and warn_rows | count > 0)
          or (trigger.id == 'morning' and (gone_off | count + use_today | count + checks_today | count) > 0) }}
 
 actions:
   - choose:
+      - conditions: "{{ trigger.id == 'warning' }}"
+        sequence:
+          - device_id: !input phone
+            domain: mobile_app
+            type: notify
+            title: >-
+              {{ 'Dads Army: ' ~ ('warning' if warn_rows | count == 1 else (warn_rows | count) ~ ' warnings') }}
+            message: |-
+              {%- set src = {'metoffice': 'Met Office', 'floods': 'Environment Agency', 'govalerts': 'GOV.UK',
+                             'gdacs': 'GDACS'} -%}
+              {%- set ns = namespace(out=[]) -%}
+              {%- for i in warn_rows[:6] -%}
+                {%- set ns.out = ns.out + [('• ' if warn_rows | count > 1 else '') ~ i.title ~ ' (' ~ src.get(i.source, i.source) ~ ')'] -%}
+              {%- endfor -%}
+              {%- if warn_rows | count > 6 -%}
+                {%- set ns.out = ns.out + ['…and ' ~ (warn_rows | count - 6) ~ ' more'] -%}
+              {%- endif -%}
+              {{ ns.out | join('\n') }}
+            data:
+              clickAction: "{{ open_path }}"
+              url: "{{ open_path }}"
+              tag: dads-army-warning
+              group: dads-army
+              channel: Dads Army
+              ttl: 0
+              priority: high
+              notification_icon: mdi:alert-octagon
       - conditions: "{{ trigger.id == 'run_out' }}"
         sequence:
           - device_id: !input phone

@@ -1,9 +1,9 @@
 blueprint:
   name: "Dads Army: weekly round-up"
   description: >-
-    Once a week, a note on your phone from Dads Army: what to use first
-    (things expiring soon), anything out of date, routine checks that are due,
-    the supply run, and how long you could hold out.
+    Once a week, a note on your phone from Dads Army: any warnings in force,
+    what to use first (things expiring soon), anything out of date, routine
+    checks that are due, the supply run, and how long you could hold out.
 
 
     Needs Dads Army 1.2.0 or later, and the Home Assistant Companion app on
@@ -98,6 +98,11 @@ actions:
         Dads Army isn't sending updates. Check the app is running in Home Assistant.
       {%- else -%}
         {%- set ns = namespace(out=[]) -%}
+        {%- set warn_n = states('sensor.dads_army_warnings') | int(0) -%}
+        {%- if warn_n > 0 -%}
+          {%- set ns.out = ns.out + ['Warnings in force: ' ~ ((state_attr('sensor.dads_army_warnings', 'items') or [])[:3]
+                | map(attribute='title') | join('; ')) ~ (' and ' ~ (warn_n - 3) ~ ' more' if warn_n > 3 else '') ~ '.'] -%}
+        {%- endif -%}
         {%- if soon_n > 0 -%}
           {%- set ns.out = ns.out + ['Use these first:'] -%}
           {%- for i in soon[:5] -%}

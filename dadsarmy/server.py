@@ -18,12 +18,14 @@ Environment variables (all optional):
 Running as a Home Assistant app, it also:
   - publishes sensor.dads_army_* entities (readiness, hold-out days, out of stock,
     running low, expired, expiring soon, checks due, daily supplies and more)
-  - fires a dads_army_ran_out event when something runs out, for phone alerts
+  - fires a dads_army_ran_out event when something runs out, and dads_army_warning
+    for new Met Office, flood, Emergency Alert or GDACS warnings, for phone alerts
   - can keep the supply run in step with a Home Assistant to-do list (HQ screen)
 GET /api/summary returns the same figures as JSON for anything else.
 """
 import csv
 import datetime as dt
+import html as htmllib
 import io
 import json
 import math
@@ -38,10 +40,11 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -582,6 +585,7 @@ def summary():
         items = all_items()
         extras = [r["text"] for r in DB.execute("SELECT text FROM shopping WHERE done = 0 ORDER BY id")]
         checks = [dict(r) for r in DB.execute("SELECT * FROM checks")]
+        warnings = warn_brief()
     warn = st["warn_days"]
     people = st["adults"] + st["children"]
     kcal_day = st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]
@@ -726,6 +730,8 @@ def summary():
         "checks_soon": ordered(checks_soon),
         "checks_due_today": ordered(checks_today),
         "next_check": next_check,
+        # Warnings from the Met Office, floods, Emergency Alerts and GDACS (if switched on)
+        "warnings": warnings,
     }
 
 
@@ -776,6 +782,7 @@ def api_state(body, query):
             "checks": all_checks(),
             "check_suggestions": [c[0] for c in CHECK_SUGGESTIONS],
             "plan": get_plan(),
+            "warnings": warn_public(),
             "settings": get_settings(),
             "log": [dict(r) for r in DB.execute("SELECT * FROM log ORDER BY id DESC LIMIT 60")],
             "server": {"version": VERSION, "time": now_iso(), "last_backup": LAST_BACKUP["at"],
@@ -1555,7 +1562,14 @@ def ha_entities(s):
                        checks_total=s["checks_total"]))
     put("sensor.dads_army_stores_value", s["stores_value"], "Dads Army stores value", "mdi:cash", "£", {
         "supply_run_cost": run["cost"], "priced_items": s["priced_items"], "items_total": s["items_total"]})
+    w = s["warnings"]
+    put("sensor.dads_army_warnings", w["count"], "Dads Army warnings",
+        "mdi:alert-octagon" if w["serious"] else "mdi:alert-outline" if w["count"] else "mdi:shield-check-outline",
+        "warnings", dict(_ha_list(w["items"]), highest=w["highest"], max_severity=w["max_severity"],
+                         enabled=w["enabled"], checked_at=w["checked_at"], health_news=w["news"]))
     reasons = []
+    if w["serious"]:
+        reasons.append("%d warning%s in force" % (w["serious"], "" if w["serious"] == 1 else "s"))
     if s["expired"]:
         reasons.append("%d expired" % len(s["expired"]))
     if s["out_of_stock"]:
@@ -2011,6 +2025,534 @@ def api_ha_make_list(body, query):
 
 
 # --------------------------------------------------------------------------
+# Warnings: Met Office, floods, Emergency Alerts, GDACS, UKHSA and WHO
+# --------------------------------------------------------------------------
+# Optional, and off until it's switched on in HQ. Dads Army downloads the same
+# public files for everyone and works out here which warnings are near you, so
+# nothing about you is sent anywhere. Without the internet everything else
+# carries on, and the last warnings found stay on show with when they were checked.
+FEED_URLS = {
+    "metoffice": "https://www.metoffice.gov.uk/public/data/PWSCache/WarningsRSS/Region/UK",
+    "floods": "https://environment.data.gov.uk/flood-monitoring/id/floods",
+    "floodarea": "https://environment.data.gov.uk/flood-monitoring/id/floodAreas/{id}",
+    "govalerts": "https://www.gov.uk/alerts/feed.atom",
+    "gdacs": "https://www.gdacs.org/xml/rss.xml",
+    "ukhsa": "https://www.gov.uk/search/news-and-communications.atom?organisations%5B%5D=uk-health-security-agency",
+    "who": "https://www.who.int/api/news/diseaseoutbreaknews?$top=6&$orderby=PublicationDateAndTime%20desc"
+           "&$select=Title,OverrideTitle,UseOverrideTitle,UrlName,PublicationDateAndTime",
+}
+try:   # for testing against local copies
+    FEED_URLS.update(json.loads(os.environ.get("DADSARMY_FEED_URLS") or "{}"))
+except ValueError:
+    pass
+FEED_UA = "DadsArmy/%s (+https://github.com/parkerveese-cloud/dads-army)" % VERSION
+WARN_SOURCES = [  # key, what it is, on by default
+    ("metoffice", "Met Office weather warnings", True),
+    ("floods", "Flood warnings (England)", True),
+    ("govalerts", "UK Emergency Alerts", True),
+    ("gdacs", "Disasters near the UK (GDACS)", True),
+    ("ukhsa", "UK Health Security Agency news", False),
+    ("who", "WHO disease outbreak news", False),
+]
+WARN_SOURCE_NAMES = {"metoffice": "Met Office", "floods": "Environment Agency", "govalerts": "GOV.UK Emergency Alerts",
+                     "gdacs": "GDACS", "ukhsa": "UKHSA", "who": "WHO"}
+MET_REGIONS = [  # code, name, rough middle (to guess yours from Home Assistant's location)
+    ("os", "Orkney & Shetland", 59.6, -2.0), ("he", "Highlands & Eilean Siar", 57.5, -5.0),
+    ("gr", "Grampian", 57.2, -2.8), ("st", "Strathclyde", 55.8, -4.8),
+    ("ta", "Central, Tayside & Fife", 56.5, -3.6), ("dg", "SW Scotland, Lothian Borders", 55.4, -3.2),
+    ("ni", "Northern Ireland", 54.6, -6.7), ("wl", "Wales", 52.3, -3.7),
+    ("nw", "North West England", 54.0, -2.7), ("ne", "North East England", 54.9, -1.8),
+    ("yh", "Yorkshire & Humber", 53.9, -1.2), ("wm", "West Midlands", 52.5, -2.1),
+    ("em", "East Midlands", 52.9, -0.9), ("ee", "East of England", 52.3, 0.7),
+    ("sw", "South West England", 50.8, -3.8), ("se", "London & South East England", 51.3, -0.5),
+]
+MET_NAME = {c: n for c, n, _, _ in MET_REGIONS}
+WARN_DEFAULTS = {"on": False, "sources": {k: d for k, _, d in WARN_SOURCES}, "region": "", "lat": None, "lon": None,
+                 "flood_km": 20, "gdacs_km": 1000}
+WARN_EVERY = 15 * 60      # seconds between checks
+FLOOD_LOOKUPS = 80        # flood areas to look up per check (they're kept once found)
+WARN_STATE = {"items": [], "news": [], "sources": {}, "checked_at": None, "region": "", "seen": []}
+WARN_LOCK = threading.Lock()
+WARN_WAKE = threading.Event()
+WARN_DONE = threading.Condition()
+WARN_RUNS = {"n": 0, "busy": False}
+HA_HOME = {"lat": None, "lon": None, "at": 0.0}
+
+
+class NeedLocation(Exception):
+    pass
+
+
+def warn_cfg():
+    """The warnings settings, with defaults filled in."""
+    raw = setting_raw("warnings", None)
+    raw = raw if isinstance(raw, dict) else {}
+    cfg = json.loads(json.dumps(WARN_DEFAULTS))
+    cfg["on"] = bool(raw.get("on"))
+    src = raw.get("sources") if isinstance(raw.get("sources"), dict) else {}
+    for k in cfg["sources"]:
+        if k in src:
+            cfg["sources"][k] = bool(src[k])
+    if raw.get("region") in MET_NAME or raw.get("region") == "UK":
+        cfg["region"] = raw["region"]
+    for k, lim in (("lat", 90), ("lon", 180)):
+        v = raw.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and -lim <= v <= lim:
+            cfg[k] = float(v)
+    if cfg["lat"] is None or cfg["lon"] is None:
+        cfg["lat"] = cfg["lon"] = None
+    for k, lo, hi in (("flood_km", 1, 200), ("gdacs_km", 50, 5000)):
+        v = raw.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            cfg[k] = int(min(hi, max(lo, v)))
+    return cfg
+
+
+def km_between(lat1, lon1, lat2, lon2):
+    r = math.radians
+    h = (math.sin(r(lat2 - lat1) / 2) ** 2
+         + math.cos(r(lat1)) * math.cos(r(lat2)) * math.sin(r(lon2 - lon1) / 2) ** 2)
+    return 6371.0 * 2 * math.asin(min(1.0, math.sqrt(h)))
+
+
+def home_location(cfg):
+    """Where you are: set by hand in HQ, or Home Assistant's home location. None if neither."""
+    if cfg["lat"] is not None:
+        return {"lat": cfg["lat"], "lon": cfg["lon"], "from": "manual"}
+    if HA_HOME["lat"] is not None:
+        return {"lat": HA_HOME["lat"], "lon": HA_HOME["lon"], "from": "homeassistant"}
+    return None
+
+
+def refresh_ha_home():
+    if not HA_TOKEN or time.time() - HA_HOME["at"] < 3600:
+        return
+    try:
+        status, out = ha_request("GET", "/config", timeout=8)
+        if status == 200 and isinstance(out, dict) and out.get("latitude") is not None:
+            HA_HOME.update(lat=float(out["latitude"]), lon=float(out["longitude"]), at=time.time())
+    except Exception:
+        pass
+
+
+def guess_region(loc):
+    if not loc:
+        return ""
+    return min(MET_REGIONS, key=lambda r: km_between(loc["lat"], loc["lon"], r[2], r[3]))[0]
+
+
+def http_get(url, timeout=20, limit=8 * 1024 * 1024):
+    req = urllib.request.Request(url, headers={"User-Agent": FEED_UA, "Accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("the feed is too big")
+    return data
+
+
+def parse_xml(data):
+    low = data.lower()
+    if b"<!doctype" in low or b"<!entity" in low:   # feeds don't need these; refusing them keeps parsing safe
+        raise ValueError("the feed isn't plain XML")
+    return ET.fromstring(data)
+
+
+TAG_RE = re.compile(r"<[^>]+>")
+
+
+def plain(s, maxlen=1500):
+    """Feed text without HTML, tidied up."""
+    s = htmllib.unescape(TAG_RE.sub(" ", s or ""))
+    s = re.sub(r"[ \t\r\f\v ]+", " ", s)
+    s = re.sub(r" *\n *", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()[:maxlen]
+
+
+def safe_url(u):
+    u = (u or "").strip()
+    return u[:500] if re.match(r"^https?://[^\s\"'<>]+$", u) else ""
+
+
+def parse_when(s):
+    """An ISO or RSS date as an aware datetime (UTC if no zone given), or None."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+            d = parsedate_to_datetime(s)
+        except (TypeError, ValueError, IndexError):
+            return None
+    return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+
+
+def iso_utc(d):
+    return d.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat() if d else ""
+
+
+ATOM = "{http://www.w3.org/2005/Atom}"
+GDACS = "{http://www.gdacs.org}"
+MET_LEVEL = {"yellow": 1, "amber": 2, "red": 3}
+FLOOD_LEVEL = {1: (3, "Severe flood warning"), 2: (2, "Flood warning"), 3: (1, "Flood alert")}
+GDACS_LEVEL = {"orange": 2, "red": 3}
+
+
+def parse_met(data, region_name):
+    """Met Office warnings in force, for one region ('' for all of the UK)."""
+    out = []
+    for it in parse_xml(data).iter("item"):
+        title = plain(it.findtext("title"), 300)
+        text = plain(it.findtext("description"), 1500)
+        if region_name and region_name.lower() not in (title + " " + text).lower():
+            continue
+        word = title.split(" ", 1)[0].lower() if title else ""
+        m = re.search(r"valid from (.+?) to (.+?)(?:\.|\n|$)", text, re.I)
+        out.append({"id": "met:" + (it.findtext("guid") or it.findtext("link") or title)[:200], "source": "metoffice",
+                    "kind": "weather", "severity": MET_LEVEL.get(word, 1),
+                    "level": word.capitalize() if word in MET_LEVEL else "Warning", "title": title, "text": text,
+                    "area": region_name, "when": ("%s to %s" % (m.group(1), m.group(2))) if m else "",
+                    "url": safe_url(it.findtext("link")) or "https://weather.metoffice.gov.uk/warnings-and-advice/uk-warnings",
+                    "issued": iso_utc(parse_when(it.findtext("pubDate")))})
+    return out
+
+
+def parse_floods(data):
+    """Every flood alert and warning in force in England (where they are comes separately)."""
+    doc = json.loads(data.decode("utf-8"))
+    rows = []
+    for f in doc.get("items") or []:
+        if not isinstance(f, dict) or f.get("severityLevel") not in FLOOD_LEVEL:
+            continue
+        area = f.get("floodArea") if isinstance(f.get("floodArea"), dict) else {}
+        nid = str(f.get("floodAreaID") or area.get("notation") or "")[:60]
+        if not re.match(r"^[A-Za-z0-9_-]+$", nid):
+            continue
+        sev, word = FLOOD_LEVEL[f["severityLevel"]]
+        rows.append({"id": "flood:" + nid, "area_id": nid, "source": "floods", "kind": "flood", "severity": sev,
+                     "level": word, "title": "%s: %s" % (word, plain(f.get("description"), 200)),
+                     "text": plain(f.get("message"), 1500), "area": plain(area.get("county"), 200), "when": "",
+                     "url": "https://check-for-flooding.service.gov.uk/target-area/" + nid,
+                     "issued": iso_utc(parse_when(f.get("timeRaised")))})
+    return rows
+
+
+def flood_centre(nid):
+    doc = json.loads(http_get(FEED_URLS["floodarea"].format(id=nid), timeout=15).decode("utf-8"))
+    it = doc.get("items")
+    it = (it[0] if it else {}) if isinstance(it, list) else (it or {})
+    return [float(it["lat"]), float(it["long"])]
+
+
+def parse_gdacs(data, home, km):
+    """Orange and red disaster alerts in force within km of home."""
+    out = []
+    for it in parse_xml(data).iter("item"):
+        if (it.findtext(GDACS + "iscurrent") or "").strip().lower() != "true":
+            continue
+        lvl = (it.findtext(GDACS + "alertlevel") or "").strip().lower()
+        if lvl not in GDACS_LEVEL:
+            continue
+        try:
+            lat, lon = [float(x) for x in (it.findtext("{http://www.georss.org/georss}point") or "").split()[:2]]
+        except ValueError:
+            continue
+        d = km_between(home["lat"], home["lon"], lat, lon)
+        if d > km:
+            continue
+        out.append({"id": "gdacs:" + (it.findtext("guid") or it.findtext("link") or "")[:200], "source": "gdacs",
+                    "kind": "disaster", "severity": GDACS_LEVEL[lvl], "level": lvl.capitalize() + " alert",
+                    "title": plain(it.findtext("title"), 300), "text": plain(it.findtext("description"), 1500),
+                    "area": plain(it.findtext(GDACS + "country"), 120), "distance_km": int(round(d)), "when": "",
+                    "url": safe_url(it.findtext("link")), "issued": iso_utc(parse_when(it.findtext("pubDate")))})
+    return out
+
+
+ALERT_STAMP = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}) (BST|GMT|UTC)\]")
+
+
+def parse_govalerts(data, now):
+    """Emergency Alerts still being sent, or that stopped in the last 12 hours."""
+    out = []
+    for e in parse_xml(data).iter(ATOM + "entry"):
+        summ = plain(e.findtext(ATOM + "summary"), 600)
+        stamps = [dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M").replace(
+            tzinfo=dt.timezone(dt.timedelta(hours=1 if m.group(2) == "BST" else 0))) for m in ALERT_STAMP.finditer(summ)]
+        sent = stamps[0] if stamps else parse_when(e.findtext(ATOM + "published"))
+        stopped = stamps[1] if len(stamps) > 1 and "Stopped" in summ else None
+        if sent is None or (stopped is None and now - sent > dt.timedelta(hours=24)) \
+                or (stopped is not None and now - stopped > dt.timedelta(hours=12)):
+            continue
+        content = e.find(ATOM + "content")
+        text = plain(" ".join(content.itertext()), 1500) if content is not None else ""
+        live = stopped is None or stopped > now
+        test = bool(re.search(r"\btest(ing)?\b", text, re.I))
+        area = plain(e.findtext(ATOM + "title"), 200)
+        link = e.find(ATOM + "link")
+        # "Alert area: X. Sent: 5:00pm (GMT) on ... [2026-01-08 17:00 GMT]. Stopped: ..." -> "Sent: 5:00pm (GMT) on .... Stopped: ..."
+        when = re.sub(r"^Alert area:.*?\.\s*(?=Sent)", "", re.sub(r"\s*\[[^\]]*\]", "", summ)).strip()
+        out.append({"id": "govalert:" + (e.findtext(ATOM + "id") or summ)[:200], "source": "govalerts", "kind": "alert",
+                    "severity": 3 if live and not test else 1,
+                    "level": "Test" if test else "Emergency Alert" if live else "Ended",
+                    "title": "Emergency Alert: " + area, "text": text, "area": area, "when": when,
+                    "url": safe_url(link.get("href") if link is not None else "") or "https://www.gov.uk/alerts",
+                    "issued": iso_utc(sent)})
+    return out
+
+
+def parse_ukhsa(data, now):
+    out = []
+    for e in parse_xml(data).iter(ATOM + "entry"):
+        when = parse_when(e.findtext(ATOM + "updated"))
+        if not when or now - when > dt.timedelta(days=14):
+            continue
+        link = e.find(ATOM + "link")
+        out.append({"id": "ukhsa:" + (e.findtext(ATOM + "id") or "")[:200], "source": "ukhsa", "kind": "news",
+                    "severity": 0, "level": "News", "title": plain(e.findtext(ATOM + "title"), 300),
+                    "text": plain(e.findtext(ATOM + "summary"), 600), "area": "", "when": "",
+                    "url": safe_url(link.get("href") if link is not None else ""), "issued": iso_utc(when)})
+    return out[:4]
+
+
+def parse_who(data, now):
+    out = []
+    for v in json.loads(data.decode("utf-8")).get("value") or []:
+        if not isinstance(v, dict):
+            continue
+        when = parse_when(v.get("PublicationDateAndTime"))
+        if not when or now - when > dt.timedelta(days=21):
+            continue
+        title = v.get("OverrideTitle") if v.get("UseOverrideTitle") and v.get("OverrideTitle") else v.get("Title")
+        slug = str(v.get("UrlName") or "")
+        out.append({"id": "who:" + slug[:100], "source": "who", "kind": "news", "severity": 0, "level": "Outbreak news",
+                    "title": plain(title, 300), "text": "", "area": "", "when": "",
+                    "url": ("https://www.who.int/emergencies/disease-outbreak-news/item/" + slug
+                            if re.match(r"^[\w-]+$", slug) else "https://www.who.int/emergencies/disease-outbreak-news"),
+                    "issued": iso_utc(when)})
+    return out[:4]
+
+
+def fetch_source(key, cfg, home, region, areas, now):
+    if key == "metoffice":
+        return parse_met(http_get(FEED_URLS["metoffice"]), "" if region == "UK" else MET_NAME.get(region, ""))
+    if key == "govalerts":
+        return parse_govalerts(http_get(FEED_URLS["govalerts"]), now)
+    if key == "ukhsa":
+        return parse_ukhsa(http_get(FEED_URLS["ukhsa"]), now)
+    if key == "who":
+        return parse_who(http_get(FEED_URLS["who"]), now)
+    if not home:
+        raise NeedLocation()
+    if key == "gdacs":
+        return parse_gdacs(http_get(FEED_URLS["gdacs"]), home, cfg["gdacs_km"])
+    # Floods: look up where each flood area is (once), then keep the ones near you.
+    out, looked = [], 0
+    for r in parse_floods(http_get(FEED_URLS["floods"])):
+        centre = areas.get(r["area_id"])
+        if centre is None:
+            if looked >= FLOOD_LOOKUPS:
+                continue
+            looked += 1
+            try:
+                centre = areas[r["area_id"]] = flood_centre(r["area_id"])
+            except Exception:
+                continue
+        d = km_between(home["lat"], home["lon"], centre[0], centre[1])
+        if d <= cfg["flood_km"]:
+            r["distance_km"] = int(round(d))
+            out.append(r)
+    return out
+
+
+def why_failed(e):
+    if isinstance(e, urllib.error.HTTPError):
+        return "the site answered %s" % e.code
+    if isinstance(e, (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError)):
+        return "couldn't reach it (is the internet down?)"
+    if isinstance(e, (ValueError, ET.ParseError, KeyError, TypeError)):
+        return "the feed didn't make sense (%s)" % str(e)[:80]
+    return str(e)[:120]
+
+
+def warnings_run():
+    """Check every source that's switched on, keeping the last good result for any that fail."""
+    refresh_ha_home()   # also shows where Home Assistant thinks home is, in the settings
+    with LOCK:
+        cfg = warn_cfg()
+        areas = setting_raw("flood_areas", {}) or {}
+    if not cfg["on"]:
+        return
+    home = home_location(cfg)
+    region = cfg["region"] or guess_region(home) or "UK"
+    now = dt.datetime.now(dt.timezone.utc)
+    with WARN_LOCK:
+        prev = json.loads(json.dumps(WARN_STATE))
+    by_src = {}
+    for it in prev["items"] + prev["news"]:
+        by_src.setdefault(it["source"], []).append(it)
+    statuses, any_ok = {}, False
+    for key, _, _ in WARN_SOURCES:
+        if not cfg["sources"][key]:
+            by_src.pop(key, None)
+            continue
+        old = prev["sources"].get(key) or {}
+        try:
+            got = fetch_source(key, cfg, home, region, areas, now)
+            by_src[key] = got
+            statuses[key] = {"ok": True, "error": "", "checked_at": now_iso(), "count": len(got)}
+            any_ok = True
+        except NeedLocation:
+            by_src[key] = []
+            statuses[key] = {"ok": False, "error": "Needs your location: set it in the warnings settings",
+                             "checked_at": None, "count": 0}
+        except Exception as e:
+            statuses[key] = {"ok": False, "error": why_failed(e), "checked_at": old.get("checked_at"),
+                             "count": len(by_src.get(key, []))}
+    every = [i for k in by_src for i in by_src[k]]
+    every.sort(key=lambda i: i.get("issued") or "", reverse=True)
+    every.sort(key=lambda i: -i["severity"])
+    warnings = [i for i in every if i["kind"] != "news"]
+    new = [w for w in warnings if w["id"] not in set(prev["seen"])]
+    state = {"items": warnings, "news": [i for i in every if i["kind"] == "news"], "sources": statuses,
+             "checked_at": now_iso() if any_ok else prev["checked_at"], "region": region,
+             "seen": [w["id"] for w in warnings]}
+    if len(areas) > 3000:
+        areas = dict(list(areas.items())[-2000:])
+    with tx() as db:
+        set_setting_raw(db, "warnings_cache", state)
+        set_setting_raw(db, "flood_areas", areas)
+    with WARN_LOCK:
+        WARN_STATE.clear()
+        WARN_STATE.update(state)
+    if new and HA_TOKEN:
+        try:
+            ha_call("POST", "/events/dads_army_warning", warning_event(new))
+        except Exception:
+            pass
+    HA_WAKE.set()
+
+
+def warning_event(new):
+    """Event data for new warnings, for phone alerts."""
+    def line(w):
+        return "%s (%s)" % (w["title"], WARN_SOURCE_NAMES.get(w["source"], w["source"]))
+    if len(new) == 1:
+        message = line(new[0]) + "."
+    else:
+        message = "%d new warnings: %s." % (len(new), "; ".join(line(w) for w in new[:5])
+                                          + ("; and %d more" % (len(new) - 5) if len(new) > 5 else ""))
+    return {"count": len(new), "max_severity": max(w["severity"] for w in new), "message": message,
+            "items": [{k: w.get(k) for k in ("title", "level", "severity", "source", "area", "url")}
+                      for w in new[:LIST_LIMIT]]}
+
+
+def warnings_loop():
+    WARN_WAKE.set()   # first check straight away (if they're switched on)
+    while True:
+        WARN_WAKE.wait(WARN_EVERY)
+        WARN_WAKE.clear()
+        with WARN_DONE:
+            WARN_RUNS["busy"] = True
+        try:
+            warnings_run()
+        except Exception:
+            traceback.print_exc()
+        with WARN_DONE:
+            WARN_RUNS["busy"] = False
+            WARN_RUNS["n"] += 1
+            WARN_DONE.notify_all()
+
+
+def load_warnings():
+    with LOCK:
+        cached = setting_raw("warnings_cache", None)
+    if isinstance(cached, dict):
+        with WARN_LOCK:
+            for k in WARN_STATE:
+                if k in cached:
+                    WARN_STATE[k] = cached[k]
+
+
+def warn_public():
+    """For the app: the settings, what's in force and how each source is doing."""
+    cfg = warn_cfg()
+    loc = home_location(cfg)
+    with WARN_LOCK:
+        st = json.loads(json.dumps(WARN_STATE))
+    on = cfg["on"]
+    return {"config": cfg, "on": on, "items": st["items"] if on else [], "news": st["news"] if on else [],
+            "sources": st["sources"] if on else {}, "checked_at": st["checked_at"] if on else None,
+            "location": loc, "region": cfg["region"] or guess_region(loc) or "UK", "region_guessed": not cfg["region"],
+            "regions": [[c, n] for c, n, _, _ in MET_REGIONS], "source_list": [[k, n] for k, n, _ in WARN_SOURCES],
+            "ha": bool(HA_TOKEN)}
+
+
+def warn_brief():
+    """For Home Assistant and /api/summary."""
+    w = warn_public()
+    keep = ("title", "level", "severity", "source", "area", "when", "url", "issued", "distance_km")
+    items = [dict({k: i.get(k) for k in keep if i.get(k) not in (None, "")}, text=(i.get("text") or "")[:300])
+             for i in w["items"]]
+    top = max([i["severity"] for i in w["items"]] or [0])
+    return {"enabled": w["on"], "count": len(items), "items": items,
+            "highest": {0: "", 1: "yellow", 2: "amber", 3: "red"}[top], "max_severity": top,
+            "serious": sum(1 for i in w["items"] if i["severity"] >= 2),
+            "news": [{k: i.get(k) for k in ("title", "source", "url", "issued")} for i in w["news"]],
+            "checked_at": w["checked_at"]}
+
+
+@route("PUT", "/api/warnings")
+def api_warnings_set(body, query):
+    cur = warn_cfg()
+    if "on" in body:
+        cur["on"] = bool(body.get("on"))
+    if isinstance(body.get("sources"), dict):
+        for k in cur["sources"]:
+            if k in body["sources"]:
+                cur["sources"][k] = bool(body["sources"][k])
+    if "region" in body:
+        reg = clean_text(body.get("region"), 4)
+        if reg and reg != "UK" and reg not in MET_NAME:
+            raise ApiError(400, "That isn't a Met Office region")
+        cur["region"] = reg
+    if "lat" in body or "lon" in body:
+        if body.get("lat") in (None, "") and body.get("lon") in (None, ""):
+            cur["lat"] = cur["lon"] = None
+        else:
+            cur["lat"] = clean_num(body.get("lat"), None, -90, 90, "Latitude")
+            cur["lon"] = clean_num(body.get("lon"), None, -180, 180, "Longitude")
+            if cur["lat"] is None or cur["lon"] is None:
+                raise ApiError(400, "Give both a latitude and a longitude, or neither")
+            for k, lim, label in (("lat", 90, "Latitude"), ("lon", 180, "Longitude")):
+                if not -lim <= float(body.get(k)) <= lim:
+                    raise ApiError(400, "%s must be between -%d and %d" % (label, lim, lim))
+    for k, lo, hi, label in (("flood_km", 1, 200, "Flood distance"), ("gdacs_km", 50, 5000, "Disaster distance")):
+        if k in body:
+            cur[k] = int(clean_num(body.get(k), cur[k], lo, hi, label))
+    with tx() as db:
+        set_setting_raw(db, "warnings", cur)
+        add_log("settings", "", "Warnings switched on" if cur["on"] and "on" in body and body.get("on")
+                else "Warnings switched off" if "on" in body and not cur["on"] else "Warnings settings updated")
+    WARN_WAKE.set()
+    with LOCK:
+        return {"warnings": warn_public()}
+
+
+@route("POST", "/api/warnings/check")
+def api_warnings_check(body, query):
+    """Check the feeds now, and wait (up to 45 seconds) for the answer."""
+    with WARN_DONE:
+        want = WARN_RUNS["n"] + (2 if WARN_RUNS["busy"] else 1)
+        WARN_WAKE.set()
+        WARN_DONE.wait_for(lambda: WARN_RUNS["n"] >= want, timeout=45)
+    with LOCK:
+        return {"warnings": warn_public()}
+
+
+# --------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------
 MIME = {
@@ -2167,7 +2709,9 @@ def main():
     if sys.version_info < (3, 7):
         sys.exit("Dads Army needs Python 3.7 or newer")
     init_db()
+    load_warnings()
     threading.Thread(target=backup_loop, name="backups", daemon=True).start()
+    threading.Thread(target=warnings_loop, name="warnings", daemon=True).start()
     if HA_TOKEN:
         threading.Thread(target=ha_loop, name="homeassistant", daemon=True).start()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)

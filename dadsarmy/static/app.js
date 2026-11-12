@@ -406,9 +406,9 @@
   }
 
   function renderSitrep(el) {
-    if (!S.items.length) { el.innerHTML = emptyCard(); return; }
+    if (!S.items.length) { el.innerHTML = warnCard(false) + emptyCard(); return; }
     var st = S.settings, r = readiness(), target = st.target_days;
-    var html = '';
+    var html = warnCard(false);
 
     // Hero: how long could we hold out?
     if (r.people === 0) {
@@ -857,7 +857,7 @@
         '<div class="card-foot btn-row"><button class="btn" data-act="check-new">' + ICON.plus + ' Add a check</button>' +
         (missing.length ? '<button class="btn" data-act="checks-seed">Suggestions (' + missing.length + ')</button>' : '') + '</div>';
     }
-    el.innerHTML = html + '</section>' + planCard();
+    el.innerHTML = warnCard(true) + html + '</section>' + planCard();
   }
 
   function planEmpty(p) {
@@ -890,6 +890,209 @@
     });
     return html + '<div class="btn-row" style="margin-top:16px"><button class="btn" data-act="plan-edit">' + ICON.edit + ' Edit plan</button>' +
       '<button class="btn" data-act="print-plan">' + ICON.print + ' Print</button></div></section>';
+  }
+
+  // ------------------------------------------------------------------
+  // Warnings: Met Office, floods, Emergency Alerts, GDACS, UKHSA, WHO
+  // ------------------------------------------------------------------
+  var WARN_ICON = { weather: '🌦️', flood: '🌊', alert: '📢', disaster: '🌍', news: '🩺' };
+  var SRC_NAME = { metoffice: 'Met Office', floods: 'Environment Agency', govalerts: 'GOV.UK', gdacs: 'GDACS', ukhsa: 'UKHSA', who: 'WHO' };
+  function W() {
+    return S.warnings || { on: false, items: [], news: [], sources: {}, config: { sources: {} }, regions: [], source_list: [] };
+  }
+  function sevClass(s) { return s >= 3 ? 'bad' : s === 2 ? 'warn' : 'yellow'; }
+  function srcName(k) { return SRC_NAME[k] || k; }
+  function regionName(code) {
+    if (code === 'UK' || !code) return 'the whole UK';
+    var r = W().regions.filter(function (x) { return x[0] === code; })[0];
+    return r ? r[1] : code;
+  }
+  function whenText(iso) {
+    var d = new Date(iso);
+    return isNaN(d) ? '' : d.toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  }
+  function hoursSince(ts) {
+    if (!ts) return null;
+    var t = new Date(String(ts).replace(' ', 'T')).getTime();
+    return isNaN(t) ? null : (Date.now() - t) / 36e5;
+  }
+  function warnRow(w, i) {
+    return '<div class="li warn-row sev' + w.severity + '"><span class="li-ico">' + (WARN_ICON[w.kind] || '⚠️') + '</span>' +
+      '<button class="li-main" data-act="warn-open" data-i="' + i + '"><span class="li-title wrap">' + esc(w.title) + '</span>' +
+      '<span class="li-sub"><span class="badge ' + sevClass(w.severity) + '">' + esc(w.level) + '</span><span>' + esc(srcName(w.source)) +
+      (w.distance_km != null ? ' · ' + w.distance_km + ' km away' : '') + '</span></span></button>' + ICON.chev + '</div>';
+  }
+  // A line on how fresh the warnings are, and which sources aren't working.
+  function warnHealth(w) {
+    var bits = [], h = hoursSince(w.checked_at);
+    if (h === null) bits.push('Not checked yet');
+    else bits.push('Checked ' + ago(w.checked_at) + (h >= 1 ? ': these may be out of date' : ''));
+    Object.keys(w.sources).forEach(function (k) {
+      var s = w.sources[k];
+      if (!s.ok) bits.push(srcName(k) + ': ' + s.error);
+    });
+    return bits;
+  }
+
+  // Sitrep: only when something's in force. Plan tab (full): always, with health news and the settings.
+  function warnCard(full) {
+    var w = W();
+    if (!w.on) {
+      if (!full) return '';
+      return '<section class="card"><div class="card-head"><h2>Warnings</h2></div>' +
+        '<p class="small muted">See official warnings for where you live, alongside your stores and plan: Met Office weather warnings, ' +
+        'flood warnings, UK Emergency Alerts and major disasters near the UK, with optional health news from UKHSA and the WHO.</p>' +
+        '<button class="btn primary block" data-act="warn-set">Set up warnings</button></section>';
+    }
+    // The Sitrep keeps it short: no test or finished Emergency Alerts, and the three most serious.
+    var shown = w.items.map(function (x, i) { return [x, i]; }).filter(function (p) {
+      return full || !(p[0].source === 'govalerts' && p[0].severity < 2);
+    });
+    if (!full && !shown.length) return '';
+    var more = full ? 0 : Math.max(0, shown.length - 3);
+    if (more) shown = shown.slice(0, 3);
+    var top = shown.reduce(function (a, p) { return Math.max(a, p[0].severity); }, 0);
+    var html = '<section class="card flush warn-card' + (top >= 2 ? ' sev' + top : '') + '"><div class="card-head"><h2>Warnings' +
+      (w.items.length ? ' in force' : '') + '</h2>' + (full ? '<button class="link" data-act="warn-check">Check now</button>' : '<button class="link" data-tab="plan">All warnings</button>') + '</div>';
+    if (shown.length) {
+      html += '<div class="list">' + shown.map(function (p) { return warnRow(p[0], p[1]); }).join('') + '</div>' +
+        (more ? '<button class="li more" data-tab="plan">' + more + ' more ' + ICON.chev + '</button>' : '');
+    } else {
+      html += '<p class="li muted small">No warnings for ' + esc(regionName(w.region)) +
+        (w.location ? ', and no floods within ' + w.config.flood_km + ' km' : '') + '.</p>';
+    }
+    var health = warnHealth(w);
+    var h = hoursSince(w.checked_at);
+    if (full || h === null || h >= 1) html += '<p class="warn-health small muted">' + health.map(esc).join('<br>') + '</p>';
+    if (full && w.news.length) {
+      html += '<div class="group-head">🩺 Health news</div><div class="list">' + w.news.map(function (n) {
+        return '<a class="li news" href="' + esc(n.url) + '" target="_blank" rel="noopener noreferrer"><span class="li-main"><span class="li-title wrap">' + esc(n.title) + '</span>' +
+          '<span class="li-sub">' + esc(srcName(n.source)) + (n.issued ? ' · ' + esc(whenText(n.issued)) : '') + '</span></span>' + ICON.chev + '</a>';
+      }).join('') + '</div>';
+    }
+    if (full) html += '<div class="card-foot"><button class="btn block" data-act="warn-set">Warnings settings</button></div>';
+    return html + '</section>';
+  }
+
+  function warnHqCard() {
+    var w = W();
+    var html = '<section class="card"><div class="card-head"><h2>Warnings</h2>' + (w.on ? pill('good', 'On') : pill('plain', 'Off')) + '</div>';
+    if (!w.on) {
+      html += '<p class="small muted">Met Office, flood, Emergency Alert and disaster warnings for where you live, on the Sitrep and on your phone.</p>';
+    } else {
+      html += '<p class="small muted">Met Office region: <b>' + esc(regionName(w.region)) + '</b>' + (w.region_guessed && w.location ? ' (from your location)' : '') + '. ' +
+        (w.location ? 'Location ' + (w.location.from === 'homeassistant' ? 'from Home Assistant' : 'set by hand') + '.' : 'No location set, so no flood or disaster warnings.') + '</p>' +
+        '<p class="small muted">' + warnHealth(w).map(esc).join('<br>') + '</p>';
+    }
+    return html + '<button class="btn block" data-act="warn-set">' + (w.on ? 'Warnings settings' : 'Set up warnings') + '</button></section>';
+  }
+
+  // What to do, by kind of warning. General UK advice; the official message comes first.
+  function warnTips(w) {
+    var t = (w.title + ' ' + w.text).toLowerCase();
+    if (w.kind === 'flood') {
+      return { plan: ['meet_near', 'meet_far', 'power_off', 'gas_off', 'water_off'], tips: [
+        'Move valuables, documents and medicines upstairs or somewhere high.',
+        'Be ready to turn off the gas, electricity and water.',
+        'Pack the grab bag and charge phones and power banks.',
+        'Never walk or drive through flood water: 30cm of flowing water can float a car.'] };
+    }
+    if (w.kind === 'alert') {
+      return { plan: ['meet_near', 'meet_far'], tips: [
+        'Do what the alert tells you. Emergency Alerts are only sent when there\'s a danger to life nearby.',
+        'Check that the people you live with, and neighbours, have seen it.'] };
+    }
+    if (w.kind === 'disaster') {
+      return { plan: [], tips: [
+        'Unless it\'s in the UK, the main thing is to keep up with the news.',
+        'If you have family there or plan to travel, check the Foreign Office travel advice.'] };
+    }
+    if (/snow|ice/.test(t)) {
+      return { plan: ['power_off'], tips: [
+        'Make sure you could stay at home for a few days: food, water and medicines.',
+        'Charge phones and power banks, and keep torches handy in case the power goes. Power cut: call 105.',
+        'Check on older neighbours.'] };
+    }
+    if (/heat/.test(t)) {
+      return { plan: [], tips: [
+        'Keep extra drinking water, and drink plenty.',
+        'Stay out of the sun between 11am and 3pm, and close curtains on rooms that get the sun.',
+        'Check on older neighbours and anyone unwell.'] };
+    }
+    if (/wind|storm|thunder|lightning/.test(t)) {
+      return { plan: ['power_off'], tips: [
+        'Bring in or tie down garden furniture, bins and anything that could blow about.',
+        'Charge phones and power banks, and keep torches handy. Power cut: call 105.',
+        'Avoid travelling during the worst of it.'] };
+    }
+    if (/rain|flood/.test(t)) {
+      return { plan: ['power_off', 'gas_off', 'water_off'], tips: [
+        'Check the flood warnings for where you live.',
+        'Keep documents and medicines somewhere high.',
+        'Avoid driving through flood water.'] };
+    }
+    return { plan: [], tips: ['Allow extra time for journeys, or put them off.'] };
+  }
+
+  function sheetWarning(s) {
+    var w = s.w, tips = warnTips(w), p = S.plan, r = readiness();
+    var bits = tips.plan.filter(function (k) { return p[k]; });
+    var heads = {};
+    PLAN_PARTS.forEach(function (x) { heads[x[0]] = x[1]; });
+    return sheetHead(w.title, srcName(w.source) + (w.issued ? ' · ' + whenText(w.issued) : ''), WARN_ICON[w.kind] || '⚠️') +
+      '<div class="warn-meta"><span class="badge ' + sevClass(w.severity) + '">' + esc(w.level) + '</span>' +
+      (w.area ? '<span class="small muted">' + esc(w.area) + '</span>' : '') +
+      (w.distance_km != null ? '<span class="small muted">' + w.distance_km + ' km away</span>' : '') + '</div>' +
+      (w.when ? '<p class="small"><b>' + esc(w.when) + '</b></p>' : '') +
+      (w.text ? '<div class="notes">' + esc(w.text) + '</div>' : '') +
+      (w.url ? '<a class="btn block ext" href="' + esc(w.url) + '" target="_blank" rel="noopener noreferrer">Full details from ' + esc(srcName(w.source)) + '</a>' : '') +
+      '<h3>What to do</h3><ul class="tips">' + tips.tips.map(function (t) { return '<li>' + esc(t) + '</li>'; }).join('') +
+      (r.people && w.kind !== 'disaster' ? '<li>Your stores would last about <b>' + esc(fmtDays(r.hold)) + ' days</b>' +
+        (r.supplies[0] ? ', and ' + esc(r.supplies[0].it.name) + ' about ' + esc(fmtDays(r.supplies[0].days)) + ' days' : '') + '.</li>' : '') + '</ul>' +
+      (bits.length ? '<h3>From your plan</h3>' + bits.map(function (k) {
+        return '<div class="plan-bit"><span class="sub-label">' + esc(heads[k]) + '</span><div class="notes">' + esc(p[k]) + '</div></div>';
+      }).join('') : '') +
+      '<p class="small muted" style="margin-top:14px">From ' + esc(srcName(w.source)) + '. Always follow official advice and the emergency services.</p>';
+  }
+
+  function sheetWarnSet() {
+    var w = W(), c = w.config, loc = w.location;
+    var guess = w.region_guessed && loc ? regionName(w.region) : '';
+    var locLine = !loc ? 'Not set.' : loc.from === 'homeassistant'
+      ? 'Using your Home Assistant home location (' + loc.lat.toFixed(3) + ', ' + loc.lon.toFixed(3) + ').'
+      : 'Set by hand (' + loc.lat.toFixed(3) + ', ' + loc.lon.toFixed(3) + ').';
+    var status = Object.keys(w.sources).map(function (k) {
+      var s = w.sources[k];
+      return '<div class="src-status"><span>' + esc(srcName(k)) + '</span><span class="small ' + (s.ok ? 'muted' : 'err') + '">' +
+        (s.ok ? s.count + ' · checked ' + esc(ago(s.checked_at)) : esc(s.error)) + '</span></div>';
+    }).join('');
+    return sheetHead('Warnings', 'Official warnings for where you live', '📢') +
+      '<form id="warnForm" novalidate>' +
+      '<label class="opt big"><input type="checkbox" name="on"' + (c.on ? ' checked' : '') + '><span><b>Show warnings</b>' +
+      '<span class="small muted">Checked every 15 minutes while the internet is up</span></span></label>' +
+      '<p class="small muted">Dads Army downloads the public warning feeds (the same files for everyone) and works out here which are near you. ' +
+      'Nothing about you is sent. If the internet goes down, everything else carries on and the last warnings stay on show.</p>' +
+      '<h3>Sources</h3>' + w.source_list.map(function (s) {
+        return '<label class="opt"><input type="checkbox" name="src_' + s[0] + '"' + (c.sources[s[0]] ? ' checked' : '') + '><span>' + esc(s[1]) + '</span></label>';
+      }).join('') +
+      '<h3>Where you are</h3>' +
+      '<label class="field"><span>Met Office region</span><select name="region">' +
+      '<option value="">' + (guess ? 'From my location: ' + esc(guess) : 'From my location') + '</option>' +
+      '<option value="UK"' + (c.region === 'UK' ? ' selected' : '') + '>The whole UK</option>' +
+      w.regions.map(function (r) { return '<option value="' + r[0] + '"' + (c.region === r[0] ? ' selected' : '') + '>' + esc(r[1]) + '</option>'; }).join('') +
+      '</select></label>' +
+      '<div class="field"><span>Location</span><div class="grid2">' +
+      '<input type="number" name="lat" inputmode="decimal" step="any" placeholder="Latitude, e.g. 53.96" value="' + (c.lat != null ? c.lat : '') + '" aria-label="Latitude">' +
+      '<input type="number" name="lon" inputmode="decimal" step="any" placeholder="Longitude, e.g. -1.08" value="' + (c.lon != null ? c.lon : '') + '" aria-label="Longitude"></div>' +
+      '<div class="hint">' + esc(locLine) + ' Used for flood and disaster warnings, and never leaves your network. ' +
+      (w.ha ? 'Leave empty to use your Home Assistant home location.' : 'Long-press your home in a maps app to find it.') + '</div></div>' +
+      '<div class="grid2"><label class="field"><span>Floods within (km)</span><input type="number" name="flood_km" inputmode="numeric" min="1" max="200" value="' + c.flood_km + '"></label>' +
+      '<label class="field"><span>Disasters within (km)</span><input type="number" name="gdacs_km" inputmode="numeric" min="50" max="5000" value="' + c.gdacs_km + '"></label></div>' +
+      '<p class="small muted" style="margin:-6px 0 12px">Disasters are orange and red alerts from GDACS, the UN and EU disaster alert system.</p>' +
+      (status ? '<h3>Last check</h3>' + status : '') +
+      '<p class="small muted" style="margin-top:12px">Sources: Met Office (weather warnings), Environment Agency (flood warnings, under the Open Government Licence), ' +
+      'GOV.UK Emergency Alerts, GDACS, UK Health Security Agency and the World Health Organization.</p>' +
+      '<div class="sheet-actions"><button class="btn primary block" type="submit">Save and check now</button></div></form>';
   }
 
   // ------------------------------------------------------------------
@@ -947,7 +1150,7 @@
       'Anything you already have is skipped. To clear out what you don\'t need, use <b>Select to delete</b> in Stores.</p>' +
       '<button class="btn block" data-act="seed">Load starter list</button></section>';
 
-    html += haCard();
+    html += warnHqCard() + haCard();
 
     html += '<section class="card"><div class="card-head"><h2>Appearance</h2></div><div class="seg" role="group" aria-label="Theme">' +
       [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']].map(function (t) {
@@ -1118,7 +1321,7 @@
     if (!s) return;
     var html = {
       item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText, halists: sheetHaLists,
-      check: sheetCheck, plan: sheetPlan
+      check: sheetCheck, plan: sheetPlan, warning: sheetWarning, warnset: sheetWarnSet
     }[s.type](s);
     if (html === null) {   // the item was deleted elsewhere
       closeSheet();
@@ -1387,6 +1590,18 @@
     }, btn);
   }
 
+  function checkWarnings(btn) {
+    toast('Checking the warning feeds…', { ms: 45000 });
+    return run(function () {
+      return api('POST', 'api/warnings/check', {}).then(refresh).then(function () {
+        var w = W(), bad = Object.keys(w.sources).filter(function (k) { return !w.sources[k].ok; });
+        var n = w.items.length;
+        toast((n ? n + ' warning' + (n === 1 ? '' : 's') + ' in force' : 'No warnings for where you are') +
+          (bad.length ? '. Couldn\'t check ' + bad.map(srcName).join(', ') : ''), bad.length ? { ms: 6000 } : {});
+      });
+    }, btn);
+  }
+
   function goStores(patch) {
     F.q = ''; F.cat = 'all'; F.show = 'all';
     Object.keys(patch).forEach(function (k) { F[k] = patch[k]; });
@@ -1499,6 +1714,14 @@
           });
         }, a);
       }
+      case 'warn-open': {
+        var wi = W().items[+a.dataset.i];
+        return wi ? openSheet({ type: 'warning', w: wi }) : null;
+      }
+      case 'warn-set':
+        return openSheet({ type: 'warnset' });
+      case 'warn-check':
+        return checkWarnings(a);
       case 'plan-edit':
         return openSheet({ type: 'plan' });
       case 'print-plan':
@@ -1689,6 +1912,19 @@
         return api('PUT', 'api/plan', plan).then(function () {
           closeSheet();
           return refresh().then(function () { toast('Plan saved'); });
+        });
+      }, btn);
+    }
+    if (f.id === 'warnForm') {
+      var wbody = { on: f.elements.on.checked, region: d.region || '', lat: d.lat, lon: d.lon,
+        flood_km: num(d.flood_km), gdacs_km: num(d.gdacs_km), sources: {} };
+      W().source_list.forEach(function (s) { wbody.sources[s[0]] = f.elements['src_' + s[0]].checked; });
+      if ((d.lat === '') !== (d.lon === '')) { toast('Give both a latitude and a longitude, or leave both empty', { error: true }); return; }
+      return run(function () {
+        return api('PUT', 'api/warnings', wbody).then(function () {
+          closeSheet();
+          if (!wbody.on) return refresh().then(function () { toast('Warnings switched off'); });
+          return checkWarnings(null);
         });
       }, btn);
     }
