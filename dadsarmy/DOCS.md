@@ -40,7 +40,7 @@ When the last of something is used up, Dads Army also fires a `dads_army_ran_out
 
 ## The Home front dashboard
 
-The quickest way to get Dads Army on your Home Assistant dashboards. In Dads Army, go to **HQ → Home Assistant** and tap **Make the dashboard**.
+The quickest way to get Dads Army on your Home Assistant dashboards. Dads Army offers to make it the first time you open it in Home Assistant. You can also tap **?** at the top of the app, then **Put Dads Army on your Home Assistant dashboard**, or go to **HQ → Home Assistant**. It can set up today's checklist and the supply run list at the same time.
 
 A **Home front** dashboard appears in the Home Assistant sidebar and in the Companion app. It's built from Home Assistant's own cards, so there's nothing extra to install. It has:
 

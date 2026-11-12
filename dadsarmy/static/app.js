@@ -323,6 +323,7 @@
       S = data;
       updateDatalists();
       render();
+      maybeOfferDashboard();
     });
   }
   function run(fn, btn) {
@@ -1112,6 +1113,137 @@
   }
 
   // ------------------------------------------------------------------
+  // Help, and the guided set-up of the Home front dashboard
+  // ------------------------------------------------------------------
+  var dashOffered = false;   // offered once per visit at most (and the Pi remembers "not now")
+
+  function maybeOfferDashboard() {
+    var ha = S && S.server.ha;
+    if (dashOffered || !ha || !ha.dash_prompt || !S.items.length) return;
+    dashOffered = true;
+    setTimeout(function () {
+      if (stack.length || SEL) return;
+      openSheet({ type: 'dashwiz', auto: true });
+      api('PUT', 'api/homeassistant/prompt', { snooze_days: 3 }).catch(function () { /* asked again next time */ });
+    }, 800);
+  }
+
+  function sheetHelp() {
+    var ha = S.server.ha;
+    function row(icon, title, sub, act, extra) {
+      return '<button class="li" data-act="' + act + '"' + (extra || '') + '><span class="li-ico">' + icon + '</span>' +
+        '<span class="li-main"><span class="li-title wrap">' + title + '</span><span class="li-sub">' + sub + '</span></span>' + ICON.chev + '</button>';
+    }
+    return sheetHead('Help', 'Getting the most from Dads Army', '❔') +
+      '<div class="list help-list">' +
+      (ha ? row('📊', 'Put Dads Army on your Home Assistant dashboard', 'Tiles for warnings, today\'s checklist, readiness and the stores', 'dash-wizard') : '') +
+      row('📢', 'Warnings for where you live', 'Met Office, floods, Emergency Alerts, fires', 'warn-set') +
+      row('📋', 'Routine checks and your emergency plan', 'On the Plan tab', 'help-go', ' data-view="plan"') +
+      row('🛒', 'Shopping for what\'s missing', 'The Supply run tab lists everything below target', 'help-go', ' data-view="supply"') +
+      (S.items.length ? '' : row('📦', 'Load the starter list', 'About 95 essentials, sized for your household', 'seed')) +
+      '</div>' +
+      (ha ? '<h3>Phone alerts</h3><p class="small muted">Two ready-made automations send warnings, run-outs, checks that are due and a weekly round-up to your phone. ' +
+        'In Home Assistant, open <b>Settings → Apps → Dads Army → Documentation</b> and follow <b>Phone alerts</b>.</p>' : '') +
+      '<p class="small muted" style="margin-top:14px">Dads Army v' + esc(S.server.version) + '</p>';
+  }
+
+  // What the dashboard will look like, with today's numbers.
+  function dashPreview() {
+    var r = readiness(), w = W(), due = checksDue(), short = shortList().length + S.shopping.filter(function (x) { return !x.done; }).length;
+    var pct = S.settings.target_days ? Math.min(100, Math.floor(100 * r.hold / S.settings.target_days)) : 0;
+    var soon = S.items.filter(function (it) { var i = info(it); return i.exp === 'bad' || i.exp === 'warn'; }).length;
+    function t(icon, name, val, cls) {
+      return '<div class="dp-tile' + (cls ? ' ' + cls : '') + '"><span class="dp-ico">' + icon + '</span><span class="dp-name">' + name + '</span><b>' + val + '</b></div>';
+    }
+    return '<div class="dash-preview" aria-hidden="true"><div class="dp-bar">Home front</div><div class="dp-grid">' +
+      t('⚠️', 'Warnings', w.on ? w.items.length + ' in force' : 'off', w.items.length ? 'red' : '') +
+      t('📋', 'Today\'s checklist', due + ' due', due ? 'purple' : '') +
+      t('🛡️', 'Readiness', pct + '%', pct >= 100 ? 'green' : pct >= 50 ? 'amber' : 'red') +
+      t('⏳', 'Hold out', fmtDays(r.hold) + ' days', '') +
+      t('📅', 'Use first', soon + (soon === 1 ? ' item' : ' items'), soon ? 'amber' : '') +
+      t('🛒', 'Supply run', short + ' to get', '') +
+      '</div></div>';
+  }
+
+  function sheetDashWiz(s) {
+    var ha = S.server.ha || {};
+    var head = sheetHead('Dads Army on your Home Assistant dashboard', 'A ready-made Home front dashboard', '📊');
+    if (s.steps) {
+      var icon = { wait: '○', run: '…', ok: ICON.check, bad: ICON.cross };
+      var html = head + '<ol class="wiz-steps">' + s.steps.map(function (st) {
+        return '<li class="' + st.state + '"><span class="wiz-ico">' + icon[st.state] + '</span><span>' + esc(st.label) +
+          (st.error ? '<span class="small ha-error">' + esc(st.error) + '</span>' : '') + '</span></li>';
+      }).join('') + '</ol>';
+      if (s.done) {
+        return html + '<div class="wiz-done"><b>Done.</b> <b>Home front</b> is now in your Home Assistant sidebar and in the Companion app.' +
+          (s.steps.some(function (st) { return st.key === 'checks'; }) ? ' Tick checks off there and they\'re marked done here.' : '') + '</div>' +
+          '<div class="sheet-actions">' + (inHomeAssistant() && ha.dashboard ? '<a class="btn primary block" href="' + esc(ha.dashboard.url) + '" target="_top">Open Home front</a>' : '') +
+          '<button class="btn block" data-act="close-sheet">Close</button></div>';
+      }
+      if (s.failed) {
+        return html + '<p class="small muted">If it keeps failing, you can still add Dads Army by hand: the app\'s <b>Documentation</b> tab in Home Assistant has a card to paste into any dashboard.</p>' +
+          '<div class="sheet-actions"><button class="btn primary block" data-act="dash-run">Try again</button><button class="btn block" data-act="close-sheet">Close</button></div>';
+      }
+      return html + '<p class="small muted">This takes a few seconds.</p>';
+    }
+    if (ha.dashboard) {
+      return head + dashPreview() +
+        '<p>The <b>Home front</b> dashboard is already in your Home Assistant sidebar (made ' + esc(ago(ha.dashboard.made_at)) + ').</p>' +
+        '<p class="small muted">Rebuild it if you\'ve linked a list since, so the list shows on it. Rebuilding replaces any changes you\'ve made to that dashboard.</p>' +
+        '<div class="sheet-actions">' + (inHomeAssistant() ? '<a class="btn primary block" href="' + esc(ha.dashboard.url) + '" target="_top">Open Home front</a>' : '') +
+        '<button class="btn block" data-act="ha-dash" data-again="1">Rebuild it</button></div>';
+    }
+    function opt(name, have, title, sub) {
+      if (have) return '<div class="opt done"><span class="wiz-ico ok">' + ICON.check + '</span><span><b>' + title + '</b><span class="small muted">Already on “' + esc(have) + '”</span></span></div>';
+      return '<label class="opt"><input type="checkbox" name="' + name + '" checked><span><b>' + title + '</b><span class="small muted">' + sub + '</span></span></label>';
+    }
+    return head +
+      '<p>Add a <b>Home front</b> dashboard to Home Assistant, so you can see how you\'re doing at a glance, on the wall tablet or in the Companion app.</p>' +
+      dashPreview() +
+      '<form id="dashWizForm" novalidate><h3>Also set up</h3>' +
+      opt('wiz_checks', ha.checks && ha.checks_name, 'Today\'s checklist', 'Routine checks that are due go on a Home Assistant to-do list. Tick them off on the dashboard.') +
+      opt('wiz_supply', ha.todo && ha.todo_name, 'Supply run list', 'The shopping list goes on a Home Assistant to-do list too, and you can add to it by voice.') +
+      '<p class="small muted" style="margin-top:12px">It\'s a dashboard of its own: your other dashboards aren\'t changed. It uses Home Assistant\'s own cards, so there\'s nothing else to install.</p>' +
+      '<div class="sheet-actions"><button class="btn primary block" type="button" data-act="dash-run">Make the dashboard</button>' +
+      (s.auto ? '<div class="btn-row"><button class="btn" type="button" data-act="dash-later">Not now</button><button class="btn" type="button" data-act="dash-never">Don\'t ask again</button></div>' : '') +
+      '</div></form>';
+  }
+
+  function runDashWizard(s) {
+    var f = $('#dashWizForm');
+    if (!s.steps) {
+      s.steps = [];
+      if (f && f.elements.wiz_checks && f.elements.wiz_checks.checked) {
+        s.steps.push({ key: 'checks', label: 'Making the “Dads Army checks” list', path: 'api/homeassistant/checks-list', state: 'wait' });
+      }
+      if (f && f.elements.wiz_supply && f.elements.wiz_supply.checked) {
+        s.steps.push({ key: 'supply', label: 'Making the “Supply run” list', path: 'api/homeassistant/todo-list', state: 'wait' });
+      }
+      s.steps.push({ key: 'dash', label: 'Building the Home front dashboard', path: 'api/homeassistant/dashboard', state: 'wait' });
+    }
+    s.failed = false;
+    function show() { if (stack[stack.length - 1] === s) renderSheet(); }
+    var chain = Promise.resolve();
+    s.steps.forEach(function (st) {
+      chain = chain.then(function () {
+        if (st.state === 'ok') return;
+        st.state = 'run';
+        st.error = '';
+        show();
+        return api('POST', st.path, {}).then(function () { st.state = 'ok'; show(); }, function (e) {
+          st.state = 'bad';
+          st.error = e.message;
+          throw e;
+        });
+      });
+    });
+    show();
+    return chain.then(function () { s.done = true; }, function () { s.failed = true; })
+      .then(function () { return refresh().catch(function () { /* shown anyway */ }); })
+      .then(show);
+  }
+
+  // ------------------------------------------------------------------
   // HQ (settings)
   // ------------------------------------------------------------------
   function stepperHtml(name, value, label, step, isSetting) {
@@ -1211,7 +1343,7 @@
     if (!d) {
       return '<p class="small muted">Add a <b>Home front</b> dashboard to the Home Assistant sidebar, made of tiles: warnings, today\'s checklist, ' +
         'readiness, what to use first, the stores and the supply run. It also works in the Companion app.</p>' +
-        '<button class="btn primary block" data-act="ha-dash">Make the dashboard</button>';
+        '<button class="btn primary block" data-act="dash-wizard">Make the dashboard…</button>';
     }
     return '<p class="small muted">The <b>Home front</b> dashboard is in the Home Assistant sidebar (made ' + esc(ago(d.made_at)) + '). ' +
       'Rebuild it after linking a list below, so the list shows on it.</p>' +
@@ -1369,7 +1501,7 @@
     if (!s) return;
     var html = {
       item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText, halists: sheetHaLists,
-      check: sheetCheck, plan: sheetPlan, warning: sheetWarning, warnset: sheetWarnSet
+      check: sheetCheck, plan: sheetPlan, warning: sheetWarning, warnset: sheetWarnSet, help: sheetHelp, dashwiz: sheetDashWiz
     }[s.type](s);
     if (html === null) {   // the item was deleted elsewhere
       closeSheet();
@@ -1773,6 +1905,27 @@
         return openSheet({ type: 'warnset' });
       case 'warn-check':
         return checkWarnings(a);
+      case 'help':
+        return openSheet({ type: 'help' });
+      case 'help-go': {
+        var dest = a.dataset.view;
+        closeSheet();
+        return setTimeout(function () { go(dest); }, 60);
+      }
+      case 'dash-wizard':
+        return openSheet({ type: 'dashwiz' });
+      case 'dash-run': {
+        var top = stack[stack.length - 1];
+        if (!top || top.type !== 'dashwiz') return;
+        a.disabled = true;
+        return runDashWizard(top);
+      }
+      case 'dash-later':
+      case 'dash-never':
+        closeSheet();
+        return api('PUT', 'api/homeassistant/prompt', act === 'dash-never' ? { never: true } : { snooze_days: 14 }).then(function () {
+          toast(act === 'dash-never' ? 'You can still make it any time: tap ? at the top' : 'Asking again in a couple of weeks. Or tap ? at the top any time.');
+        }, function () { /* fine */ });
       case 'fire-ignore': {
         var spot = [+a.dataset.lat, +a.dataset.lon];
         if (!confirm('Ignore fires at this spot from now on?\n\nUse this for places like a refinery flare or a regular bonfire site. ' +

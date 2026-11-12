@@ -47,7 +47,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -1662,11 +1662,15 @@ def ha_status():
             "SELECT key FROM ha_todo WHERE key LIKE 'i:%' AND uid != '' AND done = 1")] if entity else []
         checks = setting_raw("ha_checks_list", "") or ""
         dash = setting_raw("ha_dashboard", None)
+        prompt = setting_raw("ha_dash_prompt", None)
+    prompt = prompt if isinstance(prompt, dict) else {}
+    offer = (not isinstance(dash, dict) and not prompt.get("never")
+             and (not prompt.get("until") or str(prompt["until"]) <= dt.date.today().isoformat()))
     return {"todo": entity, "todo_name": TODO_STATUS["name"] or entity, "ok": TODO_STATUS["ok"],
             "error": TODO_STATUS["error"], "synced_at": TODO_STATUS["synced_at"], "ticked": ticked,
             "checks": checks, "checks_name": CHECKS_STATUS["name"] or checks, "checks_ok": CHECKS_STATUS["ok"],
             "checks_error": CHECKS_STATUS["error"], "checks_synced_at": CHECKS_STATUS["synced_at"],
-            "dashboard": dash if isinstance(dash, dict) else None}
+            "dashboard": dash if isinstance(dash, dict) else None, "dash_prompt": offer}
 
 
 def todo_sync(entity, s):
@@ -2454,6 +2458,20 @@ def api_ha_make_checks_list(body, query):
     checks_link(entity)
     HA_WAKE.set()
     return {"status": ha_status(), "entity_id": entity}
+
+
+@route("PUT", "/api/homeassistant/prompt")
+def api_ha_prompt(body, query):
+    """The offer to make the dashboard: ask again in a few days ({"snooze_days": n}), or never ({"never": true})."""
+    need_ha()
+    if body.get("never"):
+        val = {"never": True}
+    else:
+        days = int(clean_num(body.get("snooze_days"), 14, 1, 365, "Days"))
+        val = {"until": (dt.date.today() + dt.timedelta(days=days)).isoformat()}
+    with tx() as db:
+        set_setting_raw(db, "ha_dash_prompt", val)
+    return {"status": ha_status()}
 
 
 @route("POST", "/api/homeassistant/dashboard")
