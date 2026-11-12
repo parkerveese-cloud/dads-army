@@ -28,7 +28,7 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_checks_due` | Routine checks that are due, overdue or not done yet | `items` (each has `name`, `due`, `days`, `every` and `text`), `due_today`, `due_soon` (within a week), `next_check`, `checks_total` |
 | `sensor.dads_army_stores_value` | What the stores are worth, in £, from the prices you've set | `supply_run_cost`, `priced_items`, `items_total` |
 | `sensor.dads_army_warnings` | Official warnings in force for where you live (see **Warnings** below). 0 while warnings are switched off. | `items` (each has `title`, `level`, `severity` 1–3, `source`, `area`, `when`, `url` and `text`), `highest` (yellow, amber or red), `max_severity`, `enabled`, `checked_at`, `health_news` |
-| `binary_sensor.dads_army_attention` | **On** if anything has expired or run out, a check is due, or a serious warning (amber or worse) is in force | `reasons` |
+| `binary_sensor.dads_army_attention` | **On** when something needs doing now: stock past its best-before date, a check that's overdue, or a serious warning (amber or worse). Things you haven't bought yet don't count: they're on the supply run. | `reasons` |
 
 Each list holds up to 30 entries; `total` gives the full count. The numbers are recorded in Home Assistant's history, so you can chart how your readiness changes over time.
 
@@ -264,7 +264,7 @@ When you edit an item, **Used a day** says how many your household gets through 
 
 ## Automation ideas
 
-- Use `binary_sensor.dads_army_attention` for a warning light: it's **on** whenever something has expired or run out or a check is due, and its `reasons` attribute says what.
+- Use `binary_sensor.dads_army_attention` for a warning light: it's **on** when something needs doing now (expired stock, an overdue check or a serious warning), and its `reasons` attribute says what.
 - Flash a light or announce on a speaker when the `dads_army_ran_out` event fires.
 - Get a reminder when `sensor.dads_army_readiness` drops below 100%.
 - Get a warning when `sensor.dads_army_supplies` drops below a week, so there's time to get more of your medicines.

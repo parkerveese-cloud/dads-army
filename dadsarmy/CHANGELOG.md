@@ -3,6 +3,7 @@
 ## 1.7.2
 
 - **A quieter Activity log in Home Assistant.** **Dads Army needs attention** no longer turns "Unavailable" and back again every time Dads Army restarts, which happens for each update and for Home Assistant's nightly backup. That added two lines to the Activity log each time. The number sensors still show "Unavailable" while Dads Army is stopped, so dashboards can still tell.
+- **Needs attention now means "needs doing now".** It comes on for stock past its best-before date, checks that are overdue, and serious warnings (amber or worse). It no longer counts things you haven't bought yet (they're on the supply run), or checks you haven't done for the first time yet. Before, it stayed on for weeks while you built up your stores.
 
 ## 1.7.1
 

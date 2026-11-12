@@ -1574,16 +1574,17 @@ def ha_entities(s):
         "mdi:alert-octagon" if w["serious"] else "mdi:alert-outline" if w["count"] else "mdi:shield-check-outline",
         "warnings", dict(_ha_list(w["items"]), highest=w["highest"], max_severity=w["max_severity"],
                          enabled=w["enabled"], checked_at=w["checked_at"], health_news=w["news"]))
+    # Only what needs doing now. Things not bought yet are the supply run's job (they'd keep
+    # this on for weeks while the stores are built up), and a check that's never been done
+    # isn't overdue.
     reasons = []
     if w["serious"]:
         reasons.append("%d warning%s in force" % (w["serious"], "" if w["serious"] == 1 else "s"))
     if s["expired"]:
         reasons.append("%d expired" % len(s["expired"]))
-    if s["out_of_stock"]:
-        reasons.append("%d out of stock" % len(s["out_of_stock"]))
-    if s["checks_due"]:
-        n = len(s["checks_due"])
-        reasons.append("%d check%s due" % (n, "" if n == 1 else "s"))
+    overdue = [c for c in s["checks_due"] if c["days"] is not None and c["days"] < 0]
+    if overdue:
+        reasons.append("%d check%s overdue" % (len(overdue), "" if len(overdue) == 1 else "s"))
     put("binary_sensor.dads_army_attention", "on" if reasons else "off", "Dads Army needs attention",
         "mdi:alert-circle" if reasons else "mdi:check-circle", attrs={"reasons": reasons},
         measurement=False, device_class="problem")
