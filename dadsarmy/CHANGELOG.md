@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.1
+
+- **Possible fires nearby.** A new warnings source, off until you tick it in the warnings settings: hotspots NASA's satellites picked up in the last 24 hours within 10 km of home (you can change the distance).
+  - Nearby hotspots are grouped into one **Possible fire**, such as "Possible fire 6 km north-east of home", with a link to NASA's fire map and fire safety advice.
+  - Satellites also see controlled burns, farm fires and industrial flares. Places that come up again and again over a week or more are left out, and you can tap **Not a wildfire: ignore this spot** for any other.
+- A warning that drops out for one check (if a feed hiccups) no longer sends a second phone alert when it comes back.
+
 ## 1.6.0
 
 - **Warnings for where you live.** Switch them on under **HQ → Warnings** to see official warnings from:

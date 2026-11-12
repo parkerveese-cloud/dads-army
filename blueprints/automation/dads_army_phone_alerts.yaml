@@ -5,9 +5,9 @@ blueprint:
 
 
     - **Warnings:** straight away, new official warnings for where you live:
-    Met Office weather warnings, flood warnings, UK Emergency Alerts and major
-    disasters near the UK (switch warnings on in Dads Army under HQ, 1.6.0 or
-    later).
+    Met Office weather warnings, flood warnings, UK Emergency Alerts, major
+    disasters near the UK, and possible fires seen by satellite (switch
+    warnings on in Dads Army under HQ, 1.6.0 or later).
 
     - **Run out:** straight away, when the last of something is used up.
 
@@ -41,7 +41,7 @@ blueprint:
       selector:
         select:
           options:
-            - label: Everything, including yellow weather warnings and flood alerts
+            - label: Everything, including yellow weather warnings, flood alerts and possible fires
               value: "1"
             - label: Amber, orange and red, flood warnings and Emergency Alerts
               value: "2"
@@ -138,7 +138,7 @@ actions:
               {{ 'Dads Army: ' ~ ('warning' if warn_rows | count == 1 else (warn_rows | count) ~ ' warnings') }}
             message: |-
               {%- set src = {'metoffice': 'Met Office', 'floods': 'Environment Agency', 'govalerts': 'GOV.UK',
-                             'gdacs': 'GDACS'} -%}
+                             'gdacs': 'GDACS', 'fires': 'NASA satellites'} -%}
               {%- set ns = namespace(out=[]) -%}
               {%- for i in warn_rows[:6] -%}
                 {%- set ns.out = ns.out + [('• ' if warn_rows | count > 1 else '') ~ i.title ~ ' (' ~ src.get(i.source, i.source) ~ ')'] -%}

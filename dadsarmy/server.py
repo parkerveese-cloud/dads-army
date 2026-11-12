@@ -44,7 +44,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -2040,6 +2040,9 @@ FEED_URLS = {
     "ukhsa": "https://www.gov.uk/search/news-and-communications.atom?organisations%5B%5D=uk-health-security-agency",
     "who": "https://www.who.int/api/news/diseaseoutbreaknews?$top=6&$orderby=PublicationDateAndTime%20desc"
            "&$select=Title,OverrideTitle,UseOverrideTitle,UrlName,PublicationDateAndTime",
+    # NASA FIRMS: satellite fire detections for Europe over the last 7 days (free, no account)
+    "fires": "https://firms.modaps.eosdis.nasa.gov/data/active_fire/noaa-20-viirs-c2/csv/J1_VIIRS_C2_Europe_7d.csv",
+    "fires_modis": "https://firms.modaps.eosdis.nasa.gov/data/active_fire/modis-c6.1/csv/MODIS_C6_1_Europe_7d.csv",
 }
 try:   # for testing against local copies
     FEED_URLS.update(json.loads(os.environ.get("DADSARMY_FEED_URLS") or "{}"))
@@ -2051,11 +2054,12 @@ WARN_SOURCES = [  # key, what it is, on by default
     ("floods", "Flood warnings (England)", True),
     ("govalerts", "UK Emergency Alerts", True),
     ("gdacs", "Disasters near the UK (GDACS)", True),
+    ("fires", "Possible fires nearby (NASA satellites)", False),
     ("ukhsa", "UK Health Security Agency news", False),
     ("who", "WHO disease outbreak news", False),
 ]
 WARN_SOURCE_NAMES = {"metoffice": "Met Office", "floods": "Environment Agency", "govalerts": "GOV.UK Emergency Alerts",
-                     "gdacs": "GDACS", "ukhsa": "UKHSA", "who": "WHO"}
+                     "gdacs": "GDACS", "fires": "NASA FIRMS", "ukhsa": "UKHSA", "who": "WHO"}
 MET_REGIONS = [  # code, name, rough middle (to guess yours from Home Assistant's location)
     ("os", "Orkney & Shetland", 59.6, -2.0), ("he", "Highlands & Eilean Siar", 57.5, -5.0),
     ("gr", "Grampian", 57.2, -2.8), ("st", "Strathclyde", 55.8, -4.8),
@@ -2068,10 +2072,10 @@ MET_REGIONS = [  # code, name, rough middle (to guess yours from Home Assistant'
 ]
 MET_NAME = {c: n for c, n, _, _ in MET_REGIONS}
 WARN_DEFAULTS = {"on": False, "sources": {k: d for k, _, d in WARN_SOURCES}, "region": "", "lat": None, "lon": None,
-                 "flood_km": 20, "gdacs_km": 1000}
+                 "flood_km": 20, "gdacs_km": 1000, "fire_km": 10}
 WARN_EVERY = 15 * 60      # seconds between checks
 FLOOD_LOOKUPS = 80        # flood areas to look up per check (they're kept once found)
-WARN_STATE = {"items": [], "news": [], "sources": {}, "checked_at": None, "region": "", "seen": []}
+WARN_STATE = {"items": [], "news": [], "sources": {}, "checked_at": None, "region": "", "seen": {}}
 WARN_LOCK = threading.Lock()
 WARN_WAKE = threading.Event()
 WARN_DONE = threading.Condition()
@@ -2101,7 +2105,7 @@ def warn_cfg():
             cfg[k] = float(v)
     if cfg["lat"] is None or cfg["lon"] is None:
         cfg["lat"] = cfg["lon"] = None
-    for k, lo, hi in (("flood_km", 1, 200), ("gdacs_km", 50, 5000)):
+    for k, lo, hi in (("flood_km", 1, 200), ("gdacs_km", 50, 5000), ("fire_km", 2, 50)):
         v = raw.get(k)
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             cfg[k] = int(min(hi, max(lo, v)))
@@ -2335,7 +2339,127 @@ def parse_who(data, now):
     return out[:4]
 
 
-def fetch_source(key, cfg, home, region, areas, now):
+# -- Possible fires, from NASA's satellites ---------------------------------------
+# A satellite sees any big heat source: wildfires, but also controlled heather
+# burning, farm fires and industrial flares. Places that show up again and again
+# over weeks are flares and the like, so they're left out; real fires come and go.
+FIRE_HISTORY_KM = 50     # remember where hotspots were seen within this distance
+FIRE_CLUSTER_KM = 2      # hotspots this close together count as one fire
+FIRE_IGNORE_KM = 1.5     # a spot you've said isn't a wildfire covers this far
+FIRE_FRESH = dt.timedelta(hours=24)   # only the last day's sightings are shown; the rest is history
+
+
+def parse_firms(data):
+    """(lat, lon, when) for each confident detection in a FIRMS CSV (VIIRS or MODIS)."""
+    rows = []
+    for r in csv.DictReader(io.StringIO(data.decode("utf-8", "replace"))):
+        try:
+            lat, lon = float(r["latitude"]), float(r["longitude"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        conf = (r.get("confidence") or "").strip().lower()
+        if conf in ("l", "low") or (conf.isdigit() and int(conf) < 50):
+            continue
+        try:
+            when = dt.datetime.strptime((r.get("acq_date") or "").strip() + (r.get("acq_time") or "").strip().zfill(4),
+                                        "%Y-%m-%d%H%M").replace(tzinfo=dt.timezone.utc)
+        except ValueError:
+            continue
+        rows.append((lat, lon, when))
+    return rows
+
+
+def compass(lat1, lon1, lat2, lon2):
+    """Which way from the first point to the second: 'north-east' and so on."""
+    r = math.radians
+    y = math.sin(r(lon2 - lon1)) * math.cos(r(lat2))
+    x = math.cos(r(lat1)) * math.sin(r(lat2)) - math.sin(r(lat1)) * math.cos(r(lat2)) * math.cos(r(lon2 - lon1))
+    deg = (math.degrees(math.atan2(y, x)) + 360) % 360
+    return ["north", "north-east", "east", "south-east", "south", "south-west", "west",
+            "north-west"][int((deg + 22.5) // 45) % 8]
+
+
+def fire_cell(lat, lon):
+    return "%.2f,%.2f" % (lat, lon)
+
+
+def fire_is_fixture(hist, lat, lon, today):
+    """Seen on 4 or more earlier days in the last 30, starting a week or more ago: a flare or the like."""
+    days = set()
+    for dlat in (-0.01, 0, 0.01):
+        for dlon in (-0.01, 0, 0.01):
+            days.update(d for d in hist.get(fire_cell(lat + dlat, lon + dlon), []) if d != today)
+    week = (dt.date.fromisoformat(today) - dt.timedelta(days=7)).isoformat()
+    return len(days) >= 4 and min(days) <= week
+
+
+def fires_near(home, km, hist, now, ignore=()):
+    pts, worked, err = [], 0, None
+    for k in ("fires", "fires_modis"):
+        if not FEED_URLS.get(k):
+            continue
+        try:
+            pts += parse_firms(http_get(FEED_URLS[k], timeout=30))
+            worked += 1
+        except Exception as e:
+            err = e
+    if not worked:
+        raise err or ValueError("no fire feed")
+    today = now.date().isoformat()
+    near = []
+    for lat, lon, when in pts:
+        d = km_between(home["lat"], home["lon"], lat, lon)
+        if d <= FIRE_HISTORY_KM and not any(km_between(lat, lon, i[0], i[1]) <= FIRE_IGNORE_KM for i in ignore):
+            near.append((lat, lon, when, d))
+    # Add the week's sightings to the history, then see what's a fixture.
+    for lat, lon, when, d in near:
+        days = hist.setdefault(fire_cell(lat, lon), [])
+        if when.date().isoformat() not in days:
+            days.append(when.date().isoformat())
+    fresh = [p for p in near if p[3] <= km and now - p[2] <= FIRE_FRESH and not fire_is_fixture(hist, p[0], p[1], today)]
+    cutoff = (now.date() - dt.timedelta(days=30)).isoformat()
+    for cell in list(hist):
+        hist[cell] = sorted(d for d in hist[cell] if d >= cutoff)[-30:]
+        if not hist[cell]:
+            del hist[cell]
+    if len(hist) > 2000:
+        for cell in sorted(hist, key=lambda c: hist[c][-1])[:len(hist) - 2000]:
+            del hist[cell]
+    # Hotspots close together are one possible fire.
+    groups = []
+    for p in sorted(fresh, key=lambda p: p[2]):
+        for g in groups:
+            if km_between(g[0][0], g[0][1], p[0], p[1]) <= FIRE_CLUSTER_KM:
+                g.append(p)
+                break
+        else:
+            groups.append([p])
+    out = []
+    for g in groups:
+        lat = sum(p[0] for p in g) / len(g)
+        lon = sum(p[1] for p in g) / len(g)
+        d = km_between(home["lat"], home["lon"], lat, lon)
+        latest = max(p[2] for p in g)
+        local = latest.astimezone()
+        first = g[0]   # the earliest sighting: stays the same as more come in, so it's one warning
+        out.append({"id": "fire:%s:%s" % (fire_cell(round(first[0] * 50) / 50, round(first[1] * 50) / 50),
+                                          first[2].date().isoformat()),
+                    "source": "fires", "kind": "fire", "severity": 1, "level": "Possible fire",
+                    "title": "Possible fire %d km %s of home" % (max(1, int(round(d))),
+                                                                compass(home["lat"], home["lon"], lat, lon)),
+                    "text": ("NASA satellites picked up %d hotspot%s here, the latest at %s on %d %s. It could be a "
+                             "wildfire, a controlled burn, or a farm or garden fire. Satellites only pass over a few "
+                             "times a day, so it may be a few hours old."
+                             % (len(g), "" if len(g) == 1 else "s", local.strftime("%H:%M"), local.day,
+                                local.strftime("%b"))),
+                    "area": "", "distance_km": int(round(d)), "when": "", "lat": round(lat, 4), "lon": round(lon, 4),
+                    "url": "https://firms.modaps.eosdis.nasa.gov/map/#d:24hrs;@%.3f,%.3f,12.0z" % (lon, lat),
+                    "issued": iso_utc(latest)})
+    out.sort(key=lambda i: i["distance_km"])
+    return out
+
+
+def fetch_source(key, cfg, home, region, mem, now):
     if key == "metoffice":
         return parse_met(http_get(FEED_URLS["metoffice"]), "" if region == "UK" else MET_NAME.get(region, ""))
     if key == "govalerts":
@@ -2348,7 +2472,10 @@ def fetch_source(key, cfg, home, region, areas, now):
         raise NeedLocation()
     if key == "gdacs":
         return parse_gdacs(http_get(FEED_URLS["gdacs"]), home, cfg["gdacs_km"])
+    if key == "fires":
+        return fires_near(home, cfg["fire_km"], mem["fire_cells"], now, mem["fire_ignore"])
     # Floods: look up where each flood area is (once), then keep the ones near you.
+    areas = mem["areas"]
     out, looked = [], 0
     for r in parse_floods(http_get(FEED_URLS["floods"])):
         centre = areas.get(r["area_id"])
@@ -2382,7 +2509,8 @@ def warnings_run():
     refresh_ha_home()   # also shows where Home Assistant thinks home is, in the settings
     with LOCK:
         cfg = warn_cfg()
-        areas = setting_raw("flood_areas", {}) or {}
+        mem = {"areas": setting_raw("flood_areas", {}) or {}, "fire_cells": setting_raw("fire_cells", {}) or {},
+               "fire_ignore": fire_ignore_list()}
     if not cfg["on"]:
         return
     home = home_location(cfg)
@@ -2400,7 +2528,7 @@ def warnings_run():
             continue
         old = prev["sources"].get(key) or {}
         try:
-            got = fetch_source(key, cfg, home, region, areas, now)
+            got = fetch_source(key, cfg, home, region, mem, now)
             by_src[key] = got
             statuses[key] = {"ok": True, "error": "", "checked_at": now_iso(), "count": len(got)}
             any_ok = True
@@ -2415,15 +2543,24 @@ def warnings_run():
     every.sort(key=lambda i: i.get("issued") or "", reverse=True)
     every.sort(key=lambda i: -i["severity"])
     warnings = [i for i in every if i["kind"] != "news"]
-    new = [w for w in warnings if w["id"] not in set(prev["seen"])]
+    # A warning is only news once: remember each one for a day after it was last seen, so one that
+    # drops out for a check (a feed hiccup, or a fire spot ignored and then un-ignored) doesn't buzz again.
+    seen = prev.get("seen") or {}
+    if isinstance(seen, list):   # 1.6.0 kept a plain list
+        seen = {i: now_iso() for i in seen}
+    new = [w for w in warnings if w["id"] not in seen]
+    day_ago = (dt.datetime.now() - dt.timedelta(hours=24)).replace(microsecond=0).isoformat(sep=" ")
+    seen = {k: v for k, v in seen.items() if v >= day_ago}
+    seen.update((w["id"], now_iso()) for w in warnings)
     state = {"items": warnings, "news": [i for i in every if i["kind"] == "news"], "sources": statuses,
-             "checked_at": now_iso() if any_ok else prev["checked_at"], "region": region,
-             "seen": [w["id"] for w in warnings]}
+             "checked_at": now_iso() if any_ok else prev["checked_at"], "region": region, "seen": seen}
+    areas = mem["areas"]
     if len(areas) > 3000:
         areas = dict(list(areas.items())[-2000:])
     with tx() as db:
         set_setting_raw(db, "warnings_cache", state)
         set_setting_raw(db, "flood_areas", areas)
+        set_setting_raw(db, "fire_cells", mem["fire_cells"])
     with WARN_LOCK:
         WARN_STATE.clear()
         WARN_STATE.update(state)
@@ -2487,7 +2624,7 @@ def warn_public():
             "sources": st["sources"] if on else {}, "checked_at": st["checked_at"] if on else None,
             "location": loc, "region": cfg["region"] or guess_region(loc) or "UK", "region_guessed": not cfg["region"],
             "regions": [[c, n] for c, n, _, _ in MET_REGIONS], "source_list": [[k, n] for k, n, _ in WARN_SOURCES],
-            "ha": bool(HA_TOKEN)}
+            "fire_ignored": len(fire_ignore_list()), "ha": bool(HA_TOKEN)}
 
 
 def warn_brief():
@@ -2529,7 +2666,8 @@ def api_warnings_set(body, query):
             for k, lim, label in (("lat", 90, "Latitude"), ("lon", 180, "Longitude")):
                 if not -lim <= float(body.get(k)) <= lim:
                     raise ApiError(400, "%s must be between -%d and %d" % (label, lim, lim))
-    for k, lo, hi, label in (("flood_km", 1, 200, "Flood distance"), ("gdacs_km", 50, 5000, "Disaster distance")):
+    for k, lo, hi, label in (("flood_km", 1, 200, "Flood distance"), ("gdacs_km", 50, 5000, "Disaster distance"),
+                             ("fire_km", 2, 50, "Fire distance")):
         if k in body:
             cur[k] = int(clean_num(body.get(k), cur[k], lo, hi, label))
     with tx() as db:
@@ -2537,6 +2675,47 @@ def api_warnings_set(body, query):
         add_log("settings", "", "Warnings switched on" if cur["on"] and "on" in body and body.get("on")
                 else "Warnings switched off" if "on" in body and not cur["on"] else "Warnings settings updated")
     WARN_WAKE.set()
+    with LOCK:
+        return {"warnings": warn_public()}
+
+
+def fire_ignore_list():
+    raw = setting_raw("fire_ignore", [])
+    return [p for p in raw if isinstance(p, list) and len(p) == 2
+            and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in p)] if isinstance(raw, list) else []
+
+
+@route("POST", "/api/warnings/ignore-fire")
+def api_fire_ignore(body, query):
+    """Not a wildfire (a flare, a bonfire site...): don't show fires at that spot again. Or undo that."""
+    with LOCK:
+        spots = fire_ignore_list()
+    if body.get("clear"):
+        spots, what = [], "Ignored fire spots cleared"
+    else:
+        point = body.get("remove") if body.get("remove") is not None else [body.get("lat"), body.get("lon")]
+        if not isinstance(point, list) or len(point) != 2:
+            raise ApiError(400, "Which spot?")
+        lat = clean_num(point[0], None, -90, 90, "Latitude")
+        lon = clean_num(point[1], None, -180, 180, "Longitude")
+        if lat is None or lon is None:
+            raise ApiError(400, "Which spot?")
+        if body.get("remove") is not None:
+            spots = [s for s in spots if km_between(s[0], s[1], lat, lon) > 0.05]
+            what = "A fire spot is shown again"
+        else:
+            spots = (spots + [[round(lat, 4), round(lon, 4)]])[-100:]
+            what = "A fire spot is ignored"
+    with WARN_LOCK:   # take it off straight away, not at the next check
+        WARN_STATE["items"] = [i for i in WARN_STATE["items"] if i.get("source") != "fires" or not any(
+            km_between(i.get("lat", 0), i.get("lon", 0), s[0], s[1]) <= FIRE_IGNORE_KM for s in spots)]
+        cache = json.loads(json.dumps(WARN_STATE))
+    with tx() as db:
+        set_setting_raw(db, "fire_ignore", spots)
+        set_setting_raw(db, "warnings_cache", cache)
+        add_log("settings", "", what)
+    if body.get("remove") is not None or body.get("clear"):
+        WARN_WAKE.set()   # bring it back
     with LOCK:
         return {"warnings": warn_public()}
 

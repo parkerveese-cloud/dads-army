@@ -208,6 +208,7 @@ Dads Army can show official warnings for where you live: on the Sitrep, on the *
 | Environment Agency | Flood alerts, flood warnings and severe flood warnings near you (England only) |
 | GOV.UK Emergency Alerts | Alerts about a danger to life, while they're being sent and for 12 hours after |
 | GDACS (the UN and EU disaster alert system) | Orange and red alerts for earthquakes, floods, storms, volcanoes and tsunamis within 1,000 km |
+| NASA FIRMS (optional) | Possible fires within 10 km: hotspots seen by satellite in the last 24 hours |
 | UK Health Security Agency (optional) | Its latest news, such as cold-weather and heat-health alerts |
 | WHO (optional) | Disease outbreak news |
 
@@ -220,6 +221,12 @@ How it works:
 - Keep **Emergency Alerts** switched on in your phone's settings too. They reach the phone directly, much faster than any feed.
 
 Flood warnings outside England come from SEPA (Scotland), Natural Resources Wales and NI Direct, which Dads Army doesn't read yet.
+
+**About possible fires.** There's no public feed of UK wildfire warnings, so this uses NASA's satellite fire detections. They're the only live source that covers the whole UK.
+- A satellite sees any large heat source. Most UK detections are controlled heather burning (allowed in autumn and winter), farm fires or industrial flares, not wildfires. That's why they show as a yellow **Possible fire**.
+- Dads Army learns to leave out places that come up again and again over a week or more, such as refinery flares. For anything else that isn't a wildfire, open it and tap **Not a wildfire: ignore this spot**.
+- Satellites only pass over a few times a day, so a fire can be a few hours old before it shows.
+- If you can see a fire that looks out of control, call 999.
 
 ## Routine checks, daily use and the emergency plan
 

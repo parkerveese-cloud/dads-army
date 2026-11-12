@@ -895,8 +895,9 @@
   // ------------------------------------------------------------------
   // Warnings: Met Office, floods, Emergency Alerts, GDACS, UKHSA, WHO
   // ------------------------------------------------------------------
-  var WARN_ICON = { weather: '🌦️', flood: '🌊', alert: '📢', disaster: '🌍', news: '🩺' };
-  var SRC_NAME = { metoffice: 'Met Office', floods: 'Environment Agency', govalerts: 'GOV.UK', gdacs: 'GDACS', ukhsa: 'UKHSA', who: 'WHO' };
+  var WARN_ICON = { weather: '🌦️', flood: '🌊', alert: '📢', disaster: '🌍', fire: '🔥', news: '🩺' };
+  var SRC_NAME = { metoffice: 'Met Office', floods: 'Environment Agency', govalerts: 'GOV.UK', gdacs: 'GDACS', fires: 'NASA FIRMS',
+    ukhsa: 'UKHSA', who: 'WHO' };
   function W() {
     return S.warnings || { on: false, items: [], news: [], sources: {}, config: { sources: {} }, regions: [], source_list: [] };
   }
@@ -941,7 +942,7 @@
       if (!full) return '';
       return '<section class="card"><div class="card-head"><h2>Warnings</h2></div>' +
         '<p class="small muted">See official warnings for where you live, alongside your stores and plan: Met Office weather warnings, ' +
-        'flood warnings, UK Emergency Alerts and major disasters near the UK, with optional health news from UKHSA and the WHO.</p>' +
+        'flood warnings, UK Emergency Alerts and major disasters near the UK, with optional fire detections from NASA satellites and health news from UKHSA and the WHO.</p>' +
         '<button class="btn primary block" data-act="warn-set">Set up warnings</button></section>';
     }
     // The Sitrep keeps it short: no test or finished Emergency Alerts, and the three most serious.
@@ -1002,6 +1003,13 @@
         'Do what the alert tells you. Emergency Alerts are only sent when there\'s a danger to life nearby.',
         'Check that the people you live with, and neighbours, have seen it.'] };
     }
+    if (w.kind === 'fire') {
+      return { plan: ['meet_near', 'meet_far'], tips: [
+        'If you can see flames, or smoke from a fire that looks out of control, call 999. Don\'t assume someone else has.',
+        'Don\'t go to look, and keep away from the smoke.',
+        'Close windows and doors to keep smoke out.',
+        'If it\'s heading your way, get ready to leave: grab bag, medicines, pets, and know where you\'ll meet.'] };
+    }
     if (w.kind === 'disaster') {
       return { plan: [], tips: [
         'Unless it\'s in the UK, the main thing is to keep up with the news.',
@@ -1045,7 +1053,10 @@
       (w.distance_km != null ? '<span class="small muted">' + w.distance_km + ' km away</span>' : '') + '</div>' +
       (w.when ? '<p class="small"><b>' + esc(w.when) + '</b></p>' : '') +
       (w.text ? '<div class="notes">' + esc(w.text) + '</div>' : '') +
-      (w.url ? '<a class="btn block ext" href="' + esc(w.url) + '" target="_blank" rel="noopener noreferrer">Full details from ' + esc(srcName(w.source)) + '</a>' : '') +
+      (w.url ? '<a class="btn block ext" href="' + esc(w.url) + '" target="_blank" rel="noopener noreferrer">' +
+        (w.kind === 'fire' ? 'See it on NASA\'s fire map' : 'Full details from ' + esc(srcName(w.source))) + '</a>' : '') +
+      (w.kind === 'fire' && w.lat != null ? '<button class="btn block ext" data-act="fire-ignore" data-lat="' + w.lat + '" data-lon="' + w.lon + '">' +
+        'Not a wildfire: ignore this spot</button>' : '') +
       '<h3>What to do</h3><ul class="tips">' + tips.tips.map(function (t) { return '<li>' + esc(t) + '</li>'; }).join('') +
       (r.people && w.kind !== 'disaster' ? '<li>Your stores would last about <b>' + esc(fmtDays(r.hold)) + ' days</b>' +
         (r.supplies[0] ? ', and ' + esc(r.supplies[0].it.name) + ' about ' + esc(fmtDays(r.supplies[0].days)) + ' days' : '') + '.</li>' : '') + '</ul>' +
@@ -1087,11 +1098,16 @@
       '<div class="hint">' + esc(locLine) + ' Used for flood and disaster warnings, and never leaves your network. ' +
       (w.ha ? 'Leave empty to use your Home Assistant home location.' : 'Long-press your home in a maps app to find it.') + '</div></div>' +
       '<div class="grid2"><label class="field"><span>Floods within (km)</span><input type="number" name="flood_km" inputmode="numeric" min="1" max="200" value="' + c.flood_km + '"></label>' +
-      '<label class="field"><span>Disasters within (km)</span><input type="number" name="gdacs_km" inputmode="numeric" min="50" max="5000" value="' + c.gdacs_km + '"></label></div>' +
-      '<p class="small muted" style="margin:-6px 0 12px">Disasters are orange and red alerts from GDACS, the UN and EU disaster alert system.</p>' +
+      '<label class="field"><span>Fires within (km)</span><input type="number" name="fire_km" inputmode="numeric" min="2" max="50" value="' + c.fire_km + '"></label></div>' +
+      '<div class="grid2"><label class="field"><span>Disasters within (km)</span><input type="number" name="gdacs_km" inputmode="numeric" min="50" max="5000" value="' + c.gdacs_km + '"></label></div>' +
+      '<p class="small muted" style="margin:-6px 0 12px">Disasters are orange and red alerts from GDACS, the UN and EU disaster alert system. ' +
+      'Fires are hotspots NASA satellites saw in the last 24 hours: often controlled burns or farm fires, sometimes a wildfire. ' +
+      'Places seen again and again over a week or more, like industrial flares, are left out, and you can tell it to ignore a spot.</p>' +
+      (w.fire_ignored ? '<p class="small muted">Ignoring ' + w.fire_ignored + ' fire spot' + (w.fire_ignored === 1 ? '' : 's') +
+        ' you\'ve marked as not a wildfire. <button type="button" class="link" data-act="fire-unignore">Show them again</button></p>' : '') +
       (status ? '<h3>Last check</h3>' + status : '') +
       '<p class="small muted" style="margin-top:12px">Sources: Met Office (weather warnings), Environment Agency (flood warnings, under the Open Government Licence), ' +
-      'GOV.UK Emergency Alerts, GDACS, UK Health Security Agency and the World Health Organization.</p>' +
+      'GOV.UK Emergency Alerts, GDACS, NASA FIRMS (fire detections), UK Health Security Agency and the World Health Organization.</p>' +
       '<div class="sheet-actions"><button class="btn primary block" type="submit">Save and check now</button></div></form>';
   }
 
@@ -1722,6 +1738,26 @@
         return openSheet({ type: 'warnset' });
       case 'warn-check':
         return checkWarnings(a);
+      case 'fire-ignore': {
+        var spot = [+a.dataset.lat, +a.dataset.lon];
+        if (!confirm('Ignore fires at this spot from now on?\n\nUse this for places like a refinery flare or a regular bonfire site. ' +
+          'You can undo it straight away, or later in the warnings settings.')) return;
+        return run(function () {
+          return api('POST', 'api/warnings/ignore-fire', { lat: spot[0], lon: spot[1] }).then(function () {
+            closeSheet();
+            return refresh().then(function () {
+              toast('You won\'t see fires at that spot again', { undo: { remove: spot }, undoPath: 'api/warnings/ignore-fire', ms: 8000 });
+            });
+          });
+        }, a);
+      }
+      case 'fire-unignore':
+        return run(function () {
+          return api('POST', 'api/warnings/ignore-fire', { clear: true }).then(function () {
+            closeSheet();
+            return refresh().then(function () { toast('Ignored fire spots will show again at the next check'); });
+          });
+        }, a);
       case 'plan-edit':
         return openSheet({ type: 'plan' });
       case 'print-plan':
@@ -1917,7 +1953,7 @@
     }
     if (f.id === 'warnForm') {
       var wbody = { on: f.elements.on.checked, region: d.region || '', lat: d.lat, lon: d.lon,
-        flood_km: num(d.flood_km), gdacs_km: num(d.gdacs_km), sources: {} };
+        flood_km: num(d.flood_km), gdacs_km: num(d.gdacs_km), fire_km: num(d.fire_km), sources: {} };
       W().source_list.forEach(function (s) { wbody.sources[s[0]] = f.elements['src_' + s[0]].checked; });
       if ((d.lat === '') !== (d.lon === '')) { toast('Give both a latitude and a longitude, or leave both empty', { error: true }); return; }
       return run(function () {

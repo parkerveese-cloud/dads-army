@@ -7,7 +7,7 @@ A stores tracker for food, water and emergency kit. It runs on a Raspberry Pi or
 - **Batches and rotation:** the same item can have several batches with different best-before dates and locations. Using stock always takes the oldest first.
 - **Daily use:** say how many tablets, nappies or toilet rolls you get through a day, and Dads Army shows how long each will last and what runs out first.
 - **Supply run:** an automatic shopping list of everything below target, plus your own extras. **Got it** puts the shopping straight into the stores. Set prices to see what it'll cost and what the stores are worth.
-- **Warnings (optional):** Met Office weather warnings, flood warnings near you, UK Emergency Alerts and major disasters near the UK, with optional UK Health Security Agency and WHO news. Each comes with what to do, and the parts of your emergency plan that matter.
+- **Warnings (optional):** Met Office weather warnings, flood warnings near you, UK Emergency Alerts and major disasters near the UK. Optionally, possible fires near you seen by NASA satellites, and UK Health Security Agency and WHO news. Each comes with what to do, and the parts of your emergency plan that matter.
 - **Plan:**
   - **Routine checks:** test the smoke alarms, charge the power banks, rotate the water. Dads Army tells you when each is due.
   - **Household emergency plan:** contacts, meeting places, how to turn off the water, gas and electricity, and medical needs. It's ready to print for the grab bag.
