@@ -47,7 +47,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -2390,8 +2390,15 @@ def ha_loop():
 
 
 def ha_mark_unavailable():
-    """On shutdown, show the sensors as unavailable rather than leaving old numbers up."""
+    """On shutdown, show the number sensors as unavailable rather than leaving old numbers up.
+
+    Sensors without a unit (needs attention, next to expire) are left as they are: Home
+    Assistant's Activity log records their every change, so marking them unavailable added
+    an "Unavailable" and a "Problem" line for every update and every nightly backup. The
+    number sensors becoming unavailable is enough to show that Dads Army has stopped."""
     for eid, body in list(HA_LAST.items()):
+        if "unit_of_measurement" not in body["attributes"]:
+            continue
         attrs = {k: v for k, v in body["attributes"].items() if k in
                  ("friendly_name", "icon", "unit_of_measurement", "state_class", "device_class")}
         try:
