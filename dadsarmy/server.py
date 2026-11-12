@@ -20,10 +20,13 @@ Running as a Home Assistant app, it also:
     running low, expired, expiring soon, checks due, daily supplies and more)
   - fires a dads_army_ran_out event when something runs out, and dads_army_warning
     for new Met Office, flood, Emergency Alert or GDACS warnings, for phone alerts
-  - can keep the supply run in step with a Home Assistant to-do list (HQ screen)
+  - can keep the supply run, and the routine checks that are due, in step with
+    Home Assistant to-do lists, and build a ready-made dashboard (HQ screen)
 GET /api/summary returns the same figures as JSON for anything else.
 """
+import base64
 import csv
+import hashlib
 import datetime as dt
 import html as htmllib
 import io
@@ -44,7 +47,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -1466,6 +1469,10 @@ TODO_LOCK = threading.Lock()
 TODO_STATUS = {"ok": None, "error": "", "synced_at": None, "name": ""}
 TODO_RE = re.compile(r"^todo\.[a-z0-9_]+$")
 TODO_LIST_NAME = "Supply run"
+CHECKS_LIST_NAME = "Dads Army checks"
+CHECKS_STATUS = {"ok": None, "error": "", "synced_at": None, "name": ""}
+HA_WS = os.environ.get("DADSARMY_HA_WS", "ws://supervisor/core/websocket")
+DASH_URL = "dads-army"
 
 
 class HAError(Exception):
@@ -1653,8 +1660,13 @@ def ha_status():
         entity = setting_raw("ha_todo_list", "") or ""
         ticked = [int(r["key"][2:]) for r in DB.execute(
             "SELECT key FROM ha_todo WHERE key LIKE 'i:%' AND uid != '' AND done = 1")] if entity else []
+        checks = setting_raw("ha_checks_list", "") or ""
+        dash = setting_raw("ha_dashboard", None)
     return {"todo": entity, "todo_name": TODO_STATUS["name"] or entity, "ok": TODO_STATUS["ok"],
-            "error": TODO_STATUS["error"], "synced_at": TODO_STATUS["synced_at"], "ticked": ticked}
+            "error": TODO_STATUS["error"], "synced_at": TODO_STATUS["synced_at"], "ticked": ticked,
+            "checks": checks, "checks_name": CHECKS_STATUS["name"] or checks, "checks_ok": CHECKS_STATUS["ok"],
+            "checks_error": CHECKS_STATUS["error"], "checks_synced_at": CHECKS_STATUS["synced_at"],
+            "dashboard": dash if isinstance(dash, dict) else None}
 
 
 def todo_sync(entity, s):
@@ -1888,7 +1900,7 @@ def ha_todo_lists():
 
 
 MAKE_LIST_HELP = ("Home Assistant didn't let Dads Army make the list. You can make it yourself: "
-                  "Settings > Devices & services > Add integration > Local To-do, call it Supply run, "
+                  "Settings > Devices & services > Add integration > Local To-do, call it %s, "
                   "then choose it here.")
 
 
@@ -1925,8 +1937,401 @@ def ha_make_list(name):
             time.sleep(0.5)
     except (HAError, OSError) as e:
         print("Home Assistant to-do list: couldn't make one (%s)" % e, flush=True)
-        raise ApiError(502, MAKE_LIST_HELP)
+        raise ApiError(502, MAKE_LIST_HELP % name)
     raise ApiError(502, "Home Assistant made the list, but it hasn't appeared yet. Try again in a minute.")
+
+
+# -- Today's checklist: routine checks <-> a Home Assistant to-do list -------------
+def checks_entity():
+    with LOCK:
+        return setting_raw("ha_checks_list", "") or ""
+
+
+def check_description(c):
+    return ("%s%s" % (every_words(c["every_days"]).capitalize(), (". " + c["notes"]) if c["notes"] else ""))[:500]
+
+
+def checks_sync(entity):
+    """Checks that are due (or never done) go on the list. Ticking one there marks it done here;
+    deleting one there leaves it off until it's next due. Anything else on the list is left alone.
+    Returns True if a check changed here."""
+    status, st = ha_request("GET", "/states/" + entity, timeout=8)
+    if status == 404:
+        raise HAError("the list %s isn't in Home Assistant any more" % entity)
+    if status != 200 or not isinstance(st, dict):
+        raise HAError("Home Assistant answered %s" % status)
+    CHECKS_STATUS["name"] = (st.get("attributes") or {}).get("friendly_name") or entity
+    items = todo_items(entity)
+    by_uid = {i["uid"]: i for i in items}
+    today = dt.date.today()
+    with LOCK:
+        checks = {c["id"]: c for c in all_checks()}
+        track = setting_raw("ha_checks_track", {}) or {}
+    due_now = {}
+    for cid, c in checks.items():
+        due, d, _ = check_status(c, today)
+        if d is None or d <= 0:
+            due_now[cid] = (c, due.isoformat() if due else "")
+    linked = [x for x in track.values() if isinstance(x, dict) and x.get("uid")]
+    if len(linked) > 3 and not any(x["uid"] in by_uid for x in linked):
+        print("Home Assistant checklist: %s looks new or emptied, so filling it again" % entity, flush=True)
+        track = {}
+
+    keep, claimed, updates, removes, ticked = {}, set(), [], [], []
+    for key, x in track.items():
+        if not isinstance(x, dict) or not key.isdigit():
+            continue
+        cid, uid = int(key), x.get("uid") or ""
+        want = due_now.get(cid)
+        it = by_uid.get(uid) if uid else None
+        if it is None:                       # deleted there (or dismissed before): off until it's next due
+            if want is not None and want[1] == x.get("due"):
+                keep[key] = {"uid": "", "summary": x.get("summary", ""), "due": x.get("due")}
+            continue
+        claimed.add(uid)
+        if it.get("status") == "completed":  # ticked off there
+            if want is not None:
+                ticked.append(cid)
+            removes.append(uid)
+            continue
+        if want is None:                     # done here, or the check's gone
+            removes.append(uid)
+            continue
+        c, due = want
+        if it.get("summary") != c["name"]:
+            updates.append({"item": uid, "rename": c["name"]})
+        if due != x.get("due") and due:
+            updates.append({"item": uid, "due_date": due})
+        keep[key] = {"uid": uid, "summary": c["name"], "due": due}
+
+    pool = [i for i in items if i["uid"] not in claimed and i.get("status") != "completed"]
+    adds = []
+    for cid, (c, due) in sorted(due_now.items(), key=lambda kv: (kv[1][1] or "0", kv[1][0]["name"].lower())):
+        key = str(cid)
+        if key in keep or cid in ticked:
+            continue
+        same = next((i for i in pool if (i.get("summary") or "") == c["name"]), None)
+        if same:                             # already there: take it over rather than add a second
+            pool.remove(same)
+            claimed.add(same["uid"])
+            keep[key] = {"uid": same["uid"], "summary": c["name"], "due": due}
+        else:
+            adds.append((key, c, due))
+
+    for u in updates:
+        try:
+            ha_service("todo", "update_item", dict(u, entity_id=entity))
+        except HAError:
+            if "rename" in u:
+                raise
+    if removes:
+        ha_service("todo", "remove_item", {"entity_id": entity, "item": removes})
+    for key, c, due in adds:
+        data = {"entity_id": entity, "item": c["name"], "description": check_description(c)}
+        if due:
+            data["due_date"] = due
+        try:
+            ha_service("todo", "add_item", data)
+        except HAError:   # an older Home Assistant, or a list that doesn't take dates
+            ha_service("todo", "add_item", {"entity_id": entity, "item": c["name"]})
+    if adds:
+        latest = todo_items(entity)
+        for key, c, due in adds:
+            for i in latest:
+                if i["uid"] not in claimed and i.get("summary") == c["name"]:
+                    claimed.add(i["uid"])
+                    keep[key] = {"uid": i["uid"], "summary": c["name"], "due": due}
+                    break
+
+    when = today.isoformat()
+    with tx() as db:
+        for cid in ticked:
+            c = checks[cid]
+            db.execute("UPDATE checks SET last_done = ? WHERE id = ?", (when, cid))
+            add_log("checked", c["name"], "Ticked off in Home Assistant · next due %s"
+                    % human_date(today + dt.timedelta(days=c["every_days"])))
+        set_setting_raw(db, "ha_checks_track", keep)
+    return bool(ticked)
+
+
+def checks_tick():
+    entity = checks_entity()
+    if not entity:
+        return
+    with TODO_LOCK:
+        if checks_entity() != entity:
+            return
+        try:
+            changed = checks_sync(entity)
+        except Exception as e:
+            if not isinstance(e, (HAError, OSError)):
+                traceback.print_exc()
+            if CHECKS_STATUS["ok"] is not False:
+                print("Home Assistant checklist: can't sync with %s yet (%s). Will keep trying." % (entity, e),
+                      flush=True)
+            CHECKS_STATUS.update(ok=False, error=str(e))
+            return
+        if CHECKS_STATUS["ok"] is False:
+            print("Home Assistant checklist: syncing again", flush=True)
+        CHECKS_STATUS.update(ok=True, error="", synced_at=now_iso())
+    if changed:
+        HA_WAKE.set()
+
+
+def checks_link(entity):
+    """Put the checks that are due on a different Home Assistant to-do list ('' to stop)."""
+    with TODO_LOCK:
+        with LOCK:
+            old = setting_raw("ha_checks_list", "") or ""
+            track = setting_raw("ha_checks_track", {}) or {}
+        if old == entity:
+            return
+        mine = set(x.get("uid") for x in track.values() if isinstance(x, dict) and x.get("uid"))
+        if old and mine:
+            try:
+                there = [i["uid"] for i in todo_items(old) if i["uid"] in mine]
+                if there:
+                    ha_service("todo", "remove_item", {"entity_id": old, "item": there})
+            except Exception as e:
+                print("Home Assistant checklist: couldn't tidy up %s (%s)" % (old, e), flush=True)
+        with tx() as db:
+            set_setting_raw(db, "ha_checks_track", {})
+            set_setting_raw(db, "ha_checks_list", entity)
+            add_log("settings", "", ("Checks due now go on Home Assistant's list (%s)" % entity) if entity
+                    else "Checks no longer go on a Home Assistant list")
+        CHECKS_STATUS.update(ok=None, error="", synced_at=None, name="")
+
+
+# -- Home Assistant's websocket API (dashboards can only be made through it) ---------
+class HAWebSocket(object):
+    """Just enough of a websocket client for a few commands, using the standard library."""
+
+    def __init__(self, url=None, token=None, timeout=20):
+        u = urlparse(url or HA_WS)
+        self.sock = socket.create_connection((u.hostname, u.port or 80), timeout=timeout)
+        self.buf, self.n = b"", 0
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                           "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                           % (u.path or "/", u.netloc, key)).encode())
+        while b"\r\n\r\n" not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise HAError("Home Assistant closed the connection")
+            self.buf += chunk
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        lines = head.decode("latin-1").split("\r\n")
+        if " 101 " not in lines[0] + " ":
+            raise HAError("Home Assistant's websocket answered %s" % lines[0][:60])
+        want = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        got = [ln.split(":", 1)[1].strip() for ln in lines[1:] if ln.lower().startswith("sec-websocket-accept:")]
+        if got != [want]:
+            raise HAError("Home Assistant's websocket handshake didn't check out")
+        if self.recv().get("type") != "auth_required":
+            raise HAError("Home Assistant didn't ask to log in")
+        self.send({"type": "auth", "access_token": token or HA_TOKEN})
+        if self.recv().get("type") != "auth_ok":
+            raise HAError("Home Assistant didn't accept Dads Army's login")
+
+    def _frame(self, op, data):
+        n, mask = len(data), os.urandom(4)
+        head = bytearray([0x80 | op])
+        if n < 126:
+            head.append(0x80 | n)
+        elif n < 65536:
+            head.append(0x80 | 126)
+            head += n.to_bytes(2, "big")
+        else:
+            head.append(0x80 | 127)
+            head += n.to_bytes(8, "big")
+        self.sock.sendall(bytes(head) + mask + bytes(b ^ mask[i & 3] for i, b in enumerate(data)))
+
+    def send(self, obj):
+        self._frame(0x1, json.dumps(obj).encode("utf-8"))
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise HAError("Home Assistant closed the connection")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def recv(self):
+        parts = []
+        while True:
+            b1, b2 = self._read(2)
+            op, n = b1 & 0x0F, b2 & 0x7F
+            if n == 126:
+                n = int.from_bytes(self._read(2), "big")
+            elif n == 127:
+                n = int.from_bytes(self._read(8), "big")
+            mask = self._read(4) if b2 & 0x80 else None
+            data = self._read(n)
+            if mask:
+                data = bytes(b ^ mask[i & 3] for i, b in enumerate(data))
+            if op == 0x9:
+                self._frame(0xA, data)
+                continue
+            if op == 0x8:
+                raise HAError("Home Assistant closed the connection")
+            if op == 0xA:
+                continue
+            parts.append(data)
+            if b1 & 0x80:
+                return json.loads(b"".join(parts).decode("utf-8"))
+
+    def command(self, msg):
+        self.n += 1
+        self.send(dict(msg, id=self.n))
+        while True:
+            res = self.recv()
+            if res.get("id") == self.n and res.get("type") == "result":
+                if not res.get("success"):
+                    err = res.get("error") or {}
+                    raise HAError(str(err.get("message") or err)[:200])
+                return res.get("result")
+
+    def close(self):
+        try:
+            self._frame(0x8, b"\x03\xe8")
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+# -- The Home front dashboard ---------------------------------------------------------
+def app_panel():
+    """The Dads Army panel in Home Assistant's sidebar: the container's hostname is the app's slug."""
+    host = socket.gethostname()
+    return "/" + host.replace("-", "_") if re.match(r"^[0-9a-f]{8}-dadsarmy$", host) else "/40ee45c0_dadsarmy"
+
+
+DASH_WARNINGS = """{% set w = state_attr('sensor.dads_army_warnings', 'items') or [] -%}
+{% if states('sensor.dads_army_warnings') in ['unknown', 'unavailable'] -%}
+Dads Army isn't sending updates. Check the app is running.
+{%- elif not state_attr('sensor.dads_army_warnings', 'enabled') -%}
+Warnings are switched off. Turn them on in Dads Army under **HQ → Warnings**.
+{%- elif w -%}
+{% for i in w[:6] %}
+- **{{ i.level }}** · {{ i.title }}{% if i.distance_km is defined %} · {{ i.distance_km }} km away{% endif %}
+{%- endfor %}
+{%- else -%}
+<ha-icon icon="mdi:check-circle"></ha-icon> No warnings for where you are.
+{%- endif %}"""
+
+DASH_CHECKS = """{% set c = state_attr('sensor.dads_army_checks_due', 'items') or [] -%}
+{% for i in c[:8] %}
+- **{{ i.name }}** · {{ i.text }}
+{%- endfor %}
+{%- if not c %}<ha-icon icon="mdi:check-circle"></ha-icon> Nothing due.{% endif %}"""
+
+DASH_USE_FIRST = """{% set rows = (state_attr('sensor.dads_army_expired', 'items') or [])
+   + (state_attr('sensor.dads_army_expiring_soon', 'items') or []) -%}
+{% for i in rows[:8] %}
+- **{{ i.name }}** · {{ i.text }}
+{%- endfor %}
+{%- if not rows %}<ha-icon icon="mdi:check-circle"></ha-icon> Nothing close to its best-before date.{% endif %}"""
+
+
+def dashboard_config():
+    """A sections dashboard made of Home Assistant's own cards: nothing extra to install."""
+    with LOCK:
+        checks = setting_raw("ha_checks_list", "") or ""
+        supply = setting_raw("ha_todo_list", "") or ""
+    full = {"grid_options": {"columns": "full"}}
+
+    def tile(entity, name, color=None, icon=None):
+        c = {"type": "tile", "entity": entity, "name": name}
+        if color:
+            c["color"] = color
+        if icon:
+            c["icon"] = icon
+        return c
+
+    def heading(text, icon):
+        return {"type": "heading", "heading": text, "icon": icon}
+
+    checklist = ([dict({"type": "todo-list", "entity": checks, "hide_completed": True}, **full)] if checks else
+                 [dict({"type": "markdown", "content": DASH_CHECKS}, **full)])
+    shopping = ([dict({"type": "todo-list", "entity": supply, "hide_completed": True}, **full)] if supply else [])
+    sections = [
+        {"type": "grid", "cards": [
+            heading("Warnings", "mdi:alert-octagon"),
+            dict(tile("sensor.dads_army_warnings", "Warnings in force", "red"), **full),
+            dict({"type": "markdown", "content": DASH_WARNINGS}, **full)]},
+        {"type": "grid", "cards": [
+            heading("Today's checklist", "mdi:clipboard-check-outline"),
+            dict(tile("sensor.dads_army_checks_due", "Checks due", "purple"), **full)] + checklist},
+        {"type": "grid", "cards": [
+            heading("Readiness", "mdi:shield-home"),
+            dict({"type": "gauge", "entity": "sensor.dads_army_readiness", "name": "Readiness", "min": 0, "max": 100,
+                  "needle": True, "severity": {"green": 100, "yellow": 50, "red": 0}}, **full),
+            tile("sensor.dads_army_hold_out", "Hold out", None, "mdi:shield-home"),
+            tile("sensor.dads_army_supplies", "Daily supplies"),
+            tile("sensor.dads_army_food_days", "Food"),
+            tile("sensor.dads_army_water_days", "Water")]},
+        {"type": "grid", "cards": [
+            heading("Stores", "mdi:package-variant"),
+            tile("sensor.dads_army_expired", "Expired", "red"),
+            tile("sensor.dads_army_expiring_soon", "Expiring soon", "amber"),
+            tile("sensor.dads_army_out_of_stock", "Out of stock", "deep-orange"),
+            tile("sensor.dads_army_low_stock", "Running low", "amber"),
+            tile("sensor.dads_army_kit_stocked", "Kit stocked"),
+            tile("sensor.dads_army_stores_value", "Stores worth"),
+            dict({"type": "markdown", "title": "Use first", "content": DASH_USE_FIRST}, **full)]},
+        {"type": "grid", "cards": [
+            heading("Supply run", "mdi:cart"),
+            dict(tile("sensor.dads_army_supply_run", "To get"), **full)] + shopping + [
+            dict({"type": "button", "name": "Open Dads Army", "icon": "mdi:open-in-app", "show_state": False,
+                  "tap_action": {"action": "navigate", "navigation_path": app_panel()}}, **full)]},
+        {"type": "grid", "cards": [
+            heading("Days you could last", "mdi:chart-line"),
+            dict({"type": "history-graph", "hours_to_show": 720, "entities": [
+                {"entity": "sensor.dads_army_food_days", "name": "Food"},
+                {"entity": "sensor.dads_army_water_days", "name": "Water"}]}, **full)]},
+    ]
+    return {"views": [{"title": "Home front", "path": "home-front", "type": "sections", "max_columns": 3,
+                       "badges": [{"type": "entity", "entity": "sensor.dads_army_readiness", "name": "Readiness",
+                                   "show_name": True},
+                                  {"type": "entity", "entity": "sensor.dads_army_hold_out", "name": "Hold out",
+                                   "show_name": True},
+                                  {"type": "entity", "entity": "binary_sensor.dads_army_attention",
+                                   "name": "Needs attention", "show_name": True}],
+                       "sections": sections}]}
+
+
+def ha_dashboard():
+    """Make (or bring up to date) the Home front dashboard in Home Assistant's sidebar."""
+    try:
+        ws = HAWebSocket()
+    except (HAError, OSError) as e:
+        raise ApiError(502, "Couldn't reach Home Assistant to make the dashboard (%s)" % e)
+    try:
+        boards = ws.command({"type": "lovelace/dashboards/list"}) or []
+        made = False
+        if not any(isinstance(b, dict) and b.get("url_path") == DASH_URL for b in boards):
+            ws.command({"type": "lovelace/dashboards/create", "url_path": DASH_URL, "title": "Home front",
+                        "icon": "mdi:shield-home", "show_in_sidebar": True, "require_admin": False,
+                        "mode": "storage"})
+            made = True
+        ws.command({"type": "lovelace/config/save", "url_path": DASH_URL, "config": dashboard_config()})
+    except HAError as e:
+        raise ApiError(502, "Home Assistant didn't let Dads Army make the dashboard (%s). You can paste the card "
+                            "from the app's Documentation tab into a dashboard instead." % e)
+    except OSError as e:
+        raise ApiError(502, "Lost touch with Home Assistant while making the dashboard (%s)" % e)
+    finally:
+        ws.close()
+    info = {"url": "/" + DASH_URL, "made_at": now_iso()}
+    with tx() as db:
+        set_setting_raw(db, "ha_dashboard", info)
+        add_log("settings", "", "Home front dashboard %s in Home Assistant" % ("made" if made else "brought up to date"))
+    return made
 
 
 # -- The background loop -------------------------------------------------------
@@ -1936,7 +2341,7 @@ def ha_loop():
     sent, failing, last_full, levels = {}, False, None, None
     HA_WAKE.set()  # first push straight away
     while True:
-        HA_WAKE.wait(15 if failing else 30 if todo_entity() else 60)
+        HA_WAKE.wait(15 if failing else 30 if (todo_entity() or checks_entity()) else 60)
         HA_WAKE.clear()
         time.sleep(1)  # let a burst of changes settle
         try:
@@ -1977,6 +2382,7 @@ def ha_loop():
             sent.clear()
         if not failing:
             todo_tick(s)
+            checks_tick()
 
 
 def ha_mark_unavailable():
@@ -2008,11 +2414,26 @@ def api_ha(body, query):
 
 @route("PUT", "/api/homeassistant")
 def api_ha_set(body, query):
+    """Link the supply run ("todo_list") and/or the checks that are due ("checks_list") to to-do lists."""
     need_ha()
-    entity = clean_text(body.get("todo_list"), 120)
-    if entity and not TODO_RE.match(entity):
-        raise ApiError(400, "That isn't a Home Assistant to-do list")
-    todo_link(entity)
+    want = {}
+    for key in ("todo_list", "checks_list"):
+        if key in body:
+            entity = clean_text(body.get(key), 120)
+            if entity and not TODO_RE.match(entity):
+                raise ApiError(400, "That isn't a Home Assistant to-do list")
+            want[key] = entity
+    if not want:
+        raise ApiError(400, "Nothing to change")
+    with LOCK:
+        supply = want.get("todo_list", setting_raw("ha_todo_list", "") or "")
+        checks = want.get("checks_list", setting_raw("ha_checks_list", "") or "")
+    if supply and supply == checks:
+        raise ApiError(400, "Use different lists for the supply run and the checks")
+    if "todo_list" in want:
+        todo_link(want["todo_list"])
+    if "checks_list" in want:
+        checks_link(want["checks_list"])
     return {"status": ha_status()}
 
 
@@ -2022,6 +2443,24 @@ def api_ha_make_list(body, query):
     entity = ha_make_list(TODO_LIST_NAME)
     todo_link(entity)
     return {"status": ha_status(), "entity_id": entity}
+
+
+@route("POST", "/api/homeassistant/checks-list")
+def api_ha_make_checks_list(body, query):
+    need_ha()
+    entity = ha_make_list(CHECKS_LIST_NAME)
+    if entity == todo_entity():
+        raise ApiError(400, "Use different lists for the supply run and the checks")
+    checks_link(entity)
+    HA_WAKE.set()
+    return {"status": ha_status(), "entity_id": entity}
+
+
+@route("POST", "/api/homeassistant/dashboard")
+def api_ha_dashboard(body, query):
+    need_ha()
+    made = ha_dashboard()
+    return {"status": ha_status(), "made": made, "url": "/" + DASH_URL}
 
 
 # --------------------------------------------------------------------------

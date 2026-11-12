@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.7.0
+
+- **Home front dashboard.** In **HQ → Home Assistant**, tap **Make the dashboard**. A new **Home front** dashboard appears in the Home Assistant sidebar and the Companion app, built from Home Assistant's own cards. It shows:
+  - warnings in force
+  - today's checklist
+  - the readiness gauge, hold-out, food, water and daily supplies
+  - the stores: expired, expiring soon, out of stock, running low, kit and value, plus what to use first
+  - the supply run, with a button to open Dads Army
+  - a graph of the days you could last
+- **Today's checklist.** Your routine checks can go on a Home Assistant to-do list. Checks that are due, overdue or not done yet appear with their due dates. Tick one off on the dashboard or in the Companion app and it's marked done in Dads Army, with the next one worked out.
+
 ## 1.6.1
 
 - **Possible fires nearby.** A new warnings source, off until you tick it in the warnings settings: hotspots NASA's satellites picked up in the last 24 hours within 10 km of home (you can change the distance).

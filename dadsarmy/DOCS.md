@@ -38,9 +38,34 @@ When a new warning comes in, Dads Army fires a `dads_army_warning` event. Its da
 
 When the last of something is used up, Dads Army also fires a `dads_army_ran_out` event. Its data has `message` (ready to send, such as "Baked beans has run out. It's on the supply run: get 6 tins."), `names`, `count` and `items`. The phone alerts below use it.
 
+## The Home front dashboard
+
+The quickest way to get Dads Army on your Home Assistant dashboards. In Dads Army, go to **HQ → Home Assistant** and tap **Make the dashboard**.
+
+A **Home front** dashboard appears in the Home Assistant sidebar and in the Companion app. It's built from Home Assistant's own cards, so there's nothing extra to install. It has:
+
+- **Warnings** in force for where you live
+- **Today's checklist:** the routine checks that are due, ready to tick off (see below)
+- **Readiness:** the gauge, plus how long you could hold out, food, water and daily supplies
+- **Stores:** expired, expiring soon, out of stock, running low, kit stocked, what the stores are worth, and what to use first
+- **Supply run**, with your supply run list if you've linked one, and a button that opens Dads Army
+- a graph of the days you could last, over the last month
+
+If you link a list afterwards, tap **Rebuild it** so the list shows on the dashboard. Rebuilding replaces any changes you've made to the dashboard. To customise it safely, copy cards from it into a dashboard of your own.
+
+## Today's checklist
+
+Dads Army can put your routine checks on a Home Assistant to-do list. In **HQ → Home Assistant**, tap **Make a "Dads Army checks" list**, or choose a list you already have.
+
+- Checks that are due, overdue or not done yet go on the list, with their due dates. Home Assistant shows overdue ones in red.
+- Tick one off on the dashboard or in the Companion app, and Dads Army marks it done and works out when it's next due.
+- Do a check in Dads Army instead, and it comes off the list.
+- Delete one from the list and it stays off until it's next due.
+- Anything else you put on the list is left alone.
+
 ## Dashboard card
 
-To add it:
+To add Dads Army to a dashboard of your own:
 
 1. Open a dashboard, click the pencil (**Edit dashboard**), then **Add card**.
 2. Scroll to the bottom and choose **Manual**.

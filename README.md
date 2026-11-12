@@ -47,7 +47,9 @@ You can then open it in two ways:
   - what the stores are worth
   - warnings in force
 
-  You can use them on dashboards, in automations and in Companion app widgets. A ready-made dashboard card is on the app's **Documentation** tab.
+  You can use them on dashboards, in automations and in Companion app widgets.
+- **Home front dashboard.** One tap in **HQ → Home Assistant** adds a ready-made dashboard to the Home Assistant sidebar, made of tiles. It covers warnings, today's checklist, readiness, the stores and the supply run. A card for your own dashboards is on the app's **Documentation** tab.
+- **Today's checklist.** Routine checks that are due go on a Home Assistant to-do list. Tick them off there and Dads Army marks them done.
 - **Phone alerts.** Two blueprints in [blueprints/automation](blueprints/automation) send notifications to your phone:
   - new warnings for where you live
   - when something runs out

@@ -1183,11 +1183,14 @@
   function haCard() {
     var ha = S.server.ha;
     if (!ha) return '';
-    var html = '<section class="card"><div class="card-head"><h2>Home Assistant</h2></div>';
+    var html = '<section class="card"><div class="card-head"><h2>Home Assistant</h2></div>' +
+      '<h3 class="plan-h">Dashboard</h3>' + dashPart(ha) +
+      '<h3 class="plan-h">Today\'s checklist</h3>' + checksPart(ha) +
+      '<h3 class="plan-h">Supply run list</h3>';
     if (!ha.todo) {
       html += '<p class="small muted">Put the supply run on a Home Assistant to-do list. Tick things off there, and add to it from anywhere, ' +
         'including by voice: <i>“Add matches to the supply run list”</i>.</p>' +
-        '<div class="btn-stack"><button class="btn primary block" data-act="ha-make">' + ICON.list + ' Make a “Supply run” list</button>' +
+        '<div class="btn-stack"><button class="btn block" data-act="ha-make">' + ICON.list + ' Make a “Supply run” list</button>' +
         '<button class="btn block" data-act="ha-pick">Use a list I already have…</button></div>';
     } else {
       var state = ha.ok === false ? pill('bad', 'Not syncing') : ha.ok ? pill('good', 'In step') : pill('warn', 'Starting');
@@ -1198,7 +1201,36 @@
         'Tick off a below-target item there and it\'s marked here, ready to put away with <b>Got it</b>.</p>' +
         '<div class="btn-row"><button class="btn" data-act="ha-pick">Change list</button><button class="btn" data-act="ha-stop">Stop syncing</button></div>';
     }
-    return html + '<p class="small muted" style="margin:12px 0 0">For dashboard cards and phone alerts, open the app\'s <b>Documentation</b> tab in Home Assistant.</p></section>';
+    return html + '<p class="small muted" style="margin:12px 0 0">For phone alerts and cards for your own dashboards, open the app\'s <b>Documentation</b> tab in Home Assistant.</p></section>';
+  }
+  function inHomeAssistant() {
+    try { return window.top !== window.self; } catch (e) { return true; }
+  }
+  function dashPart(ha) {
+    var d = ha.dashboard;
+    if (!d) {
+      return '<p class="small muted">Add a <b>Home front</b> dashboard to the Home Assistant sidebar, made of tiles: warnings, today\'s checklist, ' +
+        'readiness, what to use first, the stores and the supply run. It also works in the Companion app.</p>' +
+        '<button class="btn primary block" data-act="ha-dash">Make the dashboard</button>';
+    }
+    return '<p class="small muted">The <b>Home front</b> dashboard is in the Home Assistant sidebar (made ' + esc(ago(d.made_at)) + '). ' +
+      'Rebuild it after linking a list below, so the list shows on it.</p>' +
+      '<div class="btn-row">' + (inHomeAssistant() ? '<a class="btn" href="' + esc(d.url) + '" target="_top">Open it</a>' : '') +
+      '<button class="btn" data-act="ha-dash" data-again="1">Rebuild it</button></div>';
+  }
+  function checksPart(ha) {
+    if (!ha.checks) {
+      return '<p class="small muted">Put the checks that are due on a Home Assistant to-do list. Tick one off on the dashboard or in the Companion app ' +
+        'and it\'s marked done here, with the next one worked out.</p>' +
+        '<div class="btn-stack"><button class="btn block" data-act="ha-checks-make">' + ICON.list + ' Make a “Dads Army checks” list</button>' +
+        '<button class="btn block" data-act="ha-pick" data-target="checks">Use a list I already have…</button></div>';
+    }
+    var state = ha.checks_ok === false ? pill('bad', 'Not syncing') : ha.checks_ok ? pill('good', 'In step') : pill('warn', 'Starting');
+    return '<div class="ha-link"><div class="li-main"><span class="li-title">' + esc(ha.checks_name) + '</span>' +
+      '<span class="small muted">' + esc(ha.checks) + (ha.checks_synced_at ? ' · checked ' + esc(ago(ha.checks_synced_at)) : '') + '</span></div>' + state + '</div>' +
+      (ha.checks_ok === false && ha.checks_error ? '<p class="small ha-error">' + esc(ha.checks_error) + '</p>' : '') +
+      '<p class="small muted">Checks that are due, or not done yet, are on that list with their due dates. Tick one off there and it\'s marked done here.</p>' +
+      '<div class="btn-row"><button class="btn" data-act="ha-pick" data-target="checks">Change list</button><button class="btn" data-act="ha-checks-stop">Stop</button></div>';
   }
 
   function queueSetting(key, value) {
@@ -1491,16 +1523,19 @@
   }
 
   function sheetHaLists(s) {
-    var d = s.data, body;
-    var current = S.server.ha ? S.server.ha.todo : '';
+    var d = s.data, body, checks = s.target === 'checks';
+    var ha = S.server.ha || {};
+    var current = checks ? ha.checks : ha.todo, other = checks ? ha.todo : ha.checks;
     if (!d) body = '<p class="small muted">Asking Home Assistant…</p>';
     else if (d.error) body = '<p class="small ha-error">' + esc(d.error) + '</p>';
-    else if (!d.lists.length) body = '<p class="small muted">Home Assistant hasn\'t got any to-do lists yet. Close this and use <b>Make a “Supply run” list</b> instead.</p>';
+    else if (!d.lists.length) body = '<p class="small muted">Home Assistant hasn\'t got any to-do lists yet. Close this and use <b>Make a “' + (checks ? 'Dads Army checks' : 'Supply run') + '” list</b> instead.</p>';
     else {
-      body = '<p class="small muted">Best to pick a list just for Dads Army. Whatever is on it now is left alone. Anything added to it later goes on the supply run.</p><div class="list">' +
-        d.lists.map(function (l) {
+      body = '<p class="small muted">' + (checks
+        ? 'Best to pick a list just for the checks. Whatever is on it now is left alone.'
+        : 'Best to pick a list just for Dads Army. Whatever is on it now is left alone. Anything added to it later goes on the supply run.') + '</p><div class="list">' +
+        d.lists.filter(function (l) { return l.entity_id !== other; }).map(function (l) {
           var on = l.entity_id === current;
-          return '<div class="li"><button class="li-main" data-act="ha-use" data-entity="' + esc(l.entity_id) + '" data-name="' + esc(l.name) + '">' +
+          return '<div class="li"><button class="li-main" data-act="ha-use" data-target="' + (checks ? 'checks' : 'supply') + '" data-entity="' + esc(l.entity_id) + '" data-name="' + esc(l.name) + '">' +
             '<span class="li-title">' + esc(l.name) + '</span><span class="small muted">' + esc(l.entity_id) + '</span></button>' +
             (on ? '<span class="badge ok">' + ICON.check + ' In use</span>' : '') + '</div>';
         }).join('') + '</div>';
@@ -1839,20 +1874,44 @@
             toast('The supply run is now on your Home Assistant list “' + S.server.ha.todo_name + '”');
           });
         }, a);
+      case 'ha-checks-make':
+        return run(function () {
+          toast('Making the list in Home Assistant…');
+          return api('POST', 'api/homeassistant/checks-list', {}).then(refresh).then(function () {
+            toast('Checks that are due now go on “' + S.server.ha.checks_name + '”' + (S.server.ha.dashboard ? '. Rebuild the dashboard to show it there.' : ''));
+          });
+        }, a);
+      case 'ha-checks-stop':
+        if (!confirm('Stop putting the checks on “' + S.server.ha.checks_name + '”?\n\nDads Army takes its checks off that list. Anything else on it stays.')) return;
+        return run(function () {
+          return api('PUT', 'api/homeassistant', { checks_list: '' }).then(refresh).then(function () { toast('Stopped'); });
+        }, a);
+      case 'ha-dash':
+        if (a.dataset.again && !confirm('Rebuild the Home front dashboard?\n\nAny changes you\'ve made to it in Home Assistant are replaced.')) return;
+        return run(function () {
+          toast('Making the dashboard in Home Assistant…', { ms: 20000 });
+          return api('POST', 'api/homeassistant/dashboard', {}).then(function (res) {
+            return refresh().then(function () {
+              toast(res.made ? 'Done: Home front is in the Home Assistant sidebar' : 'The Home front dashboard is up to date');
+            });
+          });
+        }, a);
       case 'ha-pick': {
-        var sh = { type: 'halists', data: null };
+        var sh = { type: 'halists', data: null, target: a.dataset.target || 'supply' };
         openSheet(sh);
         return api('GET', 'api/homeassistant').then(function (d) { sh.data = d; }, function (e) {
           sh.data = { error: e.message, lists: [] };
         }).then(function () { if (stack[stack.length - 1] === sh) renderSheet(); });
       }
       case 'ha-use': {
-        var name = a.dataset.name;
-        if (S.server.ha && S.server.ha.todo === a.dataset.entity) return closeSheet();
+        var name = a.dataset.name, forChecks = a.dataset.target === 'checks';
+        if (S.server.ha && S.server.ha[forChecks ? 'checks' : 'todo'] === a.dataset.entity) return closeSheet();
         return run(function () {
-          return api('PUT', 'api/homeassistant', { todo_list: a.dataset.entity }).then(function () {
+          return api('PUT', 'api/homeassistant', forChecks ? { checks_list: a.dataset.entity } : { todo_list: a.dataset.entity }).then(function () {
             closeSheet();
-            return refresh().then(function () { toast('The supply run is now on “' + name + '”'); });
+            return refresh().then(function () {
+              toast(forChecks ? 'Checks that are due now go on “' + name + '”' : 'The supply run is now on “' + name + '”');
+            });
           });
         }, a);
       }
