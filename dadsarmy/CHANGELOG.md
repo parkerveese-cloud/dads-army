@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.8.0
+
+- **Household alert level.** A five-step scale for the household, from LOW (green) through MODERATE, SUBSTANTIAL and SEVERE to CRITICAL (black). It uses the names of the UK's national threat levels, the British equivalent of DEFCON, but it's the household's own level, not the official one.
+  - It shows big at the top of the Sitrep, with the full scale and why it's at that level.
+  - Tap **i** for what each level means, how it's worked out, and where the advice comes from.
+  - It's worked out from warnings in force, your stores, and your home's own sensors. Stores too low to last 3 days make a SUBSTANTIAL situation SEVERE.
+- **What to do now.** Every level comes with plain advice for the situation, worst problem first. Each piece is labelled with its source: **UK Government** (Prepare, the NHS, UKHSA, the Met Office, the Environment Agency and others), the **SAS Survival Handbook**'s PLAN priorities applied to a household, fire and rescue services, or the 105 power cut line.
+- **Home sensors.** Dads Army can watch your Home Assistant sensors for:
+  - indoor and outdoor temperature
+  - humidity
+  - mains power or UPS, and a backup battery
+  - gas, carbon monoxide and smoke alarms
+  - water leaks
+  - the internet
+  - outdoor air quality
+
+  For example, a cold bedroom, a power cut, a leak or a carbon monoxide alarm raises the level and brings the right advice. **Suggest sensors for me** picks likely ones.
+- **Home front dashboard.** The alert level now leads the dashboard, big and colour-coded with the full scale. Underneath are the reasons and labelled advice, and a **What the levels mean** page. Dads Army offers to update a dashboard you've already made.
+- **Home Assistant.**
+  - New `sensor.dads_army_alert_level`, and a `dads_army_alert_level` event when the level changes.
+  - The phone alerts blueprint tells you when it goes up (to SUBSTANTIAL or higher unless you choose otherwise).
+  - The weekly round-up starts with the level.
+  - Re-import both blueprints.
+
 ## 1.7.2
 
 - **A quieter Activity log in Home Assistant.** **Dads Army needs attention** no longer turns "Unavailable" and back again every time Dads Army restarts, which happens for each update and for Home Assistant's nightly backup. That added two lines to the Activity log each time. The number sensors still show "Unavailable" while Dads Army is stopped, so dashboards can still tell.

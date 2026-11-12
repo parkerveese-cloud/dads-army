@@ -18,6 +18,8 @@ Environment variables (all optional):
 Running as a Home Assistant app, it also:
   - publishes sensor.dads_army_* entities (readiness, hold-out days, out of stock,
     running low, expired, expiring soon, checks due, daily supplies and more)
+  - works out a household alert level (LOW to CRITICAL) from warnings, the stores and
+    the home's own sensors, with guidance, as sensor.dads_army_alert_level
   - fires a dads_army_ran_out event when something runs out, and dads_army_warning
     for new Met Office, flood, Emergency Alert or GDACS warnings, for phone alerts
   - can keep the supply run, and the routine checks that are due, in step with
@@ -47,7 +49,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.7.2"
+VERSION = "1.8.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -699,7 +701,7 @@ def summary():
 
     sup = ordered(supplies)
     target_days = st["target_days"]
-    return {
+    out = {
         "version": VERSION,
         "date": today.isoformat(),
         "people": people,
@@ -712,6 +714,7 @@ def summary():
         "water_days": _days(water_days),
         "runs_out_first": "food" if food_days < water_days else "water" if water_days < food_days else "",
         "kit_stocked_pct": _round(100.0 * kit_sum / kit_n) if kit_n else 0,
+        "kit_items": kit_n,
         "items_total": len(items),
         "out_of_stock": ordered(out),
         "low_stock": ordered(low),
@@ -736,6 +739,8 @@ def summary():
         # Warnings from the Met Office, floods, Emergency Alerts and GDACS (if switched on)
         "warnings": warnings,
     }
+    out["situation"] = assess(out, home_snapshot())
+    return out
 
 
 def get_item(db, item_id):
@@ -778,8 +783,14 @@ def api_health(body, query):
 
 @route("GET", "/api/state")
 def api_state(body, query):
+    situation = summary()["situation"]
+    home = home_snapshot() if HA_TOKEN else None
     with LOCK:
+        if home is not None:
+            home["config"] = home_cfg()
         return {
+            "situation": situation,
+            "home": home,
             "items": all_items(),
             "shopping": [dict(r) for r in DB.execute("SELECT * FROM shopping ORDER BY done, id")],
             "checks": all_checks(),
@@ -1473,6 +1484,7 @@ CHECKS_LIST_NAME = "Dads Army checks"
 CHECKS_STATUS = {"ok": None, "error": "", "synced_at": None, "name": ""}
 HA_WS = os.environ.get("DADSARMY_HA_WS", "ws://supervisor/core/websocket")
 DASH_URL = "dads-army"
+DASH_LAYOUT = 2   # bump when the dashboard changes, so the app offers to rebuild it
 
 
 class HAError(Exception):
@@ -1574,6 +1586,14 @@ def ha_entities(s):
         "mdi:alert-octagon" if w["serious"] else "mdi:alert-outline" if w["count"] else "mdi:shield-check-outline",
         "warnings", dict(_ha_list(w["items"]), highest=w["highest"], max_severity=w["max_severity"],
                          enabled=w["enabled"], checked_at=w["checked_at"], health_news=w["news"]))
+    sit = s["situation"]
+    put("sensor.dads_army_alert_level", sit["name"], "Dads Army alert level", LEVEL_ICONS[sit["level"] - 1],
+        attrs={"level": sit["level"], "colour": sit["colour"], "emoji": sit["emoji"], "meaning": sit["meaning"],
+               "escalated": sit["escalated"], "reasons": sit["reasons"][:LIST_LIMIT], "notes": sit["notes"],
+               "guidance": [{"label": g["label"], "source": g["source"], "text": g["text"]} for g in sit["guidance"]],
+               "scale": [{"level": x["level"], "name": x["name"], "emoji": x["emoji"], "meaning": x["meaning"]}
+                         for x in sit["scale"]]},
+        measurement=False)
     # Only what needs doing now. Things not bought yet are the supply run's job (they'd keep
     # this on for weeks while the stores are built up), and a check that's never been done
     # isn't overdue.
@@ -1671,7 +1691,8 @@ def ha_status():
             "error": TODO_STATUS["error"], "synced_at": TODO_STATUS["synced_at"], "ticked": ticked,
             "checks": checks, "checks_name": CHECKS_STATUS["name"] or checks, "checks_ok": CHECKS_STATUS["ok"],
             "checks_error": CHECKS_STATUS["error"], "checks_synced_at": CHECKS_STATUS["synced_at"],
-            "dashboard": dash if isinstance(dash, dict) else None, "dash_prompt": offer}
+            "dashboard": dash if isinstance(dash, dict) else None, "dash_prompt": offer,
+            "dash_outdated": isinstance(dash, dict) and int(dash.get("layout") or 1) < DASH_LAYOUT}
 
 
 def todo_sync(entity, s):
@@ -2229,6 +2250,77 @@ Warnings are switched off. Turn them on in Dads Army under **HQ → Warnings**.
 <ha-icon icon="mdi:check-circle"></ha-icon> No warnings for where you are.
 {%- endif %}"""
 
+DASH_LEVEL = """{% set lv = state_attr('sensor.dads_army_alert_level', 'level') | int(0) -%}
+{% set scale = state_attr('sensor.dads_army_alert_level', 'scale') or [] -%}
+{% if lv == 0 or not scale -%}
+Dads Army isn't sending updates. Check the app is running.
+{%- else -%}
+{% set me = scale[lv - 1] -%}
+# {{ me.emoji }} {{ me.name }}
+<ha-alert alert-type="{{ ['success', 'warning', 'warning', 'error', 'error'][lv - 1] }}">{{ me.meaning }}</ha-alert>
+
+| | Household alert level | |
+|:-:|:--|:--|
+{% for s in scale | reverse -%}
+| {{ s.emoji }} | {% if s.level == lv %}**{{ s.name }}**{% else %}{{ s.name }}{% endif %} | {% if s.level == lv %}**◀ you are here**{% endif %} |
+{% endfor %}
+{%- endif %}"""
+
+DASH_WHY = """{% set r = state_attr('sensor.dads_army_alert_level', 'reasons') or [] -%}
+{% set g = state_attr('sensor.dads_army_alert_level', 'guidance') or [] -%}
+{% if r -%}
+#### Why
+{% for i in r[:6] %}
+- {{ i.title }} ({{ i.name | lower }})
+{%- endfor %}
+{%- if state_attr('sensor.dads_army_alert_level', 'escalated') %}
+- Raised to SEVERE because the stores wouldn't last 3 days
+{%- endif %}
+{% endif %}
+#### What to do now
+{% for i in g[:8] %}
+- **{{ i.label }}:** {{ i.text }}
+{%- endfor %}"""
+
+DASH_LEVELS_PAGE = """## What the household alert levels mean
+
+Dads Army works out a household alert level from the warnings in force where you live, your home's own sensors, and how long your stores would last. It's the household's own level, not the official UK threat level: it borrows the names of the UK's five national threat levels, which are the UK's nearest equivalent to America's DEFCON.
+
+| | Level | What it means for the household |
+|:-:|:--|:--|
+| 🟩 | **LOW** | Nothing is threatening the household and the stores would last at least 3 days. Carry on as normal. |
+| 🟨 | **MODERATE** | Something to keep an eye on: a yellow warning, a minor problem at home, or stores that wouldn't last 3 days. Stay aware. |
+| 🟧 | **SUBSTANTIAL** | Disruption is likely: an amber warning, a power cut, a leak, or a cold or hot home. Get ready. |
+| 🟥 | **SEVERE** | Disruption is highly likely or under way: a red warning, a flood warning, a long power cut, or a dangerously cold or hot home. Act now. |
+| ⬛ | **CRITICAL** | Danger to life, now or very soon: an Emergency Alert, a severe flood warning, or a gas, carbon monoxide or smoke alarm. Follow the emergency services' instructions. |
+
+### How Dads Army decides
+
+The level is the most serious of these. If it's SUBSTANTIAL and your food or water wouldn't last 3 days, it goes up to SEVERE, because you'd be less able to cope. Only real danger makes it CRITICAL.
+
+| Level | Warnings | At home (your sensors) | Stores |
+|:--|:--|:--|:--|
+| CRITICAL | Emergency Alert; severe flood warning | Gas, carbon monoxide or smoke alarm | |
+| SEVERE | Red weather warning; flood warning | Power cut over 12 hours, or with the backup battery under 20%; coldest room under 9°C; warmest room 33°C or more; PM2.5 75 µg/m³ or more | |
+| SUBSTANTIAL | Amber weather warning; a possible fire within 3 km | Power cut; water leak; coldest room under 12°C; warmest room 30°C or more; −10°C or colder, or 35°C or hotter, outside; PM2.5 55 or more | |
+| MODERATE | Yellow weather warning; flood alert; a disaster near the UK; a possible fire nearby | Coldest room under 16°C; warmest room 27°C or more; −5°C or colder, or 30°C or hotter, outside; humidity 80% or more; internet down; PM2.5 35 or more | Food or water for under 3 days; kit under half stocked |
+| LOW | None of the above | | |
+
+UKHSA advises heating the rooms you use to at least 18°C. Below that, Dads Army adds cold-weather advice even at LOW.
+
+### The UK's own levels
+
+The national threat level, set by MI5's Joint Terrorism Analysis Centre, uses the same five names: LOW (an attack is highly unlikely), MODERATE (possible, but not likely), SUBSTANTIAL (likely), SEVERE (highly likely) and CRITICAL (highly likely in the near future). You can check the current national level on MI5's website. Dads Army doesn't read it.
+
+### Where the advice comes from
+
+- **UK Government:** advice from Prepare (gov.uk), the NHS, UKHSA, the Met Office, the Environment Agency, DEFRA, Ofgem, the Foreign Office and the Fire Kills campaign. It's put into plain statements, not quoted word for word.
+- **SAS Survival Handbook:** John "Lofty" Wiseman's PLAN priorities (Protection, Location, Acquisition, Navigation), applied to a household. These are paraphrased, not quoted.
+- **Fire & rescue services** and **Electricity networks (105):** their standard public advice.
+- **Dads Army tip:** practical hints from the app itself.
+
+Always follow official advice and the emergency services. In an emergency, call 999."""
+
 DASH_CHECKS = """{% set c = state_attr('sensor.dads_army_checks_due', 'items') or [] -%}
 {% for i in c[:8] %}
 - **{{ i.name }}** · {{ i.text }}
@@ -2265,6 +2357,13 @@ def dashboard_config():
                  [dict({"type": "markdown", "content": DASH_CHECKS}, **full)])
     shopping = ([dict({"type": "todo-list", "entity": supply, "hide_completed": True}, **full)] if supply else [])
     sections = [
+        {"type": "grid", "column_span": 2, "cards": [
+            heading("Household alert level", "mdi:shield-home"),
+            dict({"type": "markdown", "content": DASH_LEVEL}, **full),
+            dict({"type": "markdown", "content": DASH_WHY}, **full),
+            dict({"type": "button", "name": "What the levels mean", "icon": "mdi:information-outline",
+                  "show_state": False, "tap_action": {"action": "navigate",
+                                                      "navigation_path": "/%s/alert-levels" % DASH_URL}}, **full)]},
         {"type": "grid", "cards": [
             heading("Warnings", "mdi:alert-octagon"),
             dict(tile("sensor.dads_army_warnings", "Warnings in force", "red"), **full),
@@ -2301,13 +2400,18 @@ def dashboard_config():
                 {"entity": "sensor.dads_army_water_days", "name": "Water"}]}, **full)]},
     ]
     return {"views": [{"title": "Home front", "path": "home-front", "type": "sections", "max_columns": 3,
-                       "badges": [{"type": "entity", "entity": "sensor.dads_army_readiness", "name": "Readiness",
+                       "badges": [{"type": "entity", "entity": "sensor.dads_army_alert_level", "name": "Alert level",
+                                   "show_name": True},
+                                  {"type": "entity", "entity": "sensor.dads_army_readiness", "name": "Readiness",
                                    "show_name": True},
                                   {"type": "entity", "entity": "sensor.dads_army_hold_out", "name": "Hold out",
                                    "show_name": True},
                                   {"type": "entity", "entity": "binary_sensor.dads_army_attention",
                                    "name": "Needs attention", "show_name": True}],
-                       "sections": sections}]}
+                       "sections": sections},
+                      {"title": "Alert levels", "path": "alert-levels", "subview": True, "type": "panel",
+                       "back_path": "/%s/home-front" % DASH_URL,
+                       "cards": [{"type": "markdown", "content": DASH_LEVELS_PAGE}]}]}
 
 
 def ha_dashboard():
@@ -2332,11 +2436,34 @@ def ha_dashboard():
         raise ApiError(502, "Lost touch with Home Assistant while making the dashboard (%s)" % e)
     finally:
         ws.close()
-    info = {"url": "/" + DASH_URL, "made_at": now_iso()}
+    info = {"url": "/" + DASH_URL, "made_at": now_iso(), "layout": DASH_LAYOUT}
     with tx() as db:
         set_setting_raw(db, "ha_dashboard", info)
         add_log("settings", "", "Home front dashboard %s in Home Assistant" % ("made" if made else "brought up to date"))
     return made
+
+
+def level_change(sit):
+    """Fire dads_army_alert_level when the household alert level moves (not when Dads Army restarts)."""
+    with LOCK:
+        last = setting_raw("alert_level_last", None)
+    if last == sit["level"]:
+        return
+    if isinstance(last, int):
+        prev = LEVELS[last - 1][0]
+        rising = sit["level"] > last
+        why = sit["reasons"][0]["title"] if sit["reasons"] else ""
+        todo = sit["guidance"][0] if sit["guidance"] else None
+        msg = "Household alert level %s %s (was %s)." % ("up to" if rising else "down to", sit["name"], prev)
+        if why:
+            msg += " " + why + "."
+        if todo and rising:
+            msg += " %s: %s" % (todo["label"], todo["text"])
+        ha_call("POST", "/events/dads_army_alert_level", {
+            "level": sit["level"], "name": sit["name"], "previous": last, "previous_name": prev, "rising": rising,
+            "message": msg, "reasons": [r["title"] for r in sit["reasons"][:6]], "meaning": sit["meaning"]})
+    with tx() as db:
+        set_setting_raw(db, "alert_level_last", sit["level"])
 
 
 # -- The background loop -------------------------------------------------------
@@ -2377,6 +2504,7 @@ def ha_loop():
                     HA_LAST[eid] = body
             if full:
                 last_full = time.monotonic()
+            level_change(s["situation"])
             if failing:
                 print("Home Assistant sensors: connected again", flush=True)
             failing = False
@@ -3196,6 +3324,572 @@ def api_warnings_check(body, query):
         return {"warnings": warn_public()}
 
 
+
+# --------------------------------------------------------------------------
+# Household alert level: warnings + home sensors + stores -> LOW .. CRITICAL
+# --------------------------------------------------------------------------
+# The names are the UK's own threat levels (set by MI5's Joint Terrorism Analysis
+# Centre), the nearest British thing to America's DEFCON. Dads Army borrows the names
+# and their idea, "how likely is it", for one household. It is not the official level.
+LEVELS = [
+    # name, colour, emoji for Home Assistant's text cards, what it means here, MI5's meaning
+    ("LOW", "#2e7d32", "🟩", "Nothing is threatening the household and the stores would last at least 3 days. "
+     "Carry on as normal.", "an attack is highly unlikely"),
+    ("MODERATE", "#f9a825", "🟨", "Something to keep an eye on: a yellow warning, a minor problem at home, or "
+     "stores that wouldn't last 3 days. Stay aware.", "an attack is possible, but not likely"),
+    ("SUBSTANTIAL", "#ef6c00", "🟧", "Disruption is likely: an amber warning, a power cut, a leak, or a cold or "
+     "hot home. Get ready.", "an attack is likely"),
+    ("SEVERE", "#c62828", "🟥", "Disruption is highly likely or under way: a red warning, a flood warning, a long "
+     "power cut, or a dangerously cold or hot home. Act now.", "an attack is highly likely"),
+    ("CRITICAL", "#212121", "⬛", "Danger to life, now or very soon: an Emergency Alert, a severe flood warning, or "
+     "a gas, carbon monoxide or smoke alarm. Follow the emergency services' instructions.",
+     "an attack is highly likely in the near future"),
+]
+LEVEL_ICONS = ["mdi:shield-check", "mdi:shield-alert-outline", "mdi:shield-alert", "mdi:alert-octagon",
+               "mdi:alarm-light"]
+
+GOV, SAS, FIRE, TIP, NETWORKS = ("UK Government", "SAS Survival Handbook", "Fire & rescue services", "Dads Army tip",
+                                 "Electricity networks")
+
+
+def say(source, body, text):
+    return {"source": source, "body": body, "text": text}
+
+
+# What to do. UK Government advice is paraphrased from the body named; SAS statements apply
+# the SAS Survival Handbook's PLAN priorities (Protection, Location, Acquisition, Navigation)
+# to a household. Neither is quoted word for word.
+GUIDE = {
+    "level1": [
+        say(GOV, "Prepare", "Keep an emergency kit at home and build it up over time: water, food, a torch, a battery "
+                            "or wind-up radio, spare batteries and a first aid kit."),
+        say(SAS, "PLAN", "Work through PLAN before you need it: how you'd protect the household, how people would know "
+                         "where you are, how you'd get water and food, and where you'd go."),
+    ],
+    "level2": [
+        say(GOV, "Prepare", "Keep up with the forecast and local news, and keep phones and power banks charged."),
+        say(SAS, "PLAN: Protection", "Protection comes first: think through what would keep everyone warm, dry and "
+                                     "safe if things got worse."),
+    ],
+    "level3": [
+        say(GOV, "Prepare", "Have enough drinking water for at least 3 days: 3 litres per person per day."),
+        say(GOV, "Prepare", "Check on neighbours and relatives who may need help, especially older people."),
+        say(SAS, "PLAN: Location", "Let people know your situation: tell your out-of-area contact what's happening and "
+                                   "where you are."),
+        say(SAS, "PLAN: Acquisition", "Get water and food in hand while you still can, and use what spoils first."),
+    ],
+    "level4": [
+        say(GOV, "Emergency services", "Follow official advice and the emergency services. Call 999 if a life is at "
+                                       "risk."),
+        say(SAS, "PLAN: Protection", "Protect the household first: keep everyone together, warm or cool, and away "
+                                     "from danger."),
+        say(SAS, "PLAN: Navigation", "Know where you'd go if you have to leave, and how you'd get there: your meeting "
+                                     "place and the route."),
+    ],
+    "level5": [
+        say(GOV, "Emergency services", "Do what the emergency services or the Emergency Alert tell you. Call 999 if a "
+                                       "life is at risk."),
+        say(SAS, "PLAN: Protection", "Protection first: get everyone away from the danger before anything else."),
+    ],
+    "emergency_alert": [
+        say(GOV, "Emergency Alerts", "Read the Emergency Alert and follow its instructions straight away. They're only "
+                                     "sent when there's a danger to life nearby."),
+    ],
+    "severe_flood": [
+        say(GOV, "Environment Agency", "A severe flood warning means danger to life. Follow the emergency services' "
+                                       "instructions and be ready to leave."),
+        say(GOV, "Environment Agency", "If it's safe, turn off the gas, electricity and water, and move people and pets "
+                                       "upstairs."),
+    ],
+    "flood_warning": [
+        say(GOV, "Environment Agency", "A flood warning means flooding is expected and you should act now: move "
+                                       "valuables, documents and medicines upstairs."),
+        say(GOV, "Environment Agency", "Don't walk or drive through flood water: 30cm of flowing water can float a car."),
+    ],
+    "flood_alert": [
+        say(GOV, "Environment Agency", "A flood alert means flooding is possible: be prepared, and check your flood "
+                                       "plan and the latest updates."),
+    ],
+    "met_red": [
+        say(GOV, "Met Office", "A red warning means dangerous weather is expected: take action now to keep yourselves "
+                               "and others safe."),
+    ],
+    "met_amber": [
+        say(GOV, "Met Office", "An amber warning means be prepared: think about changing plans and protecting "
+                               "yourselves and your home."),
+    ],
+    "met_yellow": [
+        say(GOV, "Met Office", "A yellow warning means be aware: some disruption is possible, so keep up with the "
+                               "forecast."),
+    ],
+    "wx_cold": [
+        say(GOV, "UKHSA", "Heat the rooms you use to at least 18°C if you can, especially for anyone over 65 or with a "
+                          "health condition."),
+        say(GOV, "NHS", "Wear several thin layers, have hot food and drinks, and keep moving."),
+    ],
+    "wx_heat": [
+        say(GOV, "NHS", "Stay out of the sun between 11am and 3pm, drink plenty, and keep rooms cool by closing "
+                        "curtains on the sunny side."),
+        say(GOV, "NHS", "Check on people most at risk: older people, babies, and anyone with a heart or lung "
+                        "condition."),
+    ],
+    "wx_wind": [
+        say(GOV, "Prepare", "Bring in or tie down anything that could blow about, and keep torches handy in case the "
+                            "power goes."),
+        say(NETWORKS, "105", "To report or check a power cut, call 105. It's free from any phone."),
+    ],
+    "wx_rain": [
+        say(GOV, "Environment Agency", "Check the flood warnings for where you live, and keep documents and medicines "
+                                       "somewhere high."),
+    ],
+    "disaster": [
+        say(GOV, "Foreign Office", "If you have family or travel plans in the area, check the Foreign Office travel "
+                                   "advice."),
+    ],
+    "fire_near": [
+        say(FIRE, "", "If you see a wildfire, move away from it and call 999. Don't try to put it out yourself."),
+        say(FIRE, "", "Keep smoke out: close windows and doors."),
+    ],
+    "gas_alarm": [
+        say(GOV, "NHS", "Gas or carbon monoxide: open doors and windows, don't use switches or flames, get everyone "
+                        "outside and call the gas emergency line on 0800 111 999."),
+        say(GOV, "NHS", "Headaches, dizziness or feeling sick can mean carbon monoxide poisoning: get fresh air and "
+                        "call 111, or 999 in an emergency."),
+    ],
+    "smoke_alarm": [
+        say(GOV, "Fire Kills", "If there's a fire: get out, stay out, and call 999. Close doors behind you as you go."),
+    ],
+    "leak": [
+        say(GOV, "Prepare", "Turn the water off at the stopcock, and keep away from any electrics near the water."),
+    ],
+    "power_cut": [
+        say(NETWORKS, "105", "To report or check a power cut, call 105. It's free from any phone."),
+        say(TIP, "", "Keep the fridge and freezer shut to keep food cold for longer, and use torches, not candles, "
+                     "where you can."),
+        say(SAS, "PLAN: Protection", "Keep warm first: gather in one room, keep its doors closed and add layers."),
+    ],
+    "power_cut_long": [
+        say(GOV, "Ofgem", "If anyone relies on powered medical equipment, tell your network on 105, and join the "
+                          "Priority Services Register for next time."),
+        say(TIP, "", "Eat food from the fridge first, then the freezer, then the stores."),
+    ],
+    "battery_low": [
+        say(TIP, "", "Your backup battery is running low: Home Assistant and Dads Army will stop when it runs out. "
+                     "Keep the printed plan and stores list to hand."),
+    ],
+    "cold_indoor": [
+        say(GOV, "UKHSA", "Heat the rooms you use to at least 18°C if you can, especially for anyone over 65 or with a "
+                          "health condition."),
+        say(GOV, "NHS", "Wear several thin layers, have hot food and drinks, and keep moving."),
+        say(SAS, "PLAN: Protection", "Protection from the cold comes first: keep everyone in one warm room."),
+    ],
+    "hot_indoor": [
+        say(GOV, "NHS", "Keep rooms cool: close curtains on the sunny side, and open windows when it's cooler "
+                        "outside, such as at night."),
+        say(GOV, "NHS", "Drink plenty, and check on people most at risk: older people, babies, and anyone with a heart "
+                        "or lung condition."),
+    ],
+    "damp": [
+        say(GOV, "NHS", "Keep damp down: open windows when you can, use extractor fans, and dry washing outside if "
+                        "possible."),
+    ],
+    "poor_air": [
+        say(GOV, "DEFRA", "When air pollution is high, people with heart or lung conditions should cut down on "
+                          "strenuous activity, especially outdoors."),
+        say(FIRE, "", "If the smoke is from a fire nearby, keep windows and doors closed."),
+    ],
+    "internet_down": [
+        say(GOV, "Prepare", "Without the internet, use a battery or wind-up radio for local news and emergency "
+                            "information."),
+        say(TIP, "", "Warnings can't update without the internet, so the ones shown may be out of date."),
+    ],
+    "food_low": [
+        say(GOV, "Prepare", "Aim for enough food to last at least 3 days, and build it up over time."),
+    ],
+    "water_low": [
+        say(GOV, "Prepare", "Store at least 3 litres of drinking water per person per day, for at least 3 days."),
+    ],
+    "kit_low": [
+        say(GOV, "Prepare", "The basics: a torch, a battery or wind-up radio, spare batteries, a power bank and a first "
+                            "aid kit."),
+    ],
+}
+for _k in ("cool_indoor",):
+    GUIDE[_k] = GUIDE["cold_indoor"][:2]
+GUIDE["freezing_out"] = GUIDE["wx_cold"]
+GUIDE["hot_out"] = GUIDE["wx_heat"]
+
+# -- Home sensors (Home Assistant only) ----------------------------------------
+# role, what it is, several allowed, domains, device classes, how it's used
+SENSOR_ROLES = [
+    ("indoor_temp", "Indoor temperature", True, ("sensor",), ("temperature",),
+     "The rooms you live in. Dads Army watches the coldest and the warmest."),
+    ("outdoor_temp", "Outdoor temperature", False, ("sensor", "weather"), ("temperature",),
+     "An outside sensor, or your weather forecast."),
+    ("humidity", "Indoor humidity", True, ("sensor",), ("humidity",), "For damp and mould."),
+    ("power", "Mains electricity", False, ("binary_sensor", "sensor"), ("power", "plug", "problem", "voltage"),
+     "Something that only changes in a power cut, like a UPS status or a mains voltage sensor. Home Assistant needs a "
+     "UPS to keep running in a power cut."),
+    ("battery", "Backup battery or UPS charge", False, ("sensor",), ("battery",),
+     "How much charge your UPS or home battery has left."),
+    ("gas_alarm", "Gas or carbon monoxide alarm", True, ("binary_sensor", "sensor"), ("gas", "carbon_monoxide"), ""),
+    ("smoke_alarm", "Smoke or heat alarm", True, ("binary_sensor",), ("smoke", "heat"), ""),
+    ("leak", "Water leak sensor", True, ("binary_sensor",), ("moisture",), ""),
+    ("internet", "Internet connection", False, ("binary_sensor",), ("connectivity",),
+     "Without it, warnings can't update."),
+    ("air", "Outdoor air quality (PM2.5)", False, ("sensor",), ("pm25",), "Fine particles, in µg/m³."),
+]
+ROLE = {r[0]: r for r in SENSOR_ROLES}
+ENTITY_RE = re.compile(r"^(sensor|binary_sensor|weather)\.[a-z0-9_]+$")
+HOME_STATE = {"readings": {}, "at": None, "power_cut_since": None}
+HOME_LOCK = threading.Lock()
+SENSOR_WAKE = threading.Event()
+SENSOR_EVERY = float(os.environ.get("DADSARMY_SENSOR_EVERY", "15"))
+
+
+def home_cfg():
+    raw = setting_raw("home_sensors", {})
+    raw = raw if isinstance(raw, dict) else {}
+    out = {}
+    for key, _, multi, doms, _, _ in SENSOR_ROLES:
+        v = raw.get(key)
+        ids = v if isinstance(v, list) else [v] if isinstance(v, str) and v else []
+        ids = [i for i in ids if isinstance(i, str) and ENTITY_RE.match(i) and i.split(".")[0] in doms][:10]
+        out[key] = ids if multi else (ids[0] if ids else "")
+    return out
+
+
+def read_entity(eid):
+    status, st = ha_request("GET", "/states/" + eid, timeout=6)
+    if status != 200 or not isinstance(st, dict):
+        return {"entity_id": eid, "name": eid, "state": "missing", "value": None, "unit": "", "device_class": "",
+                "ok": False}
+    a = st.get("attributes") or {}
+    state = st.get("state")
+    value, unit = state, a.get("unit_of_measurement") or ""
+    if eid.startswith("weather."):
+        value, unit = a.get("temperature"), a.get("temperature_unit") or "°C"
+    return {"entity_id": eid, "name": a.get("friendly_name") or eid, "state": state, "value": value, "unit": unit,
+            "device_class": a.get("device_class") or "", "ok": state not in ("unavailable", "unknown", None)}
+
+
+def number(r):
+    """A reading as a number, in °C for temperatures. None if it isn't one."""
+    if not r or not r["ok"]:
+        return None
+    try:
+        v = float(r["value"])
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(v) or math.isinf(v):
+        return None
+    if r["unit"] in ("°F", "F"):
+        v = (v - 32) * 5 / 9
+    return v
+
+
+def power_is_off(r):
+    """True in a power cut, False with power, None if it can't tell."""
+    if not r or not r["ok"]:
+        return None
+    s = str(r["state"]).strip().lower()
+    if r["entity_id"].startswith("binary_sensor."):
+        return s == "on" if r["device_class"] == "problem" else s == "off"
+    try:
+        v = float(s)
+    except ValueError:
+        if re.search(r"\b(ob|onbatt|on ?battery|power ?(failure|cut|outage|lost))\b", s):
+            return True
+        if re.search(r"\b(ol|online|on ?line|mains)\b", s):
+            return False
+        return None
+    if r["device_class"] == "voltage" or r["unit"].lower() == "v":
+        return v < 100
+    return v <= 0
+
+
+def alarm_on(r):
+    if not r or not r["ok"]:
+        return False
+    if r["entity_id"].startswith("binary_sensor."):
+        return str(r["state"]).lower() == "on"
+    v = number(r)   # a carbon monoxide sensor in ppm
+    return v is not None and v >= 50
+
+
+def poll_home_sensors():
+    """Read the chosen Home Assistant sensors, and keep track of how long a power cut has lasted."""
+    with LOCK:
+        cfg = home_cfg()
+        since = setting_raw("power_cut_since", None)
+    readings = {}
+    for key, _, multi, _, _, _ in SENSOR_ROLES:
+        ids = cfg[key] if multi else ([cfg[key]] if cfg[key] else [])
+        if ids:
+            readings[key] = [read_entity(i) for i in ids]
+    off = power_is_off(readings["power"][0]) if readings.get("power") else None
+    new_since = since
+    if off is True and not since:
+        new_since = now_iso()
+    elif off is False or not readings.get("power"):
+        new_since = None
+    if new_since != since:
+        with tx() as db:
+            set_setting_raw(db, "power_cut_since", new_since)
+            add_log("settings", "", "Power cut started" if new_since else "Power back on")
+    with HOME_LOCK:
+        before = json.dumps(HOME_STATE["readings"], sort_keys=True)
+        HOME_STATE.update(readings=readings, at=now_iso(), power_cut_since=new_since)
+        changed = json.dumps(readings, sort_keys=True) != before
+    return changed or new_since != since
+
+
+def home_sensors_loop():
+    while True:
+        try:
+            if poll_home_sensors():
+                HA_WAKE.set()
+        except Exception as e:
+            if not isinstance(e, (HAError, OSError)):
+                traceback.print_exc()
+        SENSOR_WAKE.wait(SENSOR_EVERY)
+        SENSOR_WAKE.clear()
+
+
+def home_snapshot():
+    with HOME_LOCK:
+        return json.loads(json.dumps(HOME_STATE))
+
+
+def _f(v):
+    return ("%.1f" % v).rstrip("0").rstrip(".")
+
+
+def weather_kind(title):
+    t = (title or "").lower()
+    if re.search(r"snow|ice|cold", t):
+        return "wx_cold"
+    if re.search(r"heat", t):
+        return "wx_heat"
+    if re.search(r"wind|storm|thunder|lightning", t):
+        return "wx_wind"
+    if re.search(r"rain|flood", t):
+        return "wx_rain"
+    return None
+
+
+def assess(s, home):
+    """Where the household stands, LOW (1) to CRITICAL (5), why, and what to do."""
+    factors = []
+
+    def add(level, key, title, extra=None):
+        factors.append({"level": level, "key": key, "title": title, "extra": extra})
+
+    # Warnings in force (when they're switched on).
+    for w in s["warnings"]["items"] if s["warnings"]["enabled"] else []:
+        src, sev, title = w.get("source"), w.get("severity") or 0, w.get("title") or ""
+        if src == "govalerts":
+            if sev >= 3:
+                add(5, "emergency_alert", title)
+        elif src == "floods":
+            lvl, key = {3: (5, "severe_flood"), 2: (4, "flood_warning")}.get(sev, (2, "flood_alert"))
+            add(lvl, key, title)
+        elif src == "metoffice":
+            lvl, key = {3: (4, "met_red"), 2: (3, "met_amber")}.get(sev, (2, "met_yellow"))
+            add(lvl, key, title, weather_kind(title))
+        elif src == "gdacs":
+            add(2, "disaster", title)
+        elif src == "fires":
+            near = (w.get("distance_km") if w.get("distance_km") is not None else 99) <= 3
+            add(3 if near else 2, "fire_near", title)
+
+    # Home sensors.
+    r = home.get("readings") or {}
+    for role, lvl in (("gas_alarm", 5), ("smoke_alarm", 5), ("leak", 3)):
+        for x in r.get(role, []):
+            if alarm_on(x):
+                add(lvl, role, "%s: %s" % (ROLE[role][1], x["name"]))
+    temps = [v for v in (number(x) for x in r.get("indoor_temp", [])) if v is not None]
+    if temps:
+        lo, hi = min(temps), max(temps)
+        for limit, lvl in ((9, 4), (12, 3), (16, 2), (18, 1)):
+            if lo < limit:
+                add(lvl, "cold_indoor" if lvl > 1 else "cool_indoor", "Coldest room %s°C" % _f(lo))
+                break
+        for limit, lvl in ((33, 4), (30, 3), (27, 2)):
+            if hi >= limit:
+                add(lvl, "hot_indoor", "Warmest room %s°C" % _f(hi))
+                break
+    out = number((r.get("outdoor_temp") or [None])[0])
+    if out is not None:
+        if out <= -5:
+            add(3 if out <= -10 else 2, "freezing_out", "%s°C outside" % _f(out))
+        elif out >= 30:
+            add(3 if out >= 35 else 2, "hot_out", "%s°C outside" % _f(out))
+    hums = [v for v in (number(x) for x in r.get("humidity", [])) if v is not None]
+    if hums and max(hums) >= 80:
+        add(2, "damp", "Humidity %s%% indoors" % _f(max(hums)))
+    off = power_is_off((r.get("power") or [None])[0])
+    if off:
+        since = home.get("power_cut_since")
+        hours = 0.0
+        try:
+            hours = (dt.datetime.now() - dt.datetime.fromisoformat(since)).total_seconds() / 3600 if since else 0.0
+        except ValueError:
+            pass
+        mins = max(1, int(hours * 60))
+        length = ("for %d hours" % int(hours)) if hours >= 2 else ("for %d minute%s" % (mins, "" if mins == 1 else "s"))
+        if hours >= 12:
+            add(4, "power_cut_long", "Power cut %s" % length)
+        else:
+            add(3, "power_cut", "Power cut %s" % length)
+        batt = number((r.get("battery") or [None])[0])
+        if batt is not None and batt < 20:
+            add(4, "battery_low", "Backup battery at %d%%" % int(batt))
+    net = (r.get("internet") or [None])[0]
+    if net and net["ok"] and str(net["state"]).lower() == "off":
+        add(2, "internet_down", "Internet down")
+    pm = number((r.get("air") or [None])[0])
+    if pm is not None:
+        for limit, lvl in ((75, 4), (55, 3), (35, 2)):
+            if pm >= limit:
+                add(lvl, "poor_air", "Air pollution: PM2.5 at %s µg/m³" % _f(pm))
+                break
+
+    # The stores.
+    weak = False
+    if s["people"]:
+        if s["food_days"] < 3:
+            add(2, "food_low", "Food would last %s day%s" % (_f(s["food_days"]), "" if s["food_days"] == 1 else "s"))
+            weak = True
+        if s["water_days"] < 3:
+            add(2, "water_low", "Water would last %s day%s" % (_f(s["water_days"]), "" if s["water_days"] == 1 else "s"))
+            weak = True
+    if s.get("kit_items") and s["kit_stocked_pct"] < 50:
+        add(2, "kit_low", "Kit %d%% stocked" % s["kit_stocked_pct"])
+
+    level = max([f["level"] for f in factors] + [1])
+    escalated = False
+    if level == 3 and weak:
+        level, escalated = 4, True   # less able to cope. Only real danger makes it CRITICAL.
+
+    # What to do: the most serious things first, then the level's own advice. No repeats.
+    guidance, seen = [], set()
+    reasons = sorted([f for f in factors if f["level"] >= 2], key=lambda f: -f["level"])
+    keys = []
+    for f in reasons + [f for f in factors if f["level"] < 2]:
+        keys += [f["key"]] + ([f["extra"]] if f["extra"] else [])
+    general = "level%d" % level
+    # When it's serious, the top reason's advice comes first, then the level's own (999 and
+    # the like), so neither is cut off the end of the list.
+    order = (keys[:1] + [general] + keys[1:]) if level >= 4 else (keys + [general])
+    for key in order:
+        for g in GUIDE.get(key, []):
+            if g["text"] not in seen:
+                seen.add(g["text"])
+                guidance.append(dict(g, label=g["source"] + (" · " + g["body"] if g["body"] else "")))
+    if not any(g["source"] == SAS for g in guidance[:12]):   # always some of each
+        sas = [g for g in guidance if g["source"] == SAS]
+        if sas:
+            guidance = guidance[:11] + sas[:1]
+    name, colour, emoji, meaning, _ = LEVELS[level - 1]
+    return {"level": level, "name": name, "colour": colour, "emoji": emoji, "meaning": meaning,
+            "escalated": escalated,
+            "reasons": [{"level": f["level"], "name": LEVELS[f["level"] - 1][0], "title": f["title"], "key": f["key"]}
+                        for f in reasons],
+            "notes": [f["title"] for f in factors if f["level"] < 2],
+            "guidance": guidance[:12],
+            "sensors": bool(r),
+            "scale": [{"level": i + 1, "name": n, "colour": c, "emoji": e, "meaning": m, "mi5": d}
+                      for i, (n, c, e, m, d) in enumerate(LEVELS)]}
+
+
+@route("GET", "/api/homeassistant/sensors")
+def api_ha_sensors(body, query):
+    """Sensors in Home Assistant that could fill each role, with suggestions."""
+    need_ha()
+    status, data = ha_request("GET", "/states", timeout=20)
+    if status != 200 or not isinstance(data, list):
+        raise ApiError(502, "Couldn't get the sensors from Home Assistant (it answered %s)" % status)
+    cands = {r[0]: [] for r in SENSOR_ROLES}
+    for e in data:
+        if not isinstance(e, dict):
+            continue
+        eid = str(e.get("entity_id") or "")
+        if not ENTITY_RE.match(eid) or ".dads_army" in eid:
+            continue
+        a = e.get("attributes") or {}
+        dom, dc = eid.split(".")[0], a.get("device_class") or ""
+        row = {"entity_id": eid, "name": str(a.get("friendly_name") or eid)[:80],
+               "state": str(e.get("state"))[:40], "unit": str(a.get("unit_of_measurement") or "")[:12]}
+        if dom == "weather":
+            row.update(state=str(a.get("temperature")), unit=a.get("temperature_unit") or "°C")
+        for key, _, _, doms, dcs, _ in SENSOR_ROLES:
+            if dom not in doms:
+                continue
+            ups = dom == "sensor" and re.search(r"ups|nut", eid) and re.search(r"status", eid)
+            if dc in dcs or (key == "outdoor_temp" and dom == "weather") or (key == "power" and ups):
+                if key == "power" and dom == "binary_sensor" and dc not in ("power", "plug", "problem"):
+                    continue
+                cands[key].append(row)
+    for k in cands:
+        cands[k] = sorted(cands[k], key=lambda r: r["name"].lower())[:80]
+    with LOCK:
+        cfg = home_cfg()
+    return {"roles": [{"key": k, "label": l, "multiple": m, "hint": h} for k, l, m, _, _, h in SENSOR_ROLES],
+            "candidates": cands, "suggested": suggest_sensors(cands), "config": cfg}
+
+
+OUTSIDE_RE = re.compile(r"outdoor|outside|garden|external|exterior|weather|forecast|balcony|patio", re.I)
+GADGET_RE = re.compile(r"cpu|processor|soc|system|board|nvme|disk|ssd|battery|fridge|freezer|boiler|cylinder|"
+                       r"water|flow|return|pool|car|phone|printer|router|nas|server|\bpi\b|thermal|chip|esp|"
+                       r"inverter|charger|dew|feels", re.I)
+
+
+def suggest_sensors(c):
+    """A sensible first guess for each role. Nothing is used until it's saved."""
+    def text(r):
+        return r["entity_id"] + " " + r["name"]
+    indoor = [r for r in c["indoor_temp"] if not OUTSIDE_RE.search(text(r)) and not GADGET_RE.search(text(r))]
+    hum = [r for r in c["humidity"] if not OUTSIDE_RE.search(text(r)) and not GADGET_RE.search(text(r))]
+    outdoor = ([r for r in c["outdoor_temp"] if r["entity_id"].startswith("weather.")]
+               + [r for r in c["outdoor_temp"] if OUTSIDE_RE.search(text(r)) and not GADGET_RE.search(text(r))])
+    power = [r for r in c["power"] if re.search(r"ups|nut|mains|grid|outage|power", text(r), re.I)]
+    batt = [r for r in c["battery"] if re.search(r"ups|nut|backup|powerwall|home ?battery|storage", text(r), re.I)]
+    net = [r for r in c["internet"] if re.search(r"internet|wan|online|broadband", text(r), re.I)]
+    air = [r for r in c["air"] if OUTSIDE_RE.search(text(r))] or c["air"][:1]
+    return {"indoor_temp": [r["entity_id"] for r in indoor[:6]],
+            "outdoor_temp": outdoor[0]["entity_id"] if outdoor else "",
+            "humidity": [r["entity_id"] for r in hum[:6]],
+            "power": power[0]["entity_id"] if power else "",
+            "battery": batt[0]["entity_id"] if batt else "",
+            "gas_alarm": [r["entity_id"] for r in c["gas_alarm"][:10]],
+            "smoke_alarm": [r["entity_id"] for r in c["smoke_alarm"][:10]],
+            "leak": [r["entity_id"] for r in c["leak"][:10]],
+            "internet": net[0]["entity_id"] if net else "",
+            "air": air[0]["entity_id"] if air else ""}
+
+
+@route("PUT", "/api/homeassistant/sensors")
+def api_ha_sensors_set(body, query):
+    need_ha()
+    cfg = {}
+    for key, label, multi, doms, _, _ in SENSOR_ROLES:
+        v = body.get(key, [] if multi else "")
+        ids = v if isinstance(v, list) else [v] if v else []
+        if len(ids) > 10:
+            raise ApiError(400, "Ten sensors at most for %s" % label.lower())
+        for i in ids:
+            if not isinstance(i, str) or not ENTITY_RE.match(i) or i.split(".")[0] not in doms:
+                raise ApiError(400, "%s can't use %s" % (label, str(i)[:60]))
+        cfg[key] = ids if multi else (ids[0] if ids else "")
+    with tx() as db:
+        set_setting_raw(db, "home_sensors", cfg)
+        add_log("settings", "", "Home sensors updated")
+    SENSOR_WAKE.set()
+    return {"config": cfg}
+
+
 # --------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------
@@ -3356,6 +4050,8 @@ def main():
     load_warnings()
     threading.Thread(target=backup_loop, name="backups", daemon=True).start()
     threading.Thread(target=warnings_loop, name="warnings", daemon=True).start()
+    if HA_TOKEN:
+        threading.Thread(target=home_sensors_loop, name="home-sensors", daemon=True).start()
     if HA_TOKEN:
         threading.Thread(target=ha_loop, name="homeassistant", daemon=True).start()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)

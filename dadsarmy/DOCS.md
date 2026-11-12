@@ -28,11 +28,14 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_checks_due` | Routine checks that are due, overdue or not done yet | `items` (each has `name`, `due`, `days`, `every` and `text`), `due_today`, `due_soon` (within a week), `next_check`, `checks_total` |
 | `sensor.dads_army_stores_value` | What the stores are worth, in £, from the prices you've set | `supply_run_cost`, `priced_items`, `items_total` |
 | `sensor.dads_army_warnings` | Official warnings in force for where you live (see **Warnings** below). 0 while warnings are switched off. | `items` (each has `title`, `level`, `severity` 1–3, `source`, `area`, `when`, `url` and `text`), `highest` (yellow, amber or red), `max_severity`, `enabled`, `checked_at`, `health_news` |
+| `sensor.dads_army_alert_level` | The household alert level: LOW, MODERATE, SUBSTANTIAL, SEVERE or CRITICAL (see below) | `level` (1–5), `meaning`, `reasons`, `guidance` (each with `label`, `source` and `text`), `scale`, `escalated`, `notes` |
 | `binary_sensor.dads_army_attention` | **On** when something needs doing now: stock past its best-before date, a check that's overdue, or a serious warning (amber or worse). Things you haven't bought yet don't count: they're on the supply run. | `reasons` |
 
 Each list holds up to 30 entries; `total` gives the full count. The numbers are recorded in Home Assistant's history, so you can chart how your readiness changes over time.
 
 Home Assistant doesn't keep these sensors after it restarts, so Dads Army sends them again within a minute. While Dads Army is stopped, they show as unavailable.
+
+When the household alert level changes, Dads Army fires a `dads_army_alert_level` event. Its data has `level`, `name`, `previous`, `previous_name`, `rising`, `reasons` and `message` (ready to send, with the main reason and the first thing to do).
 
 When a new warning comes in, Dads Army fires a `dads_army_warning` event. Its data has `message`, `count`, `max_severity` and `items` (each with `title`, `level`, `severity`, `source`, `area` and `url`).
 
@@ -44,6 +47,7 @@ The quickest way to get Dads Army on your Home Assistant dashboards. Dads Army o
 
 A **Home front** dashboard appears in the Home Assistant sidebar and in the Companion app. It's built from Home Assistant's own cards, so there's nothing extra to install. It has:
 
+- **The household alert level**, big and colour-coded across the top, with the full scale, why it's at that level, and what to do now. **What the levels mean** opens a page that explains them.
 - **Warnings** in force for where you live
 - **Today's checklist:** the routine checks that are due, ready to tick off (see below)
 - **Readiness:** the gauge, plus how long you could hold out, food, water and daily supplies
@@ -188,7 +192,7 @@ Two ready-made automations (blueprints) send Dads Army news to your phone. You n
 
 | Blueprint | What it sends |
 |---|---|
-| **Dads Army: phone alerts** | Straight away when a new warning comes in (amber and worse unless you choose otherwise), and when something runs out. Every morning (8:30 unless you change it), anything that went out of date overnight, anything on its last day, and any routine check that falls due that day. |
+| **Dads Army: phone alerts** | When the household alert level goes up (to SUBSTANTIAL or higher unless you choose otherwise). Straight away when a new warning comes in (amber and worse unless you choose otherwise), and when something runs out. Every morning (8:30 unless you change it), anything that went out of date overnight, anything on its last day, and any routine check that falls due that day. |
 | **Dads Army: weekly round-up** | Once a week (Sunday 6pm unless you change it): any warnings in force, what to use first, anything out of date, checks that are due, the supply run, what runs out first, and how long you could hold out. |
 
 **Already set these up before Dads Army 1.6.0?** Re-import them to get warnings, checks and daily supplies: go to **Settings → Automations & scenes → Blueprints**, open the **⋮** menu next to each Dads Army blueprint, and choose **Re-import blueprint**. Your automations keep their settings.
@@ -222,6 +226,53 @@ How it works:
 - Anything added to the list in Home Assistant, including by voice, becomes an extra on the supply run.
 
 Changes show up on the other side within about half a minute.
+
+## Household alert level
+
+Dads Army works out where the household stands on a five-step scale. It shows at the top of the Sitrep and the Home front dashboard, in `sensor.dads_army_alert_level`, and on your phone through the phone alerts blueprint.
+
+The names are the UK's own five national threat levels, the nearest British equivalent to America's DEFCON. This is the household's own level, though, not the official threat level, which is set by MI5's Joint Terrorism Analysis Centre.
+
+| | Level | What it means for the household |
+|:-:|:--|:--|
+| 🟩 | **LOW** | Nothing is threatening the household and the stores would last at least 3 days. Carry on as normal. |
+| 🟨 | **MODERATE** | Something to keep an eye on: a yellow warning, a minor problem at home, or stores that wouldn't last 3 days. Stay aware. |
+| 🟧 | **SUBSTANTIAL** | Disruption is likely: an amber warning, a power cut, a leak, or a cold or hot home. Get ready. |
+| 🟥 | **SEVERE** | Disruption is highly likely or under way: a red warning, a flood warning, a long power cut, or a dangerously cold or hot home. Act now. |
+| ⬛ | **CRITICAL** | Danger to life, now or very soon: an Emergency Alert, a severe flood warning, or a gas, carbon monoxide or smoke alarm. Follow the emergency services' instructions. |
+
+It's worked out from three things:
+
+- **Warnings in force**, if you've switched them on.
+- **Your home's own sensors**, if you've chosen them (see below).
+- **Your stores:** food or water for under 3 days, or kit under half stocked, makes it at least MODERATE. If it's SUBSTANTIAL and the food or water wouldn't last 3 days, it goes up to SEVERE. Only real danger makes it CRITICAL.
+
+The exact rules are on the dashboard's **What the levels mean** page, and behind the **i** next to the level in the app.
+
+Each level comes with **what to do now**, worst problem first. Each piece of advice is labelled with where it comes from:
+
+- **UK Government:** advice from Prepare (gov.uk), the NHS, UKHSA, the Met Office, the Environment Agency, DEFRA, Ofgem, the Foreign Office and the Fire Kills campaign. It's put into plain statements, not quoted word for word.
+- **SAS Survival Handbook:** John "Lofty" Wiseman's PLAN priorities (Protection, Location, Acquisition of water and food, Navigation), applied to a household. These are paraphrased, not quoted.
+- **Fire & rescue services**, **Electricity networks (105)** and **Dads Army tip** for the rest.
+
+### Home sensors
+
+In Dads Army, open **HQ → Home sensors** (or tap **?**, then **Choose home sensors**). Tap **Suggest sensors for me**, check the choices, then **Save**. Dads Army reads the sensors every 15 seconds and uses them like this:
+
+| Sensor | Raises the level when |
+|:--|:--|
+| Indoor temperature (the coldest and warmest room) | Under 16°C (MODERATE), 12°C (SUBSTANTIAL) or 9°C (SEVERE); 27°C or more (MODERATE), 30°C (SUBSTANTIAL) or 33°C (SEVERE). Under 18°C brings UKHSA's cold-home advice. |
+| Outdoor temperature (a sensor or your weather forecast) | −5°C or colder, or 30°C or hotter (MODERATE); −10°C or 35°C (SUBSTANTIAL) |
+| Indoor humidity | 80% or more (MODERATE), for damp and mould |
+| Mains electricity | A power cut (SUBSTANTIAL); over 12 hours (SEVERE) |
+| Backup battery or UPS charge | Under 20% during a power cut (SEVERE) |
+| Gas or carbon monoxide alarm | Going off (CRITICAL) |
+| Smoke or heat alarm | Going off (CRITICAL) |
+| Water leak sensor | A leak (SUBSTANTIAL) |
+| Internet connection | Down (MODERATE): warnings can't update |
+| Outdoor air quality (PM2.5) | 35 µg/m³ or more (MODERATE), 55 (SUBSTANTIAL) or 75 (SEVERE) |
+
+For **mains electricity**, choose something that only changes in a power cut, such as a UPS status, a mains voltage sensor or a power-cut sensor. Without a UPS, Home Assistant itself stops in a power cut. Power cuts and their length are noted in Dads Army's activity log.
 
 ## Warnings
 

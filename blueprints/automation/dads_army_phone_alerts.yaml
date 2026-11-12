@@ -9,6 +9,9 @@ blueprint:
     disasters near the UK, and possible fires seen by satellite (switch
     warnings on in Dads Army under HQ, 1.6.0 or later).
 
+    - **Alert level:** when the household alert level goes up (Dads Army 1.8.0
+    or later).
+
     - **Run out:** straight away, when the last of something is used up.
 
     - **Morning check:** once a day, anything that went out of date overnight,
@@ -32,6 +35,25 @@ blueprint:
         device:
           filter:
             - integration: mobile_app
+    alert_level:
+      name: Household alert level
+      description: >-
+        Tell me when Dads Army's household alert level (LOW, MODERATE,
+        SUBSTANTIAL, SEVERE, CRITICAL) changes, with the reason and what to do.
+      default: "3"
+      selector:
+        select:
+          options:
+            - label: When it goes up to SUBSTANTIAL or higher
+              value: "3"
+            - label: When it goes up to SEVERE or higher
+              value: "4"
+            - label: Whenever it goes up
+              value: "2"
+            - label: Whenever it changes, up or down
+              value: "1"
+            - label: Never
+              value: "99"
     warnings:
       name: Warnings
       description: >-
@@ -99,6 +121,9 @@ triggers:
   - trigger: event
     event_type: dads_army_warning
     id: warning
+  - trigger: event
+    event_type: dads_army_alert_level
+    id: level
   - trigger: time
     at: !input morning_time
     id: morning
@@ -109,6 +134,7 @@ variables:
   want_last_day: !input last_day
   want_checks: !input checks
   want_warnings: !input warnings
+  want_level: !input alert_level
   open_path: !input open_path
   warn_rows: >-
     {{ (trigger.event.data['items'] | default([]) | selectattr('severity', '>=', want_warnings | int) | list)
@@ -125,10 +151,28 @@ conditions:
     value_template: >-
       {{ (trigger.id == 'run_out' and want_run_out)
          or (trigger.id == 'warning' and warn_rows | count > 0)
+         or (trigger.id == 'level' and want_level | int < 99
+             and (want_level | int == 1 or (trigger.event.data.rising and trigger.event.data.level >= want_level | int)))
          or (trigger.id == 'morning' and (gone_off | count + use_today | count + checks_today | count) > 0) }}
 
 actions:
   - choose:
+      - conditions: "{{ trigger.id == 'level' }}"
+        sequence:
+          - device_id: !input phone
+            domain: mobile_app
+            type: notify
+            title: "Dads Army: {{ trigger.event.data.name }}"
+            message: "{{ trigger.event.data.message }}"
+            data:
+              clickAction: "{{ open_path }}"
+              url: "{{ open_path }}"
+              tag: dads-army-level
+              group: dads-army
+              channel: Dads Army
+              ttl: 0
+              priority: "{{ 'high' if trigger.event.data.level >= 4 else 'normal' }}"
+              notification_icon: mdi:shield-alert
       - conditions: "{{ trigger.id == 'warning' }}"
         sequence:
           - device_id: !input phone

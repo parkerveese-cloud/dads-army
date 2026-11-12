@@ -1,7 +1,8 @@
 blueprint:
   name: "Dads Army: weekly round-up"
   description: >-
-    Once a week, a note on your phone from Dads Army: any warnings in force,
+    Once a week, a note on your phone from Dads Army: the household alert level,
+    any warnings in force,
     what to use first (things expiring soon), anything out of date, routine
     checks that are due, the supply run, and how long you could hold out.
 
@@ -98,6 +99,10 @@ actions:
         Dads Army isn't sending updates. Check the app is running in Home Assistant.
       {%- else -%}
         {%- set ns = namespace(out=[]) -%}
+        {%- set lvl = states('sensor.dads_army_alert_level') -%}
+        {%- if lvl not in ['unknown', 'unavailable'] -%}
+          {%- set ns.out = ns.out + ['Household alert level: ' ~ lvl ~ '. ' ~ (state_attr('sensor.dads_army_alert_level', 'meaning') or '')] -%}
+        {%- endif -%}
         {%- set warn_n = states('sensor.dads_army_warnings') | int(0) -%}
         {%- if warn_n > 0 -%}
           {%- set ns.out = ns.out + ['Warnings in force: ' ~ ((state_attr('sensor.dads_army_warnings', 'items') or [])[:3]

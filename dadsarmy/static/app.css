@@ -688,3 +688,77 @@ body.sheet-open .toast { bottom: calc(env(safe-area-inset-bottom) + 12px); }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .dp-tile.purple b { color: #c79ce6; } }
 :root[data-theme="dark"] .dp-tile.purple b { color: #c79ce6; }
 @media (max-width: 360px) { .top-actions { gap: 8px; } .hdr-help, .hdr-add { width: 38px; height: 38px; } }
+
+/* ---------- Household alert level ---------- */
+.lv1 { --lv: #2e7d32; --lv-ink: #2e7d32; }
+.lv2 { --lv: #f9a825; --lv-ink: #8a6100; }
+.lv3 { --lv: #ef6c00; --lv-ink: #b45300; }
+.lv4 { --lv: #c62828; --lv-ink: #c62828; }
+.lv5 { --lv: #212121; --lv-ink: #000000; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .lv2 { --lv-ink: #ffd54f; }
+  :root:not([data-theme="light"]) .lv3 { --lv-ink: #ffa040; }
+  :root:not([data-theme="light"]) .lv4 { --lv-ink: #ff6b60; }
+  :root:not([data-theme="light"]) .lv5 { --lv: #000000; --lv-ink: #ffffff; }
+  :root:not([data-theme="light"]) .src-gov { color: #82b1ff; }
+}
+:root[data-theme="dark"] .lv2 { --lv-ink: #ffd54f; }
+:root[data-theme="dark"] .lv3 { --lv-ink: #ffa040; }
+:root[data-theme="dark"] .lv4 { --lv-ink: #ff6b60; }
+:root[data-theme="dark"] .lv5 { --lv: #000000; --lv-ink: #ffffff; }
+:root[data-theme="dark"] .src-gov { color: #82b1ff; }
+
+.level-card { border: 2px solid var(--lv); box-shadow: inset 0 7px 0 var(--lv); padding-top: 20px; }
+.level-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.info-btn {
+  flex: none; width: 32px; height: 32px; border-radius: 50%;
+  display: grid; place-items: center; padding: 0;
+  border: 1.5px solid var(--line-strong); background: var(--surface-2); color: var(--ink-2);
+  font: italic 700 17px/1 Georgia, "Times New Roman", serif;
+}
+.level-main { display: block; width: 100%; background: none; border: 0; padding: 0; text-align: left; color: inherit; }
+.level-name {
+  display: block; margin: 6px 0 4px;
+  font: 800 42px/1.02 var(--font-cond); letter-spacing: .05em; color: var(--lv-ink);
+}
+.level-meaning { display: block; font-size: 15px; color: var(--ink-2); }
+.level-scale { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; margin: 16px 0 10px; align-items: end; }
+.ls { display: flex; flex-direction: column; align-items: center; gap: 5px; min-width: 0; }
+.ls i { display: block; width: 100%; height: 12px; border-radius: 4px; background: var(--lv); opacity: .38; }
+.ls.lv5 i { outline: 1px solid var(--line-strong); }
+.ls.on i { height: 24px; opacity: 1; box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--lv); }
+.ls b {
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: 700 9.5px/1.1 var(--font-cond); letter-spacing: .03em; color: var(--muted);
+}
+.ls.on b { color: var(--lv-ink); font-size: 10.5px; }
+.level-why { font-size: 14px; color: var(--ink-2); margin: 6px 0 12px; }
+.level-card.in-sheet { display: block; border-radius: 14px; padding: 16px 14px 10px; margin-bottom: 6px; }
+.level-card.in-sheet .level-name { font-size: 34px; margin-top: 0; }
+.ls-chip {
+  display: inline-block; margin-right: 8px; padding: 4px 7px; border-radius: 6px; vertical-align: 1px;
+  background: var(--lv); color: #fff; font: 700 11px/1 var(--font-cond); letter-spacing: .06em;
+}
+.ls-chip.lv2 { color: #3a2a00; }
+.ls-chip.lv5 { outline: 1px solid var(--line-strong); }
+ul.why { list-style: none; padding: 0; margin: 0 0 8px; display: grid; gap: 9px; font-size: 15px; }
+ul.guidance { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; }
+ul.guidance li { font-size: 15px; line-height: 1.42; }
+.src { display: block; margin-bottom: 2px; font: 700 11px/1.2 var(--font-cond); letter-spacing: .08em; text-transform: uppercase; }
+.src-gov { color: #1565c0; }
+.src-sas { color: var(--olive); }
+.src-fire { color: var(--bad-ink); }
+.src-tip { color: var(--muted); }
+.src-net { color: var(--warn-ink); }
+.level-defs { margin: 8px 0 12px; }
+.level-def { padding: 12px 0; border-top: 1px solid var(--line); }
+.level-def p { margin: 6px 0 0; font-size: 15px; }
+.level-def p.small { font-size: 13px; }
+details.hs-role { border-top: 1px solid var(--line); padding: 8px 0; }
+details.hs-role > summary { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; min-height: 34px; cursor: pointer; }
+details.hs-role > p { margin: 4px 0 8px; }
+details.hs-role select { margin: 4px 0 6px; }
+.tip-card { background: var(--olive-tint); border-color: var(--olive); }
+.tip-card p { margin: 0 0 10px; font-size: 14px; }
+@media (max-width: 380px) { .level-name { font-size: 36px; } .ls b { font-size: 8.5px; } .ls.on b { font-size: 9.5px; } }
+.level-card.lv5 { box-shadow: inset 0 7px 0 var(--lv), 0 0 0 3px var(--bad); }

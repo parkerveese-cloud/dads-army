@@ -407,9 +407,9 @@
   }
 
   function renderSitrep(el) {
-    if (!S.items.length) { el.innerHTML = warnCard(false) + emptyCard(); return; }
+    if (!S.items.length) { el.innerHTML = levelCard() + warnCard(false) + emptyCard(); return; }
     var st = S.settings, r = readiness(), target = st.target_days;
-    var html = warnCard(false);
+    var html = levelCard() + dashNote() + warnCard(false);
 
     // Hero: how long could we hold out?
     if (r.people === 0) {
@@ -1113,6 +1113,174 @@
   }
 
   // ------------------------------------------------------------------
+  // Household alert level (worked out on the Pi: warnings + home sensors + stores)
+  // ------------------------------------------------------------------
+  var SRC_CLASS = { 'UK Government': 'gov', 'SAS Survival Handbook': 'sas', 'Fire & rescue services': 'fire',
+    'Dads Army tip': 'tip', 'Electricity networks': 'net' };
+  var LEVEL_RULES = {
+    5: ['An Emergency Alert', 'A severe flood warning', 'A gas, carbon monoxide or smoke alarm going off'],
+    4: ['A red weather warning', 'A flood warning', 'A power cut over 12 hours, or with the backup battery under 20%',
+      'The coldest room under 9°C, or the warmest 33°C or more', 'PM2.5 air pollution of 75 µg/m³ or more'],
+    3: ['An amber weather warning', 'A possible fire within 3 km', 'A power cut', 'A water leak',
+      'The coldest room under 12°C, or the warmest 30°C or more', '−10°C or colder, or 35°C or hotter, outside',
+      'PM2.5 of 55 µg/m³ or more'],
+    2: ['A yellow weather warning', 'A flood alert', 'A disaster near the UK', 'A possible fire nearby',
+      'The coldest room under 16°C, or the warmest 27°C or more', '−5°C or colder, or 30°C or hotter, outside',
+      'Humidity of 80% or more indoors', 'The internet down', 'PM2.5 of 35 µg/m³ or more',
+      'Food or water that wouldn\'t last 3 days', 'Kit under half stocked'],
+    1: ['None of the above']
+  };
+
+  function levelScale(sit) {
+    return '<div class="level-scale" role="img" aria-label="' + esc(sit.name + ', level ' + sit.level + ' of 5') + '">' +
+      sit.scale.map(function (x) {
+        return '<span class="ls lv' + x.level + (x.level === sit.level ? ' on' : '') + '"><i></i><b>' + esc(x.name) + '</b></span>';
+      }).join('') + '</div>';
+  }
+  function levelCard() {
+    var sit = S.situation;
+    if (!sit) return '';
+    var why = sit.reasons.slice(0, 3).map(function (r) { return r.title; });
+    var more = sit.reasons.length - why.length;
+    return '<section class="card level-card lv' + sit.level + '">' +
+      '<div class="level-top"><span class="eyebrow">Household alert level</span>' +
+      '<button class="info-btn" data-act="level-help" aria-label="What the alert levels mean">i</button></div>' +
+      '<button class="level-main" data-act="level-open"><span class="level-name">' + esc(sit.name) + '</span>' +
+      '<span class="level-meaning">' + esc(sit.meaning) + '</span></button>' +
+      levelScale(sit) +
+      '<p class="level-why">' + (why.length ? '<b>Why:</b> ' + esc(why.join(' · ')) + (more > 0 ? ' and ' + more + ' more' : '') +
+        (sit.escalated ? '. Raised to SEVERE because the stores wouldn\'t last 3 days.' : '')
+        : 'Nothing is raising the level.') + '</p>' +
+      '<button class="btn block" data-act="level-open">What to do now</button></section>';
+  }
+  function guidanceList(items) {
+    return '<ul class="guidance">' + items.map(function (g) {
+      return '<li><span class="src src-' + (SRC_CLASS[g.source] || 'tip') + '">' + esc(g.label) + '</span>' + esc(g.text) + '</li>';
+    }).join('') + '</ul>';
+  }
+  function readingText(r) {
+    if (!r.ok) return r.state === 'missing' ? 'not found' : 'unavailable';
+    var v = parseFloat(r.value);
+    return isFinite(v) && r.unit ? fq(Math.round(v * 10) / 10) + (r.unit === '%' ? '%' : ' ' + r.unit) : String(r.state);
+  }
+  function homeReadings() {
+    var h = S.home, roles = HOME_ROLES, rows = [];
+    if (!h) return '';
+    roles.forEach(function (role) {
+      (h.readings[role[0]] || []).forEach(function (r) {
+        rows.push('<div class="src-status"><span>' + esc(r.name) + '<span class="small muted"> · ' + esc(role[1]) + '</span></span>' +
+          '<span class="small' + (r.ok ? ' muted' : ' err') + '">' + esc(readingText(r)) + '</span></div>');
+      });
+    });
+    return rows.join('');
+  }
+  var HOME_ROLES = [['indoor_temp', 'Indoor temperature'], ['outdoor_temp', 'Outdoor temperature'], ['humidity', 'Humidity'],
+    ['power', 'Mains power'], ['battery', 'Backup battery'], ['gas_alarm', 'Gas or CO alarm'], ['smoke_alarm', 'Smoke alarm'],
+    ['leak', 'Leak sensor'], ['internet', 'Internet'], ['air', 'Air quality']];
+
+  function sheetLevel() {
+    var sit = S.situation;
+    if (!sit) return null;
+    var h = S.home, readings = homeReadings();
+    return sheetHead('Household alert level', 'Where the household stands, and what to do', '🛡️') +
+      '<div class="level-card lv' + sit.level + ' in-sheet"><span class="level-name">' + esc(sit.name) + '</span>' +
+      '<span class="level-meaning">' + esc(sit.meaning) + '</span>' + levelScale(sit) + '</div>' +
+      '<h3>Why</h3>' + (sit.reasons.length ? '<ul class="why">' + sit.reasons.map(function (r) {
+        return '<li><span class="ls-chip lv' + r.level + '">' + esc(r.name) + '</span>' + esc(r.title) + '</li>';
+      }).join('') + '</ul>' : '<p class="small muted">Nothing is raising the level.</p>') +
+      (sit.escalated ? '<p class="small">Raised to SEVERE because the stores wouldn\'t last 3 days, so you\'d be less able to cope.</p>' : '') +
+      (sit.notes.length ? '<p class="small muted">Also worth knowing: ' + esc(sit.notes.join(' · ')) + '</p>' : '') +
+      '<h3>What to do now</h3>' + guidanceList(sit.guidance) +
+      '<p class="small muted">UK Government advice is put into plain words, not quoted. SAS statements apply the SAS Survival Handbook\'s PLAN priorities to a home. ' +
+      '<button type="button" class="link" data-act="level-help">More about the levels and sources</button></p>' +
+      (h ? '<h3>Home sensors</h3>' + (readings || '<p class="small muted">No home sensors chosen yet. Temperatures, power, alarms and more can raise or lower the level.</p>') +
+        '<button class="btn block" style="margin-top:10px" data-act="home-sensors">' + (readings ? 'Change home sensors' : 'Choose home sensors') + '</button>' : '') +
+      '<p class="small muted" style="margin-top:14px">Always follow official advice and the emergency services. In an emergency, call 999.</p>';
+  }
+
+  function sheetLevelHelp() {
+    var sit = S.situation, scale = sit ? sit.scale.slice().reverse() : [];
+    return sheetHead('What the levels mean', 'The household alert level, explained', 'ℹ️') +
+      '<p>Dads Army works out a <b>household alert level</b> from the warnings in force where you live, your home\'s own sensors, ' +
+      'and how long your stores would last. It shows where the household should consider itself, and what to do about it.</p>' +
+      '<div class="level-defs">' + scale.map(function (x) {
+        return '<div class="level-def"><span class="ls-chip lv' + x.level + '">' + esc(x.name) + '</span><p>' + esc(x.meaning) + '</p>' +
+          '<p class="small muted"><b>Raised to ' + esc(x.name) + ' by:</b> ' + esc(LEVEL_RULES[x.level].join('; ')) + '.</p></div>';
+      }).join('') + '</div>' +
+      '<p class="small">The level is the most serious of these. If it\'s SUBSTANTIAL and your food or water wouldn\'t last 3 days, ' +
+      'it goes up to SEVERE, because you\'d be less able to cope. Only real danger makes it CRITICAL. UKHSA advises heating the rooms you use to at least 18°C, so below that you get cold-weather advice even at LOW.</p>' +
+      '<h3>The UK\'s own levels</h3>' +
+      '<p class="small">The names are the UK\'s five national threat levels, the nearest British equivalent to America\'s DEFCON. They\'re set by MI5\'s Joint Terrorism Analysis Centre: ' +
+      esc(scale.slice().reverse().map(function (x) { return x.name + ' (' + x.mi5 + ')'; }).join('; ')) + '. ' +
+      'This is the household\'s own level, not the national one. <a href="https://www.mi5.gov.uk/threat-levels" target="_blank" rel="noopener noreferrer">See the national threat level</a>.</p>' +
+      '<h3>Where the advice comes from</h3><ul class="guidance">' +
+      '<li><span class="src src-gov">UK Government</span>Prepare (gov.uk), the NHS, UKHSA, the Met Office, the Environment Agency, DEFRA, Ofgem, the Foreign Office and the Fire Kills campaign. Put into plain statements, not quoted word for word.</li>' +
+      '<li><span class="src src-sas">SAS Survival Handbook</span>John “Lofty” Wiseman\'s PLAN priorities: Protection, Location, Acquisition (of water and food) and Navigation, applied to a household. Paraphrased, not quoted.</li>' +
+      '<li><span class="src src-fire">Fire &amp; rescue services</span>Their standard advice on wildfires and smoke.</li>' +
+      '<li><span class="src src-net">Electricity networks</span>The national power cut number, 105.</li>' +
+      '<li><span class="src src-tip">Dads Army tip</span>Practical hints from the app itself.</li></ul>' +
+      '<p class="small muted">Always follow official advice and the emergency services. In an emergency, call 999.</p>';
+  }
+
+  function sheetHomeSensors(s) {
+    var d = s.data;
+    if (!d) return sheetHead('Home sensors', 'From Home Assistant', '🌡️') + '<p class="small muted">Asking Home Assistant…</p>';
+    if (d.error) return sheetHead('Home sensors', 'From Home Assistant', '🌡️') + '<p class="small ha-error">' + esc(d.error) + '</p>';
+    var cfg = s.pick || d.config;
+    var html = sheetHead('Home sensors', 'Sensors that change the alert level', '🌡️') +
+      '<p class="small muted">Choose the Home Assistant sensors Dads Army should watch. Temperatures, humidity, power, alarms, leaks, the internet and air quality ' +
+      'can raise the household alert level, and bring advice for the situation. Nothing is used until you save.</p>' +
+      '<button type="button" class="btn block" data-act="hs-suggest" style="margin-bottom:12px">Suggest sensors for me</button>' +
+      '<form id="homeSensorsForm" novalidate>';
+    d.roles.forEach(function (role) {
+      var c = d.candidates[role.key] || [], chosen = cfg[role.key];
+      var picked = role.multiple ? (chosen || []) : (chosen ? [chosen] : []);
+      html += '<details class="hs-role"' + (picked.length ? ' open' : '') + '><summary><b>' + esc(role.label) + '</b>' +
+        '<span class="small muted">' + (picked.length ? picked.length + ' chosen' : c.length ? c.length + ' found' : 'none found') + '</span></summary>' +
+        (role.hint ? '<p class="small muted">' + esc(role.hint) + '</p>' : '');
+      if (!c.length) {
+        html += '<p class="small muted">Home Assistant has nothing of this kind.</p>';
+      } else if (role.multiple) {
+        html += c.map(function (x) {
+          return '<label class="opt"><input type="checkbox" name="hs_' + role.key + '" value="' + esc(x.entity_id) + '"' + (picked.indexOf(x.entity_id) >= 0 ? ' checked' : '') + '>' +
+            '<span>' + esc(x.name) + '<span class="small muted">' + esc(x.state + (x.unit ? ' ' + x.unit : '')) + ' · ' + esc(x.entity_id) + '</span></span></label>';
+        }).join('');
+      } else {
+        html += '<select name="hs_' + role.key + '" aria-label="' + esc(role.label) + '"><option value="">Not used</option>' + c.map(function (x) {
+          return '<option value="' + esc(x.entity_id) + '"' + (picked[0] === x.entity_id ? ' selected' : '') + '>' + esc(x.name + ' (' + x.state + (x.unit ? ' ' + x.unit : '') + ')') + '</option>';
+        }).join('') + '</select>';
+      }
+      html += '</details>';
+    });
+    return html + '<div class="sheet-actions"><button class="btn primary block" type="submit">Save</button></div></form>';
+  }
+  function homeSensorsForm(f, roles) {
+    var out = {};
+    roles.forEach(function (role) {
+      if (role.multiple) out[role.key] = $$('input[name="hs_' + role.key + '"]:checked', f).map(function (i) { return i.value; });
+      else out[role.key] = f.elements['hs_' + role.key] ? f.elements['hs_' + role.key].value : '';
+    });
+    return out;
+  }
+  function homeCard() {
+    var h = S.home;
+    if (!h) return '';
+    var readings = homeReadings();
+    return '<section class="card"><div class="card-head"><h2>Home sensors</h2></div>' +
+      (readings ? readings : '<p class="small muted">Let your Home Assistant sensors (temperatures, humidity, power, gas and smoke alarms, leaks, the internet, ' +
+        'air quality) raise or lower the household alert level, and bring advice for the situation.</p>') +
+      '<button class="btn block" style="margin-top:10px" data-act="home-sensors">' + (readings ? 'Change home sensors' : 'Choose home sensors') + '</button></section>';
+  }
+  function dashNote() {
+    var ha = S.server.ha;
+    if (!ha || !ha.dash_outdated) return '';
+    try { if (localStorage.getItem('da-dash-note') === 'layout2') return ''; } catch (e) { /* show it */ }
+    return '<div class="card tip-card"><p><b>New for the Home front dashboard:</b> the household alert level, at the top. Update the dashboard to add it.</p>' +
+      '<div class="btn-row"><button class="btn small" data-act="ha-dash" data-again="1">Update the dashboard</button>' +
+      '<button class="btn small" data-act="dash-note-hide">Not now</button></div></div>';
+  }
+
+  // ------------------------------------------------------------------
   // Help, and the guided set-up of the Home front dashboard
   // ------------------------------------------------------------------
   var dashOffered = false;   // offered once per visit at most (and the Pi remembers "not now")
@@ -1137,6 +1305,8 @@
     return sheetHead('Help', 'Getting the most from Dads Army', '❔') +
       '<div class="list help-list">' +
       (ha ? row('📊', 'Put Dads Army on your Home Assistant dashboard', 'Tiles for warnings, today\'s checklist, readiness and the stores', 'dash-wizard') : '') +
+      row('🛡️', 'What the household alert level means', 'LOW to CRITICAL, and how it\'s worked out', 'level-help') +
+      (ha ? row('🌡️', 'Choose home sensors', 'Temperatures, power, alarms and more can change the alert level', 'home-sensors') : '') +
       row('📢', 'Warnings for where you live', 'Met Office, floods, Emergency Alerts, fires', 'warn-set') +
       row('📋', 'Routine checks and your emergency plan', 'On the Plan tab', 'help-go', ' data-view="plan"') +
       row('🛒', 'Shopping for what\'s missing', 'The Supply run tab lists everything below target', 'help-go', ' data-view="supply"') +
@@ -1298,7 +1468,7 @@
       'Anything you already have is skipped. To clear out what you don\'t need, use <b>Select to delete</b> in Stores.</p>' +
       '<button class="btn block" data-act="seed">Load starter list</button></section>';
 
-    html += warnHqCard() + haCard();
+    html += warnHqCard() + homeCard() + haCard();
 
     html += '<section class="card"><div class="card-head"><h2>Appearance</h2></div><div class="seg" role="group" aria-label="Theme">' +
       [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']].map(function (t) {
@@ -1501,7 +1671,8 @@
     if (!s) return;
     var html = {
       item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText, halists: sheetHaLists,
-      check: sheetCheck, plan: sheetPlan, warning: sheetWarning, warnset: sheetWarnSet, help: sheetHelp, dashwiz: sheetDashWiz
+      check: sheetCheck, plan: sheetPlan, warning: sheetWarning, warnset: sheetWarnSet, help: sheetHelp, dashwiz: sheetDashWiz,
+      level: sheetLevel, levelhelp: sheetLevelHelp, homesensors: sheetHomeSensors
     }[s.type](s);
     if (html === null) {   // the item was deleted elsewhere
       closeSheet();
@@ -1907,6 +2078,27 @@
         return checkWarnings(a);
       case 'help':
         return openSheet({ type: 'help' });
+      case 'level-open':
+        return openSheet({ type: 'level' });
+      case 'level-help':
+        return openSheet({ type: 'levelhelp' });
+      case 'home-sensors': {
+        var hs = { type: 'homesensors', data: null };
+        openSheet(hs);
+        return api('GET', 'api/homeassistant/sensors').then(function (d) { hs.data = d; }, function (e) {
+          hs.data = { error: e.message };
+        }).then(function () { if (stack[stack.length - 1] === hs) renderSheet(); });
+      }
+      case 'hs-suggest': {
+        var top2 = stack[stack.length - 1];
+        if (!top2 || top2.type !== 'homesensors' || !top2.data || !top2.data.suggested) return;
+        top2.pick = top2.data.suggested;
+        renderSheet();
+        return toast('Suggestions ticked. Check them, then Save.');
+      }
+      case 'dash-note-hide':
+        try { localStorage.setItem('da-dash-note', 'layout2'); } catch (e) { /* fine */ }
+        return render();
       case 'help-go': {
         var dest = a.dataset.view;
         closeSheet();
@@ -2160,6 +2352,20 @@
         return api('PUT', 'api/plan', plan).then(function () {
           closeSheet();
           return refresh().then(function () { toast('Plan saved'); });
+        });
+      }, btn);
+    }
+    if (f.id === 'homeSensorsForm') {
+      var hsTop = stack[stack.length - 1];
+      var picks = homeSensorsForm(f, hsTop.data.roles);
+      var n = Object.keys(picks).reduce(function (a, k) { return a + (Array.isArray(picks[k]) ? picks[k].length : picks[k] ? 1 : 0); }, 0);
+      return run(function () {
+        return api('PUT', 'api/homeassistant/sensors', picks).then(function () {
+          closeSheet();
+          toast('Saved. Reading ' + n + ' sensor' + (n === 1 ? '' : 's') + '…');
+          return new Promise(function (ok) { setTimeout(ok, 2500); }).then(refresh).then(function () {
+            toast(n ? 'Watching ' + n + ' home sensor' + (n === 1 ? '' : 's') + '. Alert level: ' + S.situation.name : 'Not watching any home sensors');
+          });
         });
       }, btn);
     }
