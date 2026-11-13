@@ -79,6 +79,11 @@
   var toastTimer = null;
   var settingsQueue = {};
   var settingsTimer = null;
+  var lastStateJson = '';       // the last /api/state seen, to skip redrawing when nothing changed
+  var reqSeq = 0, reqApplied = 0;   // refreshes can overlap: only the newest answer counts
+  var shopBusy = {};            // supply run extras with a tick on its way to HQ
+  var searchTimer = null;
+  var UNREACHABLE = "Can't reach Dads Army. Check Home Assistant is running and you're connected.";
 
   // ------------------------------------------------------------------
   // Helpers
@@ -90,8 +95,15 @@
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
   }
-  function num(v) { var n = parseFloat(v); return isFinite(n) ? n : 0; }
-  var nf = new Intl.NumberFormat('en-GB', { maximumFractionDigits: 2 });
+  // A typed number, allowing a comma for the decimal point ("1,5"). NaN if it isn't a number.
+  function parseQty(v) {
+    v = String(v == null ? '' : v).replace(/\s+/g, '');
+    if (/^[+-]?\d*,\d+$/.test(v)) v = v.replace(',', '.');
+    if (!/^[+-]?(\d+\.?\d*|\.\d+)$/.test(v)) return NaN;
+    return parseFloat(v);
+  }
+  function num(v) { var n = parseQty(v); return isFinite(n) ? n : 0; }
+  var nf = new Intl.NumberFormat('en-GB', { maximumFractionDigits: 3 });
   var nf0 = new Intl.NumberFormat('en-GB', { maximumFractionDigits: 0 });
   function fq(q) { return nf.format(Math.round(q * 1000) / 1000); }
 
@@ -145,11 +157,14 @@
     if (n < 60) return Math.round(n / 7) + 'w left';
     return Math.round(n / 30.44) + 'mo left';
   }
-  function expState(s) {
+  function warnDays(category) {
+    return (S.settings.category_warn_days || {})[category] || S.settings.warn_days;
+  }
+  function expState(s, category) {
     if (!s) return 'none';
     var n = daysUntil(s);
     if (n < 0) return 'bad';
-    if (n <= S.settings.warn_days) return 'warn';
+    if (n <= warnDays(category)) return 'warn';
     return 'ok';
   }
   function ago(ts) {
@@ -168,7 +183,7 @@
     if (d >= 10) return nf0.format(Math.floor(d));
     return String(Math.floor(d * 10) / 10);
   }
-  function addDays(s, n) { var d = parseYmd(s); d.setDate(d.getDate() + n); return ymd(d); }
+  function dateAdd(s, n) { var d = parseYmd(s); d.setDate(d.getDate() + n); return ymd(d); }
   var nf2 = new Intl.NumberFormat('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   function money(v) { return '£' + (v >= 100 ? nf0.format(Math.round(v)) : nf2.format(v)); }
   function lastsWords(d) { return d <= 0 ? 'run out' : d < 1 ? 'less than a day' : span(Math.floor(d)); }
@@ -201,18 +216,25 @@
     return null;
   }
   function total(it) { return it.batches.reduce(function (a, b) { return a + b.qty; }, 0); }
+  // In-date stock: what counts towards the target (expired stock needs replacing).
+  function fresh(it) {
+    return it.batches.reduce(function (a, b) { return a + (b.expiry && daysUntil(b.expiry) < 0 ? 0 : b.qty); }, 0);
+  }
   function info(it) {
-    var tot = total(it), soonest = null;
+    var tot = total(it), good = fresh(it), soonest = null;
     it.batches.forEach(function (b) {
       if (b.expiry && b.qty > 0 && (soonest === null || b.expiry < soonest)) soonest = b.expiry;
     });
     return {
       total: tot,
+      fresh: good,
+      expired: Math.round((tot - good) * 1000) / 1000,
       soonest: soonest,
-      exp: soonest ? expState(soonest) : 'none',
-      low: it.target_qty > 0 && tot < it.target_qty,
-      out: tot <= 0,
-      short: Math.max(0, Math.round((it.target_qty - tot) * 1000) / 1000)
+      exp: soonest ? expState(soonest, it.category) : 'none',
+      low: it.target_qty > 0 && good < it.target_qty,
+      out: good <= 0,
+      none: tot <= 0,
+      short: Math.max(0, Math.round((it.target_qty - good) * 1000) / 1000)
     };
   }
   function locations() {
@@ -245,7 +267,7 @@
   // Routine checks
   function checkInfo(c) {
     if (!c.last_done) return { due: null, days: null, state: 'never', text: 'Not done yet' };
-    var due = addDays(c.last_done, c.every_days), d = daysUntil(due);
+    var due = dateAdd(c.last_done, c.every_days), d = daysUntil(due);
     if (d < 0) return { due: due, days: d, state: 'bad', text: 'Overdue by ' + span(-d) };
     if (d === 0) return { due: due, days: 0, state: 'bad', text: 'Due today' };
     return { due: due, days: d, state: d <= 7 ? 'warn' : 'ok', text: 'Due in ' + span(d) };
@@ -261,9 +283,9 @@
 
   function readiness() {
     var st = S.settings;
-    var people = st.adults + st.children;
-    var kcalDay = st.adults * st.kcal_adult + st.children * st.kcal_child;
-    var waterDay = people * st.water_per_person;
+    var people = st.adults + st.children, pets = st.pets || 0;
+    var kcalDay = st.adults * st.kcal_adult + st.children * st.kcal_child + pets * (st.kcal_per_pet || 0);
+    var waterDay = people * st.water_per_person + pets * (st.water_per_pet || 0);
     var r = { people: people, kcalDay: kcalDay, waterDay: waterDay, kcal: 0, kcalOld: 0, litres: 0, litresOld: 0, noKcal: 0 };
     S.items.forEach(function (it) {
       var food = it.category === 'food', water = it.category === 'water' && it.litres_per_unit > 0;
@@ -284,7 +306,7 @@
     r.waterOldDays = waterDay > 0 ? r.litresOld / waterDay : 0;
     var kit = S.items.filter(function (it) { return it.target_qty > 0 && it.category !== 'food' && it.category !== 'water'; });
     r.kit = kit.length;
-    r.kitPct = kit.length ? kit.reduce(function (a, it) { return a + Math.min(1, total(it) / it.target_qty); }, 0) / kit.length : 0;
+    r.kitPct = kit.length ? kit.reduce(function (a, it) { return a + Math.min(1, fresh(it) / it.target_qty); }, 0) / kit.length : 0;
     r.hold = Math.min(r.foodDays, r.waterDays);
     r.limit = r.foodDays < r.waterDays ? 'food' : r.waterDays < r.foodDays ? 'water' : '';
     // Things with a daily use, shortest-lasting first.
@@ -307,7 +329,15 @@
   function api(method, path, body) {
     var opt = { method: method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store' };
     if (body !== undefined) opt.body = JSON.stringify(body);
+    if (method !== 'GET') dropUndo();   // a later change: an older Undo could now wipe it out
     return fetch(path, opt).then(function (res) {
+      // Signed out of Home Assistant, or a proxy saying Dads Army isn't there: not an answer from HQ.
+      var ours = !!res.headers.get('X-Dads-Army');
+      var json = /application\/json/i.test(res.headers.get('Content-Type') || '');
+      if (!json || (!ours && [401, 502, 503, 504].indexOf(res.status) >= 0)) {
+        setOnline(false);
+        throw new Error(UNREACHABLE);
+      }
       setOnline(true);
       return res.json().catch(function () { return {}; }).then(function (data) {
         if (!res.ok) throw new Error(data.error || ('Error ' + res.status));
@@ -315,16 +345,29 @@
       });
     }, function () {
       setOnline(false);
-      throw new Error("Can't reach HQ - check the Pi and your Wi-Fi.");
+      throw new Error(UNREACHABLE);
     });
   }
   function refresh() {
+    var n = ++reqSeq;
     return api('GET', 'api/state').then(function (data) {
+      if (n < reqApplied) return;   // an older request answering late
+      reqApplied = n;
+      var server = data.server || {};
+      var json = JSON.stringify(data, function (k, v) { return this === server && k === 'time' ? undefined : v; });
+      if (json === lastStateJson && S) return;   // nothing changed: don't redraw (or re-announce) anything
+      lastStateJson = json;
       S = data;
       updateDatalists();
-      render();
+      if (hqTyping()) updateHQ();   // don't wipe out a setting that's being typed
+      else render();
       maybeOfferDashboard();
     });
+  }
+  // Something in HQ has focus: a field being typed in, or about to be.
+  function hqTyping() {
+    var a = document.activeElement;
+    return view === 'hq' && !stack.length && a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && !!a.closest('#view');
   }
   function run(fn, btn) {
     if (btn) btn.disabled = true;
@@ -336,13 +379,37 @@
   // ------------------------------------------------------------------
   // Rendering: shell
   // ------------------------------------------------------------------
+  // A selector for an element that survives a redraw (same id, name or action), to keep focus on it.
+  function focusKey(el) {
+    if (!el || el === document.body || !el.getAttribute) return null;
+    var sel = el.tagName.toLowerCase(), any = false;
+    ['id', 'name', 'data-act', 'data-id', 'data-setting', 'data-step', 'data-d', 'data-key', 'data-val', 'data-cat', 'data-tab', 'data-catwarn'].forEach(function (a) {
+      var v = el.getAttribute(a);
+      if (v === null) return;
+      any = true;
+      sel += '[' + a + '="' + String(v).replace(/["\\]/g, '\\$&') + '"]';
+    });
+    return any ? sel : null;
+  }
+  function refocus(key, within) {
+    if (!key) return false;
+    var el = $(key, within);
+    if (!el) return false;
+    if (el !== document.activeElement) {
+      try { el.focus({ preventScroll: true }); } catch (e) { el.focus(); }
+    }
+    return true;
+  }
+
   function render() {
+    var a = document.activeElement;
+    var keep = a && a.closest && a.closest('#view') ? focusKey(a) : null;
     $$('.tab').forEach(function (t) { t.setAttribute('aria-current', t.dataset.tab === view ? 'page' : 'false'); });
     var el = $('#view');
     if (!S) {
       el.dataset.view = '';
       el.innerHTML = offline
-        ? '<div class="card empty"><div class="crate">📡</div><h2>No signal from HQ</h2><p>The app couldn\'t reach the Pi. Check it\'s switched on and this phone is on the home Wi-Fi.</p><button class="btn primary" data-act="retry">Try again</button></div>'
+        ? '<div class="card empty"><div class="crate">📡</div><h2>No signal from HQ</h2><p>The app couldn\'t reach Dads Army. Check Home Assistant is running and you\'re connected.</p><button class="btn primary" data-act="retry">Try again</button></div>'
         : '<div class="loading">Mustering the troops…</div>';
       return;
     }
@@ -355,7 +422,9 @@
       else if (view === 'hq') renderHQ(el);
       else renderSitrep(el);
     }
+    mountIntelMap();   // the live alerts map lives on the Sitrep (and is tidied away elsewhere)
     if (stack.length && /^(item|area|resall)$/.test(stack[stack.length - 1].type)) renderSheet();
+    if (keep && !stack.length) refocus(keep, el);
   }
 
   function updateBadge() {
@@ -377,140 +446,843 @@
     $('#dl-locations').innerHTML = locations().map(function (l) { return '<option value="' + esc(l) + '">'; }).join('');
   }
 
+  // ------------------------------------------------------------------
+  // First run: nothing in the stores yet (also shown by Stores when it's empty)
+  // ------------------------------------------------------------------
   function emptyCard() {
-    var st = S.settings;
-    return '<div class="card empty"><div class="crate">📦</div><h2>Stores are empty</h2>' +
-      '<p>Load a starter list of essentials sized for your household, or add your own items one at a time.</p>' +
-      '<div class="btn-stack"><button class="btn primary block" data-act="seed">Load starter list</button>' +
-      '<button class="btn block" data-act="new">' + ICON.plus + ' Add an item</button></div></div>' +
-      '<div class="card"><p class="small muted" style="margin:0">Starter targets will be sized for <b>' +
-      st.adults + ' adult' + (st.adults === 1 ? '' : 's') + '</b> and <b>' + st.children + ' child' + (st.children === 1 ? '' : 'ren') +
-      '</b> over <b>' + st.target_days + ' days</b>. <button class="link" data-tab="hq">Change household</button></p></div>';
+    var st = S.settings, who = srHousehold(st);
+    var steps = [
+      ['Who you\'re feeding',
+        who ? 'Set for <b>' + esc(who) + '</b>. Targets are sized from this and keep up if it changes.'
+          : 'Tell HQ who lives with you, so the targets fit your household.',
+        '<button class="btn small" data-tab="hq">' + (who ? 'Change household' : 'Set up household') + '</button>'],
+      ['Your target',
+        'Enough food and water to last <b>' + esc(st.target_days) + ' days</b>. You can change it at any time.',
+        '<button class="btn small" data-tab="hq">Change target</button>'],
+      ['Fill the stores',
+        'Load about 95 suggested essentials at zero stock, then add what you already have. Or start from scratch.',
+        '<button class="btn small primary" data-act="seed">Load starter list</button>' +
+        '<button class="btn small" data-act="new">' + ICON.plus + ' Add an item</button>']
+    ];
+    return '<section class="card sr-first">' +
+      '<div class="sr-first-head"><div class="card-kicker">Getting started</div>' +
+      '<h2 class="sr-first-title">Let\'s get the stores in order</h2>' +
+      '<p class="card-sub">Three steps, and the Sitrep fills in: how long you could hold out, what to use first and what to buy.</p></div>' +
+      '<ol class="sr-steps">' + steps.map(function (s, i) {
+        return '<li class="sr-step"><span class="sr-step-n" aria-hidden="true">' + (i + 1) + '</span>' +
+          '<div class="sr-step-body"><h3 class="sr-step-title">' + s[0] + '</h3><p>' + s[1] + '</p>' +
+          '<div class="sr-step-btns">' + s[2] + '</div></div></li>';
+      }).join('') + '</ol></section>';
   }
 
   // ------------------------------------------------------------------
   // Sitrep
   // ------------------------------------------------------------------
-  function meter(label, value, frac, note) {
-    var state = stateOf(frac);
-    var pct = Math.max(0, Math.min(100, frac * 100));
-    return '<div class="meter" data-state="' + state + '">' +
-      '<div class="meter-head"><span class="meter-label">' + label + '</span><span class="meter-val">' + value + '</span></div>' +
-      '<div class="meter-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + Math.round(pct) + '"><div class="meter-fill" style="width:' + pct.toFixed(1) + '%"></div></div>' +
-      (note ? '<div class="meter-note">' + note + '</div>' : '') + '</div>';
-  }
-  function tile(n, label, state, show) {
-    var s = n === 0 ? 'good' : state;
-    return '<button class="tile" data-state="' + s + '" data-act="go" data-show="' + show + '">' +
-      '<span class="tile-top"><span class="tile-num">' + n + '</span><span class="tile-ico">' + statusIcon(s) + '</span></span>' +
-      '<span class="tile-label">' + label + '</span></button>';
-  }
+  var SR_GRID = null;   // the Sitrep grid last drawn: while it's still on screen, a redraw is a refresh (charts don't animate)
+  var SR_ICO = {
+    clock: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8v4.5l3 2"/></svg>',
+    swap: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 10a7 7 0 0 1 12.2-3.6M19 14a7 7 0 0 1-12.2 3.6M17.5 3v3.6h-3.6M6.5 21v-3.6h3.6"/></svg>',
+    cart: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4.5h2.2l2.1 10a1.5 1.5 0 0 0 1.5 1.2h8.3a1.5 1.5 0 0 0 1.5-1.1L20 8.5H6"/><circle cx="9.5" cy="19.5" r="1.2"/><circle cx="17" cy="19.5" r="1.2"/></svg>',
+    alert: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4.5l8.5 15h-17z"/><path d="M12 10.5v4M12 17.2v.01"/></svg>',
+    bell: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 16v-5a5.5 5.5 0 0 1 11 0v5l1.5 2h-14z"/><path d="M10 20.5a2 2 0 0 0 4 0"/></svg>',
+    people: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0"/><circle cx="17" cy="9" r="2.2"/><path d="M15.8 14.1a4.5 4.5 0 0 1 4.7 4.4"/></svg>',
+    trend: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 17l5-5 3.5 3.5L20 8"/><path d="M15 8h5v5"/></svg>'
+  };
+  // Units that read well as "3 tins of chopped tomatoes".
+  var SR_OF = { tin: 1, jar: 1, pack: 1, bag: 1, bottle: 1, box: 1, carton: 1, bar: 1, roll: 1, tube: 1, tub: 1, canister: 1, kg: 1, g: 1, litre: 1 };
 
-  function renderSitrep(el) {
-    if (!S.items.length) { el.innerHTML = levelCard() + warnCard(false) + emptyCard() + resilienceCard(); return; }
-    var st = S.settings, r = readiness(), target = st.target_days;
-    var html = levelCard() + dashNote() + warnCard(false) + resilienceCard();
+  function srHousehold(st) {
+    var bits = [];
+    if (st.adults) bits.push(st.adults + ' adult' + (st.adults === 1 ? '' : 's'));
+    if (st.children) bits.push(st.children + (st.children === 1 ? ' child' : ' children'));
+    if (st.pets) bits.push(st.pets + ' pet' + (st.pets === 1 ? '' : 's'));
+    return bits.length > 1 ? bits.slice(0, -1).join(', ') + ' and ' + bits[bits.length - 1] : bits.join('');
+  }
+  function srDate(s) {   // "24 Nov", with the year when it isn't this year
+    var d = parseYmd(s), o = { day: 'numeric', month: 'short' };
+    if (d.getFullYear() !== new Date().getFullYear()) o.year = 'numeric';
+    return d.toLocaleDateString('en-GB', o);
+  }
+  function srName(it) {   // "chopped tomatoes" from "Chopped tomatoes (400g)", "AA batteries" left alone
+    var n = it.name.replace(/\s*\([^)]*\)\s*$/, '') || it.name;
+    return /^[A-Z][a-z]/.test(n) ? n.charAt(0).toLowerCase() + n.slice(1) : n;
+  }
+  function srThing(it, qty) {   // "3 tins of chopped tomatoes", "the first aid kit", "2 × head torch"
+    var u = (it.unit || '').toLowerCase(), n = srName(it);
+    if (SR_OF[u]) return qu(qty, it.unit) + ' of ' + n;
+    if (isMoney(it.unit)) return n + ' (' + qu(qty, it.unit) + ')';
+    return qty === 1 ? 'the ' + n : fq(qty) + ' × ' + n;
+  }
+  function srNames(list, max) {   // "Rice, tinned fish and 6 more"
+    var names = list.slice(0, max).map(function (it) { return it.name.replace(/\s*\([^)]*\)\s*$/, ''); });
+    var more = list.length - names.length;
+    if (more > 0) return names.join(', ') + ' and ' + more + ' more';
+    return names.length > 1 ? names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1] : names.join('');
+  }
+  function srN(n, one, many) { return n + ' ' + (n === 1 ? one : many); }
+  function srGap(a, b) { return Math.round((parseYmd(b) - parseYmd(a)) / 864e5); }
 
-    // Hero: how long could we hold out?
-    if (r.people === 0) {
-      html += '<section class="card hero"><div class="eyebrow">Situation report</div><p style="margin-top:10px">Tell HQ who you\'re feeding to see how long your stores will last.</p><button class="btn primary" data-tab="hq">Set up household</button></section>';
-    } else {
-      var hs = stateOf(r.hold / target);
-      var limit = r.limit === 'food' ? 'Food runs out first' : r.limit === 'water' ? 'Water runs out first' : '';
-      var foodNote = nf0.format(r.kcal) + ' kcal stored · ' + nf0.format(r.kcalDay) + ' needed a day';
-      if (r.foodOldDays >= 0.1) foodNote += ' · +' + fmtDays(r.foodOldDays) + ' days in expired stock';
-      if (r.noKcal) foodNote += ' · ' + r.noKcal + ' item' + (r.noKcal === 1 ? '' : 's') + ' with no calories set';
-      var waterNote = fq(Math.round(r.litres * 10) / 10) + ' L stored · ' + fq(r.waterDay) + ' L needed a day';
-      if (r.waterOldDays >= 0.1) waterNote += ' · +' + fmtDays(r.waterOldDays) + ' days past best-before';
-      var sup = r.supplies[0], supNote = '';
-      if (sup) {
-        supNote = '<button class="link" data-act="open" data-id="' + sup.it.id + '">' + esc(sup.it.name) + '</button> ' +
-          (sup.days > 0 ? 'runs out first' : 'has run out') +
-          (r.supplies.length > 1 ? ' · ' + r.supplies.length + ' things with a daily use' : '');
-      }
-      html += '<section class="card hero">' +
-        '<div class="eyebrow">You could hold out for</div>' +
-        '<div class="hero-num">' + fmtDays(r.hold) + '<small>' + (fmtDays(r.hold) === '1' ? 'day' : 'days') + '</small></div>' +
-        '<div class="hero-sub">' + pill(hs, hs === 'good' ? target + '-day target met' : 'Target ' + target + ' days') +
-        (limit ? '<span>' + limit + '</span>' : '') + '</div>' +
-        '<div class="meters">' +
-        meter('🥫 Food', fmtDays(r.foodDays) + ' of ' + target + ' days', r.foodDays / target, foodNote) +
-        meter('💧 Water', fmtDays(r.waterDays) + ' of ' + target + ' days', r.waterDays / target, waterNote) +
-        (sup ? meter('⏳ Daily supplies', fmtDays(sup.days) + ' of ' + target + ' days', sup.days / target, supNote) : '') +
-        '</div></section>';
+  // History, oldest first with today last, and the entry to compare today against: a week back if we have it.
+  function srHist() { return (S.history || []).filter(function (h) { return h && h.date; }); }
+  function srBack(hist) {
+    if (hist.length < 2) return null;
+    var last = hist[hist.length - 1], i, gap;
+    for (i = hist.length - 2; i >= 0; i--) {
+      gap = srGap(hist[i].date, last.date);
+      if (gap >= 7) return gap <= 10 ? { h: hist[i], when: 'this week', vs: 'on last week' } : null;
     }
+    gap = srGap(hist[0].date, last.date);
+    if (gap < 1) return null;
+    var since = 'since ' + (gap === 1 ? 'yesterday' : parseYmd(hist[0].date).toLocaleDateString('en-GB', { weekday: 'long' }));
+    return { h: hist[0], when: since, vs: since };
+  }
+  // A trend arrow with words. more: 'good' when going up is good, 'bad' when it's worse (expired and the like).
+  function srDelta(diff, text, more) {
+    var dir = Math.abs(diff) < 1e-9 ? 'flat' : diff > 0 ? 'up' : 'down';
+    return '<span class="delta ' + dir + (more === 'bad' ? ' invert' : '') + '">' + esc(text) + '</span>';
+  }
 
-    // Alert tiles
-    var cnt = { bad: 0, warn: 0, low: 0 };
+  function srCounts() {
+    var c = { expired: 0, soon: 0, low: 0, out: 0 };
     S.items.forEach(function (it) {
       var i = info(it);
-      if (i.exp === 'bad') cnt.bad++; else if (i.exp === 'warn') cnt.warn++;
-      if (i.low) cnt.low++;
+      if (i.exp === 'bad') c.expired++; else if (i.exp === 'warn') c.soon++;
+      if (i.low) c.low++;
+      if (i.out) c.out++;
     });
-    html += '<div class="tiles">' +
-      tile(cnt.bad, 'Expired', 'bad', 'expired') +
-      tile(cnt.warn, 'Expiring in ' + st.warn_days + ' days', 'warn', 'soon') +
-      tile(cnt.low, 'Below target', 'warn', 'low') + '</div>';
+    return c;
+  }
 
-    // Use first
+  // Hero: how long could we hold out, against what target, and which way it's heading.
+  function srHero(r, hist, anim) {
+    var st = S.settings, target = st.target_days;
+    if (r.people === 0) {
+      return '<section class="card col-8 sr-hero sr-hero-setup"><div class="card-kicker">Situation report</div>' +
+        '<h2 class="sr-setup-title">Who are you feeding?</h2>' +
+        '<p class="card-sub">Tell HQ who lives with you to see how long your food and water would last.</p>' +
+        '<div class="sr-step-btns"><button class="btn primary" data-tab="hq">Set up household</button></div></section>';
+    }
+    var hs = stateOf(r.hold / target), days = fmtDays(r.hold);
+    var limit = r.limit === 'food' ? 'Food runs out first' : r.limit === 'water' ? 'Water runs out first' : '';
+    var notes = [];
+    if (r.foodOldDays >= 0.1) notes.push(fmtDays(r.foodOldDays) + ' more days of food are past their date');
+    if (r.waterOldDays >= 0.1) notes.push(fmtDays(r.waterOldDays) + ' more days of water are past best-before');
+    if (r.noKcal) notes.push(srN(r.noKcal, 'food has', 'foods have') + ' no calories set, so don\'t count');
+
+    var html = '<section class="card col-8 sr-hero"><div class="sr-hero-top"><div class="sr-hero-main">' +
+      '<div class="card-kicker">Situation report</div>' +
+      '<h2 class="sr-hold"><span class="sr-hold-lead">You could hold out for</span> ' +
+      '<span class="sr-hold-num"><b>' + days + '</b> <span>' + (days === '1' ? 'day' : 'days') + '</span></span></h2>' +
+      '<div class="sr-hero-sub">' + pill(hs, hs === 'good' ? target + '-day target met' : 'Target ' + target + ' days') +
+      (limit ? '<span>' + limit + '</span>' : '') + '</div>' +
+      (notes.length ? '<p class="sr-hero-note">' + esc(notes.join(' · ')) + '</p>' : '') + '</div>';
+
+    var rings = [
+      { value: Math.round(r.foodDays * 10) / 10, max: target, color: 'food', label: 'Food', unit: 'days' },
+      { value: Math.round(r.waterDays * 10) / 10, max: target, color: 'water', label: 'Water', unit: 'days' }
+    ];
+    var legend = [
+      { label: 'Food', color: 'food', value: fmtDays(r.foodDays) + ' of ' + target + ' days' },
+      { label: 'Water', color: 'water', value: fmtDays(r.waterDays) + ' of ' + target + ' days' }
+    ];
+    if (r.kit) {
+      rings.push({ value: Math.round(r.kitPct * 100), max: 100, color: 'kit', label: 'Kit and supplies', unit: '%' });
+      legend.push({ label: 'Kit', color: 'kit', value: Math.round(r.kitPct * 100) + '% stocked' });
+    }
+    html += '<div class="sr-rings"><div class="sr-rings-chart">' + DAChart.rings({
+      rings: rings, size: 168, title: 'Against your ' + target + '-day target', noAnimate: !anim,
+      centre: { big: Math.min(999, Math.round(r.hold / target * 100)) + '%', small: 'of target' }
+    }) + '</div>' + DAChart.legend({ items: legend, vertical: true }) + '</div></div>';
+
+    // The trend: hold-out days a day at a time, against the target.
+    var back = srBack(hist), head = '';
+    if (back) {
+      var d = r.hold - (+back.h.hold_out_days || 0), ad = Math.abs(d);
+      var dt = ad < 0.05 ? 'No change ' + back.when : (d > 0 ? 'Up ' : 'Down ') + fmtDays(ad) + (fmtDays(ad) === '1' ? ' day ' : ' days ') + back.when;
+      head = srDelta(ad < 0.05 ? 0 : d, dt, 'good');
+    }
+    var span90 = hist.length ? srGap(hist[0].date, hist[hist.length - 1].date) + 1 : 0;
+    html += '<div class="sr-trend"><div class="sr-trend-head"><span class="sr-label">Hold-out days' +
+      (hist.length >= 3 ? ', last ' + srN(Math.min(span90, 120), 'day', 'days') : '') + '</span>' + head + '</div>';
+    if (hist.length >= 3) {
+      var top = 0;
+      hist.forEach(function (h) { top = Math.max(top, +h.hold_out_days || 0); });
+      html += '<div class="sr-trend-chart">' + DAChart.trend({
+        series: [{ name: 'Hold-out days', color: 'olive', points: hist.slice(-90).map(function (h) { return { x: h.date, y: h.hold_out_days }; }) }],
+        height: 150, target: target, targetLabel: 'Target ' + target + ' days', yUnit: 'days', title: 'Hold-out days',
+        yMax: Math.max(top, target) * 1.12, noAnimate: !anim
+      }) + '</div>';
+    } else {
+      html += '<div class="sr-trend-empty">' + SR_ICO.trend + '<div><b>Your trend builds up as the days go by.</b>' +
+        '<span>Dads Army notes how long you could hold out each day. In a few days you\'ll see which way it\'s heading.</span></div></div>';
+    }
+    return html + '</div></section>';
+  }
+
+  // Next actions: the few most useful things to do now, most pressing first.
+  function srActions(r) {
+    var st = S.settings, I = S.intel, acts = [], late = [];
+    if (r.people === 0) acts.push({ state: 'info', ico: SR_ICO.people, title: 'Tell HQ who you\'re feeding', sub: 'So Dads Army can work out how long your stores last', attrs: 'data-tab="hq"' });
+
+    // A live alert near you: the worst one goes to the top if it's serious.
+    if (I && I.enabled) {
+      var worst = null;
+      I.sources.forEach(function (s) {
+        if (!s.enabled) return;
+        s.items.forEach(function (i) {
+          if (scopeOf(i) === 'yours' && isAlert(i) && (!worst || LEVEL_RANK[i.level] > LEVEL_RANK[worst.i.level])) worst = { s: s, i: i };
+        });
+      });
+      if (worst) {
+        var al = { state: LEVEL_STATE[worst.i.level] || 'warn', ico: SR_ICO.alert, title: worst.i.title,
+          sub: LEVEL_WORD[worst.i.level] + ' · ' + worst.s.name + (worst.i.area ? ' · ' + worst.i.area : ''),
+          attrs: 'data-act="sr-alert" data-src="' + esc(worst.s.id) + '"' };
+        if (LEVEL_RANK[worst.i.level] >= LEVEL_RANK.moderate) acts.push(al); else late.push(al);
+      }
+    }
+
+    // Use what expires first: the soonest in-date batch inside its warning window.
+    var soon = [];
+    S.items.forEach(function (it) {
+      it.batches.forEach(function (b) { if (b.qty > 0 && expState(b.expiry, it.category) === 'warn') soon.push({ it: it, b: b }); });
+    });
+    soon.sort(function (a, b) { return a.b.expiry < b.b.expiry ? -1 : a.b.expiry > b.b.expiry ? 1 : 0; });
+    if (soon.length) {
+      var f = soon[0], others = {};
+      soon.forEach(function (x) { if (x.it.id !== f.it.id) others[x.it.id] = 1; });
+      var no = Object.keys(others).length;
+      acts.push({ state: 'warn', ico: SR_ICO.clock, title: 'Use ' + srThing(f.it, f.b.qty) + ' by ' + srDate(f.b.expiry),
+        sub: [expiryWords(f.b.expiry), f.b.location, no ? srN(no, 'more thing', 'more things') + ' expiring soon' : ''].filter(Boolean).join(' · '),
+        attrs: 'data-act="open" data-id="' + f.it.id + '"' });
+    }
+
+    // Replace what's expired.
+    var old = S.items.filter(function (it) { return info(it).expired > 0; }).map(function (it) {
+      var first = null;
+      it.batches.forEach(function (b) { if (b.qty > 0 && b.expiry && daysUntil(b.expiry) < 0 && (!first || b.expiry < first)) first = b.expiry; });
+      return { it: it, d: first };
+    }).sort(function (a, b) { return a.d < b.d ? -1 : a.d > b.d ? 1 : 0; });
+    if (old.length === 1) {
+      acts.push({ state: 'bad', ico: SR_ICO.swap, title: 'Replace ' + srThing(old[0].it, info(old[0].it).expired),
+        sub: 'Went out of date on ' + srDate(old[0].d), attrs: 'data-act="open" data-id="' + old[0].it.id + '"' });
+    } else if (old.length > 1) {
+      acts.push({ state: 'bad', ico: SR_ICO.swap, title: 'Replace ' + old.length + ' things that are out of date',
+        sub: srNames(old.map(function (x) { return x.it; }), 3), attrs: 'data-act="go" data-show="expired"' });
+    }
+
+    // Buy what's out, or runs out soonest at the rate you're using it.
+    var buy = S.items.map(function (it) { return { it: it, i: info(it) }; }).filter(function (x) { return x.i.low; });
+    if (buy.length) {
+      buy.forEach(function (x) {
+        var ro = x.it.usage && x.it.usage.runs_out_in_days;
+        x.d = x.i.out ? 0 : ro !== null && ro !== undefined && isFinite(ro) ? +ro : Infinity;
+        x.w = x.it.category === r.limit ? 0 : x.it.category === 'water' ? 1 : x.it.category === 'food' ? 2 : 3;
+      });
+      buy.sort(function (a, b) {
+        return a.d - b.d || a.w - b.w || (a.i.fresh / a.it.target_qty) - (b.i.fresh / b.it.target_qty) || byName(a.it, b.it);
+      });
+      var x = buy[0], t;
+      if (x.i.out) t = 'Buy ' + srName(x.it) + (x.i.none ? ': none in stock' : ': none in date');
+      else if (x.d !== Infinity) t = 'Buy more ' + srName(x.it) + ': runs out in about ' + span(Math.max(1, Math.round(x.d)));
+      else t = 'Top up ' + srName(x.it) + ': ' + fq(x.i.fresh) + ' of ' + qu(x.it.target_qty, x.it.unit);
+      acts.push({ state: x.i.out ? 'bad' : 'warn', ico: SR_ICO.cart, title: t,
+        sub: 'Get ' + qu(x.i.short, x.it.unit) + (buy.length > 1 ? ' · ' + srN(buy.length - 1, 'more thing', 'more things') + ' on the supply run' : ''),
+        attrs: 'data-tab="supply"' });
+    }
+    acts = acts.concat(late);
+
+    // Setting up.
+    if (I && !I.enabled) acts.push({ state: 'info', ico: SR_ICO.bell, title: 'Switch on live alerts', sub: 'Floods, severe weather and power cuts near you', attrs: 'data-act="go-hq-intel"' });
+    var starter = S.items.some(function (it) { return it.target_rule; }) || S.log.some(function (l) { return l.action === 'starter'; });
+    if (!starter && S.items.length < 25) acts.push({ state: 'info', ico: ICON.list, title: 'Load the starter list', sub: 'About 95 suggested essentials, sized for your household', attrs: 'data-act="seed"' });
+    return acts.slice(0, 5);
+  }
+  function srNext(r) {
+    var acts = srActions(r);
+    var html = '<section class="card col-4 sr-next"><div class="card-head"><h2>Next actions</h2>' +
+      (acts.length ? '<span class="small muted">most pressing first</span>' : '') + '</div>';
+    if (!acts.length) {
+      return html + '<div class="sr-clear"><span class="sr-clear-ico">' + ICON.check + '</span><b>Nothing needs doing</b>' +
+        '<span>Everything\'s in date and at target. Carry on.</span></div></section>';
+    }
+    return html + '<ol class="sr-acts">' + acts.map(function (a) {
+      return '<li><button class="sr-act" data-state="' + a.state + '" ' + a.attrs + '><span class="sr-act-ico">' + a.ico + '</span>' +
+        '<span class="sr-act-text"><span class="sr-act-title">' + esc(a.title) + '</span>' +
+        (a.sub ? '<span class="sr-act-sub">' + esc(a.sub) + '</span>' : '') + '</span>' + ICON.chev + '</button></li>';
+    }).join('') + '</ol></section>';
+  }
+
+  // The four counts, each with a small trend and a way into the list.
+  function srKpis(c, hist, anim) {
+    var back = srBack(hist), st = S.settings;
+    var defs = [
+      { label: 'Expired', n: c.expired, state: 'bad', show: 'expired', h: 'expired' },
+      { label: Object.keys(st.category_warn_days || {}).length ? 'Expiring soon' : 'Expiring in ' + st.warn_days + ' days', n: c.soon, state: 'warn', show: 'soon', h: 'expiring' },
+      { label: 'Below target', n: c.low, state: 'warn', show: 'low', h: 'below_target' },
+      { label: 'Out of stock', n: c.out, state: 'bad', show: 'out', h: null }
+    ];
+    return '<div class="col-12 kpi-row sr-kpis">' + defs.map(function (k) {
+      var state = k.n ? k.state : 'good', foot = '', spark = '';
+      if (k.h && back) {
+        var d = k.n - (+back.h[k.h] || 0);
+        foot = srDelta(d, d === 0 ? (back.vs === 'on last week' ? 'Same as last week' : 'No change ' + back.vs) : (d > 0 ? '+' : '−') + Math.abs(d) + ' ' + back.vs, 'bad');
+      } else if (!k.h) {
+        foot = '<span class="sr-kpi-note">of ' + srN(S.items.length, 'item', 'items') + '</span>';
+      }
+      if (k.h && hist.length >= 3) {
+        spark = DAChart.spark({ points: hist.slice(-30).map(function (h) { return h[k.h]; }), height: 28, color: k.n ? k.state : 'muted', area: true,
+          title: k.label + ', last 30 days', unit: 'items', noAnimate: !anim });
+      }
+      return '<button class="stat sr-kpi" data-state="' + state + '" data-act="go" data-show="' + k.show + '">' +
+        '<span class="stat-label">' + esc(k.label) + '</span>' +
+        '<span class="stat-val">' + k.n + ' <span class="stat-unit">' + (k.n === 1 ? 'item' : 'items') + '</span></span>' +
+        '<span class="stat-foot">' + foot + '</span>' +
+        '<span class="stat-spark" aria-hidden="' + (spark ? 'false' : 'true') + '">' + spark + '</span></button>';
+    }).join('') + '</div>';
+  }
+
+  // Expiry timeline: batches with stock, by the month they go out of date, after a column of what already has.
+  function srTimeline(anim) {
+    var now = new Date(), y = now.getFullYear(), m = now.getMonth(), k;
+    var cols = [{ label: 'Expired', short: 'Past', long: 'Already expired', bad: 0, warn: 0, ok: 0, show: 'expired' }];
+    for (k = 0; k < 12; k++) {
+      var md = new Date(y, m + k, 1);
+      cols.push({ label: md.toLocaleDateString('en-GB', { month: 'short' }), long: md.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' }), bad: 0, warn: 0, ok: 0, show: 'all' });
+    }
+    var later = 0, tot = { bad: 0, warn: 0, ok: 0 };
+    S.items.forEach(function (it) {
+      it.batches.forEach(function (b) {
+        if (!b.expiry || !(b.qty > 0)) return;
+        var s = expState(b.expiry, it.category);
+        if (s === 'bad') { cols[0].bad++; tot.bad++; return; }
+        var bd = parseYmd(b.expiry), idx = (bd.getFullYear() - y) * 12 + bd.getMonth() - m;
+        if (idx >= 12) { later++; return; }
+        cols[idx + 1][s === 'warn' ? 'warn' : 'ok']++;
+        tot[s === 'warn' ? 'warn' : 'ok']++;
+      });
+    });
+    var chart = DAChart.columns({
+      columns: cols.map(function (c) {
+        return { label: '', key: c.long, stacks: [{ value: c.bad, state: 'bad', label: 'expired' }, { value: c.warn, state: 'warn', label: 'expiring soon' }, { value: c.ok, state: 'good', label: 'later' }] };
+      }),
+      height: 220, title: 'Batches by expiry month', noAnimate: !anim
+    });
+    var hits = cols.map(function (c) {
+      var n = c.bad + c.warn + c.ok;
+      var lab = c.long + ': ' + (n ? srN(n, 'batch', 'batches') + (c.warn && c.ok ? ', ' + c.warn + ' expiring soon' : '') : 'nothing') + '. Open Stores, soonest first';
+      return '<button class="sr-col-hit" data-act="go" data-show="' + c.show + '" data-sort="expiry" aria-label="' + esc(lab) + '">' +
+        (c.short ? '<span class="sr-col-l"><span class="sr-wide">' + c.label + '</span><span class="sr-narrow">' + c.short + '</span></span>' : '<span class="sr-col-l">' + c.label + '</span>') + '</button>';
+    }).join('');
+    var lastMonth = cols[12].long;
+    return '<section class="card col-7 sr-timeline"><div class="card-head"><h2>Expiry timeline</h2>' +
+      '<button class="link" data-act="go" data-show="all" data-sort="expiry">Soonest first</button></div>' +
+      '<p class="card-sub sr-sub">Batches in stock by the month they go out of date, to ' + esc(lastMonth) + '</p>' +
+      '<div class="sr-cols"><div class="sr-cols-chart">' + chart + '</div><div class="sr-cols-hits">' + hits + '</div></div>' +
+      '<div class="sr-foot">' + DAChart.legend({ items: [
+        { label: 'Expired', state: 'bad', value: tot.bad }, { label: 'Expiring soon', state: 'warn', value: tot.warn }, { label: 'Fine', state: 'good', value: tot.ok }
+      ] }) + (later ? '<span class="small muted">+ ' + srN(later, 'batch', 'batches') + ' after that</span>' : '') + '</div></section>';
+  }
+
+  // Stock by category: how complete each one is against its targets.
+  function srCats(anim) {
+    var rows = '';
+    CATS.forEach(function (c) {
+      var its = S.items.filter(function (it) { return it.category === c.id; });
+      if (!its.length) return;
+      var tg = its.filter(function (it) { return it.target_qty > 0; });
+      var met = tg.filter(function (it) { return fresh(it) >= it.target_qty; }).length;
+      var p = tg.length ? tg.reduce(function (a, it) { return a + Math.min(1, fresh(it) / it.target_qty); }, 0) / tg.length : null;
+      var pc = p === null ? null : Math.floor(p * 100);
+      rows += '<button class="sr-cat" data-act="cat-go" data-cat="' + c.id + '" aria-label="' + esc(c.label + ': ' +
+        (p === null ? srN(its.length, 'item', 'items') + ', no targets' : pc + '% stocked, ' + met + ' of ' + tg.length + ' at target')) + '">' +
+        '<span class="sr-cat-top"><span class="sr-cat-name"><span aria-hidden="true">' + c.icon + '</span> ' + esc(c.short || c.label) + '</span>' +
+        '<span class="sr-cat-pct"><span class="sr-cat-n">' + (p === null ? srN(its.length, 'item', 'items') : met + '/' + tg.length) + '</span>' +
+        (p === null ? '–' : pc + '%') + '</span></span>' +
+        DAChart.meter({ value: pc === null ? 0 : pc, max: 100, state: p === null ? 'info' : stateOf(p), height: 6, noAnimate: !anim }) + '</button>';
+    });
+    return '<section class="card col-5 sr-catcard"><div class="card-head"><h2>Stock by category</h2>' +
+      '<span class="small muted">items at target · stocked</span></div><div class="sr-cats">' + rows + '</div></section>';
+  }
+
+  function srUseFirst() {
     var upcoming = [];
     S.items.forEach(function (it) {
       it.batches.forEach(function (b) { if (b.expiry && b.qty > 0) upcoming.push({ it: it, b: b }); });
     });
     upcoming.sort(function (a, b) { return a.b.expiry < b.b.expiry ? -1 : a.b.expiry > b.b.expiry ? 1 : 0; });
-    var urgent = upcoming.filter(function (x) { return expState(x.b.expiry) !== 'ok'; });
-    var showList = (urgent.length ? urgent : upcoming).slice(0, 6);
-    if (showList.length) {
-      html += '<section class="card flush"><div class="card-head"><h2>' + (urgent.length ? 'Use these first' : 'Next to expire') + '</h2>' +
-        (upcoming.length > showList.length ? '<button class="link" data-act="go" data-show="all" data-sort="expiry">See all</button>' : '') + '</div><div class="list">';
-      showList.forEach(function (x) {
-        var es = expState(x.b.expiry);
-        html += '<div class="li"><span class="li-ico">' + cat(x.it.category).icon + '</span>' +
-          '<button class="li-main" data-act="open" data-id="' + x.it.id + '"><div class="li-title">' + esc(x.it.name) + '</div>' +
-          '<div class="li-sub"><span class="badge ' + (es === 'ok' ? 'plain' : es) + '">' + esc(expiryWords(x.b.expiry)) + '</span>' +
-          '<span>' + esc(qu(x.b.qty, x.it.unit)) + (x.b.location ? ' · ' + esc(x.b.location) : '') + '</span></div></button>' +
+    var urgent = upcoming.filter(function (x) { return expState(x.b.expiry, x.it.category) !== 'ok'; });
+    var list = (urgent.length ? urgent : upcoming).slice(0, 5);
+    if (!list.length) return '';
+    return '<section class="card flush sr-use"><div class="card-head"><h2>' + (urgent.length ? 'Use these first' : 'Next to expire') + '</h2>' +
+      (upcoming.length > list.length ? '<button class="link" data-act="go" data-show="all" data-sort="expiry">See all</button>' : '') + '</div><div class="list">' +
+      list.map(function (x) {
+        var es = expState(x.b.expiry, x.it.category);
+        return '<div class="li"><span class="li-ico" aria-hidden="true">' + cat(x.it.category).icon + '</span>' +
+          '<button class="li-main" data-act="open" data-id="' + x.it.id + '"><span class="li-title">' + esc(x.it.name) + '</span>' +
+          '<span class="li-sub"><span class="badge ' + (es === 'ok' ? 'plain' : es) + '">' + esc(expiryWords(x.b.expiry)) + '</span>' +
+          '<span>' + esc(qu(x.b.qty, x.it.unit)) + (x.b.location ? ' · ' + esc(x.b.location) : '') + '</span></span></button>' +
           '<button class="qbtn" data-act="use" data-id="' + x.it.id + '" aria-label="Use one ' + esc(x.it.name) + '">' + ICON.minus + '</button></div>';
-      });
-      html += '</div></section>';
-    }
+      }).join('') + '</div></section>';
+  }
 
-    // Routine checks that are due, or due within a week
+  // Routine checks that are due (or due this week), and the things with a daily use that run out first.
+  function srPlan(r) {
     var due = sortedChecks().filter(function (x) { return x.i.days === null || x.i.days <= 7; });
-    if (due.length) {
-      html += '<section class="card flush"><div class="card-head"><h2>Checks due</h2><button class="link" data-tab="plan">All checks</button></div><div class="list">' +
-        due.slice(0, 4).map(checkRow).join('') + '</div>' +
-        (due.length > 4 ? '<button class="li more" data-tab="plan">' + (due.length - 4) + ' more ' + ICON.chev + '</button>' : '') + '</section>';
-    }
-
-    // Categories
-    html += '<section class="card flush"><div class="card-head"><h2>Stores by category</h2><span class="small muted">at target</span></div><div class="list">';
-    CATS.forEach(function (c) {
-      var its = S.items.filter(function (it) { return it.category === c.id; });
-      if (!its.length) return;
-      var tg = its.filter(function (it) { return it.target_qty > 0; });
-      var met = tg.filter(function (it) { return total(it) >= it.target_qty; }).length;
-      var pct = tg.length ? met / tg.length : null;
-      html += '<button class="li" data-act="cat-go" data-cat="' + c.id + '"><span class="li-ico">' + c.icon + '</span>' +
-        '<span class="li-main"><span class="li-title">' + esc(c.label) + '</span>' +
-        '<span class="li-sub">' + its.length + ' item' + (its.length === 1 ? '' : 's') + (tg.length ? ' · ' + met + ' of ' + tg.length + ' at target' : '') + '</span>' +
-        (pct !== null ? '<span class="catbar"><i style="width:' + (pct * 100).toFixed(1) + '%"></i></span>' : '') + '</span>' +
-        '<span class="cat-pct">' + (pct !== null ? Math.round(pct * 100) + '%' : '') + '</span>' + ICON.chev + '</button>';
-    });
-    html += '</div>';
+    var target = S.settings.target_days, sup = r.supplies;
     var priced = S.items.filter(function (it) { return it.price > 0; }).length;
-    if (priced) {
-      html += '<div class="li worth"><span class="li-main"><span class="li-title">Worth about ' + esc(money(stockValue())) + '</span>' +
-        '<span class="li-sub">From the prices on ' + priced + ' of ' + S.items.length + ' items</span></span></div>';
+    var checks = '', daily = '';
+    if (due.length) {
+      checks = '<section class="card flush sr-checks"><div class="card-head"><h2>Checks due</h2><button class="link" data-tab="plan">All checks</button></div><div class="list">' +
+        due.slice(0, 4).map(checkRow).join('') + '</div>' +
+        (due.length > 4 ? '<button class="li more" data-tab="plan">' + esc(due.length - 4) + ' more ' + ICON.chev + '</button>' : '') + '</section>';
     }
-    html += '</section>';
+    if (sup.length || priced) {
+      daily = '<section class="card flush sr-daily"><div class="card-head"><h2>Daily supplies</h2>' +
+        (sup.length ? '<span class="small muted">' + esc(sup.length) + ' tracked</span>' : '') + '</div><div class="list">' +
+        sup.slice(0, 4).map(function (x) {
+          var f = target > 0 ? Math.min(1, x.days / target) : 1, st = x.days <= 0 ? 'bad' : stateOf(f);
+          return '<button class="li" data-act="open" data-id="' + x.it.id + '"><span class="li-ico" aria-hidden="true">' + cat(x.it.category).icon + '</span>' +
+            '<span class="li-main"><span class="li-title">' + esc(x.it.name) + '</span>' +
+            '<span class="li-sub">' + esc(qu(inDate(x.it), x.it.unit)) + ' left · ' + esc(fq(x.it.per_day)) + ' a day</span>' +
+            '<span class="row-meter" data-state="' + st + '" style="--pct:' + (f * 100).toFixed(1) + '%" aria-hidden="true"><i></i></span></span>' +
+            pill(st, x.days <= 0 ? 'Run out' : 'Lasts ' + lastsWords(x.days)) + '</button>';
+        }).join('') +
+        (priced ? '<div class="li"><span class="li-ico" aria-hidden="true">💷</span><span class="li-main"><span class="li-title">Stores worth about ' + esc(money(stockValue())) + '</span>' +
+          '<span class="li-sub">From the prices on ' + esc(priced) + ' of ' + esc(S.items.length) + ' items</span></span></div>' : '') +
+        '</div></section>';
+    }
+    var half = checks && daily ? 'col-6 ' : 'col-12 ';
+    return checks.replace('class="card ', 'class="' + half + 'card ') + daily.replace('class="card ', 'class="' + half + 'card ');
+  }
 
-    // Recent activity
-    if (S.log.length) {
-      html += '<section class="card"><div class="card-head"><h2>Latest orders</h2><button class="link" data-tab="hq">Full log</button></div>' +
-        logHtml(S.log.slice(0, 4)) + '</section>';
+  // The household alert level, the dashboard note and the official warnings lead the Sitrep, full width.
+  // Side by side on a wall tablet or desktop, stacked on a phone.
+  function srTop() {
+    var res = resilienceCard();
+    return levelCard().replace('class="card ', 'class="' + (res ? 'col-5 ' : 'col-12 ') + 'card ') +
+      res.replace('class="card ', 'class="col-7 card ') +
+      (dashNote() + warnCard(false)).replace(/class="card /g, 'class="col-12 card ');
+  }
+  // With live alerts on, weather, flood and fire warnings are already on the live map and in Things to watch,
+  // so the Sitrep's warnings card leaves them out. The Plan tab still lists every warning.
+  var WARN_ON_MAP = { metoffice: 'weather', floods: 'floods', fires: 'fires' };
+  function warnOnMap(w) {
+    var I = S.intel, id = WARN_ON_MAP[w.source];
+    if (!id || !I || !I.enabled) return false;
+    return (I.sources || []).some(function (x) { return x.id === id && x.ok; });
+  }
+
+  function renderSitrep(el) {
+    var anim = !(SR_GRID && el.contains(SR_GRID));   // first draw since load or since coming back to the Sitrep
+    if (!S.items.length) {
+      el.innerHTML = '<div class="grid sr-grid">' + srTop() + intelBanner() + emptyCard().replace('class="card sr-first"', 'class="card col-12 sr-first"') + intelSitrep(anim) + '</div>';
+      SR_GRID = el.firstChild;
+      return;
     }
-    html += '<p class="tagline">Don\'t panic · stay supplied</p>';
-    el.innerHTML = html;
+    var r = readiness(), hist = srHist();
+    var html = '<div class="grid stretch sr-grid">' + srTop() + intelBanner() + srHero(r, hist, anim) + srNext(r) + srKpis(srCounts(), hist, anim) +
+      srPlan(r) + srTimeline(anim) + srCats(anim) + intelSitrep(anim);
+    var use = srUseFirst();
+    var log = S.log.length ? '<section class="card sr-log"><div class="card-head"><h2>Latest orders</h2><button class="link" data-tab="hq">Full log</button></div>' +
+      logHtml(S.log.slice(0, 5)) + '</section>' : '';
+    var half = use && log ? 'col-6 ' : 'col-12 ';
+    html += use.replace('class="card ', 'class="' + half + 'card ') + log.replace('class="card ', 'class="' + half + 'card ');
+    el.innerHTML = html + '</div><p class="tagline">Don\'t panic · stay supplied</p>';
+    SR_GRID = el.firstChild;
+  }
+
+  // ------------------------------------------------------------------
+  // Live alerts (server: intel.py)
+  // ------------------------------------------------------------------
+  var LEVEL_RANK = { none: 0, info: 1, minor: 2, moderate: 3, severe: 4 };
+  var LEVEL_STATE = { none: 'good', info: 'good', minor: 'warn', moderate: 'bad', severe: 'bad' };
+  var LEVEL_WORD = { none: 'All clear', info: 'For info', minor: 'Be aware', moderate: 'Be prepared', severe: 'Take action' };
+  var INTEL_ICON = { floods: '🌊', rivers: '🏞️', weather: '🌧️', power: '⚡', fires: '🔥', gas: '🏭', fx: '💷', markets: '📈', grid: '🔌', air: '💨', space: '☀️' };
+
+  function safeUrl(u) { return /^https:\/\//i.test(String(u || '')) ? String(u) : ''; }
+
+  function intelItemHtml(src, i) {
+    var url = safeUrl(i.url);
+    var sub = [i.area, i.time && /^\d{4}-\d\d-\d\dT/.test(i.time) ? ago(i.time) : i.time].filter(Boolean).join(' · ');
+    return '<div class="li intel-item"><span class="li-ico" aria-hidden="true">' + (INTEL_ICON[src.id] || '⚠️') + '</span>' +
+      '<div class="li-main"><span class="li-title">' + esc(i.title) + '</span>' +
+      (sub ? '<span class="li-sub">' + esc(sub) + '</span>' : '') +
+      (i.detail ? '<span class="li-sub intel-detail">' + esc(i.detail) + '</span>' : '') +
+      (url ? '<a class="link small" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">Official details</a>' : '') +
+      '</div>' + pill(LEVEL_STATE[i.level] || 'warn', LEVEL_WORD[i.level] || i.level) + '</div>';
+  }
+
+  // The card on the Sitrep: a map of what's happening (near you and across the UK), colour-coded summaries,
+  // and anything active near you.
+  var INTEL_OPEN = null;         // the summary tile whose details are showing
+  var MAPI = null, MAP_VIEW = null, LEAFLET = null;
+  var LEVEL_COLOUR = { severe: '#d63b30', moderate: '#ef7d1a', minor: '#f2b705', info: '#2f7fd1', none: '#2fa85a' };
+  var FIRE_COLOUR = '#ff4d1a';
+
+  function scopeOf(i) { return i.scope || 'yours'; }
+  function isAlert(i) { return LEVEL_RANK[i.level] >= LEVEL_RANK.minor; }
+
+  function trendsFor(id) {
+    return ((S.intel && S.intel.trends) || []).filter(function (t) { return t.source === id; })
+      .sort(function (a, b) { return LEVEL_RANK[b.level] - LEVEL_RANK[a.level]; });
+  }
+  function intelStatus(s) {
+    if (s.ok === null || s.ok === undefined) return { level: 'info', word: 'Checking…' };
+    var mine = s.items.filter(function (i) { return scopeOf(i) === 'yours' && isAlert(i); });
+    var tr = trendsFor(s.id);
+    if (tr.length && LEVEL_RANK[tr[0].level] >= LEVEL_RANK[mine.length ? s.level : 'none']) {
+      return { level: tr[0].level, word: LEVEL_WORD[tr[0].level], trend: tr[0], more: tr.length - 1 + mine.filter(function (i) { return !i.watch; }).length };
+    }
+    if (mine.length) return { level: s.level, word: LEVEL_WORD[s.level], n: mine.length };
+    if (s.ok === false && !s.items.length) return { level: 'info', word: 'Not reachable' };
+    // Country-wide measures aren't "near you": they're either normal or not.
+    if (['gas', 'grid', 'space'].indexOf(s.id) >= 0) return { level: 'none', word: 'Normal' };
+    if (s.id === 'fx' || s.id === 'markets') return { level: 'none', word: 'Steady' };
+    if (s.id === 'air') return { level: 'none', word: 'Good' };
+    if (s.id === 'rivers') return { level: 'none', word: s.items.some(function (i) { return scopeOf(i) === 'near'; }) ? 'Normal near you' : 'All clear near you' };
+    return { level: 'none', word: 'All clear near you' };
+  }
+  function intelTileSub(s, st) {
+    if (st.trend) return st.trend.title + (st.more > 0 ? ' · +' + st.more + ' more' : '');
+    if (s.id === 'gas' && s.items.length) return s.items[0].title.replace('Gas storage ', '') + (s.items[0].days_left ? ' · ~' + s.items[0].days_left + ' days' : '');
+    var parts = [];
+    if (s.id === 'fx' && s.items.length) {
+      return s.items.slice(0, 2).map(function (i) { return i.code + ' ' + i.value.toFixed(i.value >= 20 ? 2 : 4) + ' ' + pctTxt(i.changes.w1) + ' wk'; }).join(' · ');
+    }
+    if (s.id === 'markets' && s.items.length) {
+      return s.items.slice(0, 1).concat(s.items.filter(function (i) { return i.code === '^GSPC'; })).map(function (i) {
+        return i.name.replace(/ \(.*\)/, '') + ' ' + pctTxt(i.changes.w1) + ' wk';
+      }).join(' · ');
+    }
+    if (s.id === 'rivers') {
+      var gauges = s.items.filter(function (i) { return scopeOf(i) !== 'uk'; }).length;
+      var highUk = s.items.filter(function (i) { return scopeOf(i) === 'uk'; }).length;
+      if (st.n) parts.push(st.n + ' of ' + gauges + ' gauges high');
+      else if (gauges) parts.push(gauges + ' gauge' + (gauges === 1 ? '' : 's') + ' nearby');
+      if (highUk) parts.push(highUk + ' high elsewhere');
+      if (parts.length) return parts.join(' · ');
+    }
+    if (st.n) parts.push(st.n + ' near you');
+    var near = s.items.filter(function (i) { return scopeOf(i) === 'near'; }).length;
+    var uk = s.items.filter(function (i) { return scopeOf(i) === 'uk'; }).length;
+    if (near) parts.push(near + ' nearby');
+    if (uk) parts.push(uk + ' elsewhere in the UK');
+    if (parts.length) return parts.join(' · ');
+    var quiet = s.items.filter(function (i) { return i.level === 'none' || i.level === 'info'; });
+    if (quiet.length && (s.id === 'air' || s.id === 'space' || s.id === 'gas')) return quiet[0].title;
+    return s.checked_at ? 'checked ' + ago(s.checked_at) : 'every ' + s.refresh_minutes + ' min';
+  }
+
+  // Gas storage: the stock level over time, from the National Gas feed ([[date, TWh], ...]).
+  function srGasSeries(s) {
+    var g = s && s.id === 'gas' && s.items[0];
+    return g && g.series && g.series.length >= 2 ? g.series : null;
+  }
+  // Money: the pound and the markets. A row per currency or index with its recent path and how far it has moved.
+  function pctTxt(v) { return v == null ? '–' : (v > 0 ? '+' : v < 0 ? '−' : '') + Math.abs(v).toFixed(1) + '%'; }
+  function pctCell(v, neutral) {
+    var cls = v == null || neutral || Math.abs(v) < 0.05 ? '' : v > 0 ? ' up' : ' down';
+    return '<span class="mn-pct' + cls + '">' + pctTxt(v) + '</span>';
+  }
+  function moneyRow(i, anim) {
+    var neutral = i.money === 'commodity';
+    var state = i.level === 'moderate' ? 'bad' : i.level === 'minor' ? 'warn' : '';
+    var val = i.money === 'fx' ? i.value.toFixed(i.value >= 20 ? 2 : 4) : i.value.toLocaleString('en-GB', { maximumFractionDigits: i.value >= 1000 ? 0 : 2 });
+    var url = safeUrl(i.url);
+    return '<div class="mn-row"' + (state ? ' data-state="' + state + '"' : '') + '>' +
+      '<div class="mn-main"><span class="mn-name">' + (url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(i.name) + '</a>' : esc(i.name)) + '</span>' +
+      '<span class="mn-sub">' + esc(i.money === 'fx' ? i.code + ' per £1' : (i.currency || '')) + (i.watch ? ' · ' + esc(i.watch) : '') + '</span></div>' +
+      '<span class="mn-spark">' + DAChart.spark({ points: i.series.map(function (p) { return p[1]; }), height: 26, color: state || 'info', area: true, zero: false,
+        title: i.name + ', last three months', noAnimate: !anim }) + '</span>' +
+      '<b class="mn-val">' + esc(val) + '</b>' + pctCell(i.changes.d1, neutral) + pctCell(i.changes.w1, neutral) + pctCell(i.changes.m1, neutral) + '</div>';
+  }
+  function moneyList(src, anim) {
+    var head = '<div class="mn-row mn-head"><span></span><span></span><span class="mn-val">Now</span><span class="mn-pct">Day</span><span class="mn-pct">Week</span><span class="mn-pct">Month</span></div>';
+    var groups = src.id === 'fx' ? [['fx', 'The pound buys']] : [['index', 'Stock markets'], ['commodity', 'Commodities']];
+    return groups.map(function (g) {
+      var list = src.items.filter(function (i) { return i.money === g[0]; });
+      if (!list.length) return '';
+      return '<h3 class="intel-group">' + esc(g[1]) + '</h3><div class="mn-list">' + head + list.map(function (i) { return moneyRow(i, anim); }).join('') + '</div>';
+    }).join('') + '<p class="small muted">' + (src.id === 'fx' ? 'A falling line means a weaker pound. Daily reference rates.' : 'Prices can be delayed. Updated every three hours.') + ' Context only, not financial advice.</p>';
+  }
+  // What a source has looked like over the last two weeks (kept by the server at every check).
+  function historyCharts(src, anim) {
+    var H = (S.intel && S.intel.history) || {};
+    return Object.keys(H).filter(function (m) { return H[m].source === src.id && H[m].points.length >= 3; }).map(function (m) {
+      var days = Math.max(1, Math.round((new Date(H[m].points[H[m].points.length - 1][0]) - new Date(H[m].points[0][0])) / 864e5));
+      return '<div class="sr-gas"><div class="sr-label">' + esc(H[m].label) + ' · last ' + (days <= 1 ? 'day' : days + ' days') + '</div>' + DAChart.trend({
+        series: [{ name: H[m].label, color: 'info', points: H[m].points }], height: 130, title: H[m].label, noAnimate: !anim
+      }) + '</div>';
+    }).join('');
+  }
+  // The banner at the very top of the Sitrep: trends to watch and anything active near you. Tap one for its details.
+  function intelBanner() {
+    var I = S.intel;
+    if (!I || !I.enabled) return '';
+    var rows = (I.trends || []).map(function (t) { return { src: t.source, level: t.level, title: t.title, detail: t.detail, tag: 'Trend' }; });
+    I.sources.forEach(function (s) {
+      if (!s.enabled) return;
+      s.items.forEach(function (i) {
+        if (scopeOf(i) === 'yours' && isAlert(i) && !i.watch) rows.push({ src: s.id, level: i.level, title: i.title, detail: i.detail, tag: s.name });
+      });
+    });
+    if (!rows.length) return '';
+    rows.sort(function (a, b) { return LEVEL_RANK[b.level] - LEVEL_RANK[a.level]; });
+    var more = rows.length - 4;
+    return '<section class="col-12 tr-strip" data-level="' + esc(rows[0].level) + '" aria-label="Things to watch">' +
+      '<div class="tr-head"><span class="sr-label">Things to watch</span><span class="small muted">' + rows.length + ' now</span></div>' +
+      rows.slice(0, 4).map(function (t) {
+        return '<button class="tr-item" data-act="intel-jump" data-src="' + esc(t.src) + '" data-level="' + esc(t.level) + '">' +
+          '<span class="tr-ico" aria-hidden="true">' + (INTEL_ICON[t.src] || '📈') + '</span>' +
+          '<span class="tr-main"><b>' + esc(t.title) + '</b><span>' + esc(t.tag) + (t.detail ? ' · ' + esc(t.detail.length > 150 ? t.detail.slice(0, 150) + '…' : t.detail) : '') + '</span></span>' +
+          pill(LEVEL_STATE[t.level] || 'warn', LEVEL_WORD[t.level] || 'Be aware') + '</button>';
+      }).join('') +
+      (more > 0 ? '<button class="link small" data-act="intel-jump" data-src="">and ' + more + ' more in Live alerts</button>' : '') + '</section>';
+  }
+
+  // River gauges near you: where the level sits between the lowest and highest it has been, with the normal range shaded.
+  function riverRow(i, anim) {
+    var lo = Math.min(i.low, i.value), hi = Math.max(i.max == null ? i.high : i.max, i.value, i.high);
+    var span = (hi - lo) || 1;
+    function pc(v) { return Math.max(0, Math.min(100, (v - lo) / span * 100)).toFixed(1); }
+    var state = i.state === 'high' ? (i.level === 'moderate' ? 'bad' : 'warn') : 'good';
+    var word = i.state === 'high' ? 'Above normal' : i.state === 'low' ? 'Below normal' : 'Normal';
+    var arrow = i.trend === 'rising' ? ' ↑' : i.trend === 'falling' ? ' ↓' : '';
+    var url = safeUrl(i.url);
+    var sub = [i.area, i.time ? ago(i.time) : '', i.trend ? i.trend.charAt(0).toUpperCase() + i.trend.slice(1) : ''].filter(Boolean).join(' · ');
+    return '<div class="rv-row" data-state="' + state + '">' +
+      '<div class="rv-main"><span class="rv-name">' + (url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(i.name) + '</a>' : esc(i.name)) + '</span>' +
+      '<span class="rv-sub">' + esc(sub) + '</span></div>' +
+      '<div class="rv-bar" role="img" aria-label="' + esc(i.value.toFixed(2) + ' m. Normal range ' + i.low.toFixed(2) + ' to ' + i.high.toFixed(2) + ' m.') + '">' +
+        '<span class="rv-norm" style="left:' + pc(i.low) + '%;width:' + (pc(i.high) - pc(i.low)).toFixed(1) + '%"></span>' +
+        '<span class="rv-dot" style="left:' + pc(i.value) + '%"></span></div>' +
+      (i.series ? '<span class="rv-spark">' + DAChart.spark({ points: i.series.map(function (p) { return p[1]; }), height: 22, color: state === 'good' ? 'info' : state, zero: false,
+        title: i.name + ', recent levels', unit: 'm', noAnimate: !anim }) + '</span>' : '<span class="rv-spark"></span>') +
+      '<span class="rv-val"><b>' + esc(i.value.toFixed(2)) + ' m' + arrow + '</b>' + pill(state, word) + '</span></div>';
+  }
+  function riverList(src, anim) {
+    var near = src.items.filter(function (i) { return i.river && scopeOf(i) !== 'uk'; });
+    if (!near.length) return '';
+    return '<h3 class="intel-group">Gauges near you <span class="muted">' + near.length + '</span></h3>' +
+      '<div class="rv-list">' + near.map(function (i) { return riverRow(i, anim); }).join('') + '</div>' +
+      '<p class="small muted rv-key"><i class="rv-key-norm"></i>Shaded: the normal range. The bar runs from the lowest level up to the highest on record.</p>';
+  }
+
+  // The pill on the Live alerts card: name the thing when there's only one.
+  function intelHeadline(I, on) {
+    if (!I.active) return 'All clear near you';
+    var hit = on.filter(function (s) { return LEVEL_RANK[intelStatus(s).level] >= LEVEL_RANK.minor; });
+    if (hit.length === 1) return hit[0].name + ': ' + (LEVEL_WORD[intelStatus(hit[0]).level] || '').toLowerCase();
+    return I.active + ' to be aware of';
+  }
+
+  function intelSitrep(anim) {
+    var I = S.intel;
+    if (!I) return '';
+    if (!I.enabled) {
+      return '<section class="card col-12 intel-off sr-intel-off"><div class="card-head"><h2>Live alerts</h2>' +
+        '<button class="link" data-act="go-hq-intel">Switch on</button></div>' +
+        '<p class="small muted">A live map of floods, river levels, severe weather, power cuts and wildfires, near you and across the UK, from the official sources.</p></section>';
+    }
+    var on = I.sources.filter(function (s) { return s.enabled; });
+    var active = [];
+    on.forEach(function (s) {
+      s.items.forEach(function (i) { if (scopeOf(i) === 'yours' && isAlert(i)) active.push({ s: s, i: i }); });
+    });
+    active.sort(function (a, b) { return LEVEL_RANK[b.i.level] - LEVEL_RANK[a.i.level]; });
+    var hasMap = I.map && I.map.on;
+    var html = '<section class="card col-12 intel sr-intel" data-level="' + esc(I.level) + '"><div class="card-head"><h2>Live alerts</h2>' +
+      pill(LEVEL_STATE[I.level] || 'good', intelHeadline(I, on)) + '</div>' +
+      '<div class="sr-intel-body' + (hasMap ? ' has-map' : '') + '">';
+    if (hasMap) {
+      html += '<div class="intel-map-wrap"><div id="intelMap" class="intel-map" role="region" aria-label="Map of live alerts"></div>' +
+        '<div class="intel-legend" aria-hidden="true">' + ['severe', 'moderate', 'minor', 'info'].map(function (l) {
+          return '<span><i style="background:' + LEVEL_COLOUR[l] + '"></i>' + esc(l === 'info' ? 'For info' : LEVEL_WORD[l]) + '</span>';
+        }).join('') + '<span><i style="background:' + FIRE_COLOUR + '"></i>Heat detection</span>' +
+        '<span><i class="faint"></i>Elsewhere in the UK</span></div></div>';
+    }
+    // Anything that needs attention comes first, worst first; the quiet ones keep their usual order.
+    var tiles = on.map(function (s, n) { return { s: s, st: intelStatus(s), n: n }; });
+    tiles.sort(function (a, b) {
+      var ra = LEVEL_RANK[a.st.level] >= LEVEL_RANK.minor ? LEVEL_RANK[a.st.level] : 0, rb = LEVEL_RANK[b.st.level] >= LEVEL_RANK.minor ? LEVEL_RANK[b.st.level] : 0;
+      return rb - ra || a.n - b.n;
+    });
+    html += '<div class="intel-tiles">' + tiles.map(function (x) {
+      var s = x.s, st = x.st, gs = srGasSeries(s);
+      if (!gs && (s.id === 'fx' || s.id === 'markets') && s.items.length && s.items[0].series) gs = s.items[0].series;
+      return '<button class="intel-tile" data-act="intel-src" data-src="' + esc(s.id) + '" data-level="' + esc(st.level) + '" aria-expanded="' + (INTEL_OPEN === s.id) + '">' +
+        '<span class="it-ico" aria-hidden="true">' + (INTEL_ICON[s.id] || '⚠️') + '</span>' +
+        '<span class="it-name">' + esc(s.name) + '</span>' +
+        '<span class="it-word">' + esc(st.word) + '</span>' +
+        '<span class="it-sub">' + esc(intelTileSub(s, st)) + '</span>' +
+        (gs ? '<span class="it-spark">' + DAChart.spark({ points: gs.slice(-60).map(function (p) { return p[1]; }), height: 22, color: 'info', area: true, zero: false,
+          title: s.id === 'gas' ? 'Gas in storage, last ' + Math.min(60, gs.length) + ' days' : s.items[0].name + ', last three months', unit: s.id === 'gas' ? 'TWh' : '', noAnimate: !anim }) + '</span>' : '') + '</button>';
+    }).join('') + '</div></div>';
+    var open = INTEL_OPEN && on.filter(function (s) { return s.id === INTEL_OPEN; })[0];
+    if (open) {
+      var groups = [['yours', 'Near you'], ['near', 'Nearby'], ['uk', 'Elsewhere in the UK']];
+      html += '<div class="intel-open"><div class="small muted">' + esc(open.attribution) +
+        (open.error ? ' · <span class="ha-error">' + esc(open.error) + '</span>' : '') + '</div>';
+      var gser = srGasSeries(open);
+      if (gser) {
+        html += '<div class="sr-gas"><div class="sr-label">Gas in storage</div>' + DAChart.trend({
+          series: [{ name: 'Gas in storage', color: 'info', points: gser }], height: 160, yUnit: 'TWh', title: 'Gas in storage', noAnimate: !anim
+        }) + '</div>';
+      }
+      trendsFor(open.id).forEach(function (t) {
+        html += '<div class="callout ' + (LEVEL_STATE[t.level] === 'bad' ? 'bad' : 'warn') + ' tr-callout"><b>' + esc(t.title) + '</b><br>' + esc(t.detail) + '</div>';
+      });
+      var any = false;
+      var hc = historyCharts(open, anim);
+      if (hc) { html += hc; }
+      if (open.id === 'fx' || open.id === 'markets') {
+        html += moneyList(open, anim); any = true; groups = [];
+      }
+      if (open.id === 'rivers') {
+        var rl = riverList(open, anim);
+        if (rl) { html += rl; any = true; }
+        groups = [['uk', 'Running high elsewhere in England']];
+      }
+      groups.forEach(function (g) {
+        var list = open.items.filter(function (i) { return scopeOf(i) === g[0]; });
+        if (!list.length) return;
+        any = true;
+        html += '<h3 class="intel-group">' + esc(g[1]) + ' <span class="muted">' + list.length + '</span></h3><div class="list">' +
+          list.slice(0, 25).map(function (i) { return intelItemHtml(open, i); }).join('') + '</div>' +
+          (list.length > 25 ? '<p class="small muted">and ' + (list.length - 25) + ' more on the map</p>' : '');
+      });
+      if (!any) html += '<p class="small muted">Nothing to report.</p>';
+      html += (safeUrl(open.link) ? '<a class="link small" href="' + esc(safeUrl(open.link)) + '" target="_blank" rel="noopener noreferrer">Official source</a>' : '') + '</div>';
+    } else if (active.length) {
+      html += '<div class="list sr-intel-active">' + active.slice(0, 6).map(function (x) { return intelItemHtml(x.s, x.i); }).join('') + '</div>' +
+        (active.length > 6 ? '<button class="link" data-act="go-hq-intel">See all ' + active.length + '</button>' : '');
+    }
+    return html + '</section>';
+  }
+
+  // Leaflet is bundled (static/vendor/leaflet); load it the first time the map is shown.
+  function ensureLeaflet() {
+    if (window.L) return Promise.resolve(window.L);
+    if (LEAFLET) return LEAFLET;
+    LEAFLET = new Promise(function (ok, fail) {
+      var css = document.createElement('link');
+      css.rel = 'stylesheet'; css.href = 'vendor/leaflet/leaflet.css';
+      document.head.appendChild(css);
+      var js = document.createElement('script');
+      js.src = 'vendor/leaflet/leaflet.js';
+      js.onload = function () { ok(window.L); };
+      js.onerror = function () { LEAFLET = null; fail(new Error('map library')); };
+      document.head.appendChild(js);
+    });
+    return LEAFLET;
+  }
+
+  function popupHtml(src, i) {
+    var url = safeUrl(i.url);
+    var when = i.time && /^\d{4}-\d\d-\d\dT/.test(i.time) ? ago(i.time) : i.time;
+    var where = scopeOf(i) === 'yours' ? 'Near you' : scopeOf(i) === 'near' ? 'Nearby' : 'Elsewhere in the UK';
+    return '<div class="map-pop"><b>' + (INTEL_ICON[src.id] || '') + ' ' + esc(i.title) + '</b>' +
+      '<div class="muted">' + esc(where) + (i.network ? ' · ' + esc(i.network) : '') + '</div>' +
+      (i.area ? '<div>' + esc(i.area) + '</div>' : '') + (when ? '<div class="muted">' + esc(when) + '</div>' : '') +
+      (i.detail ? '<p>' + esc(i.detail.length > 220 ? i.detail.slice(0, 220) + '…' : i.detail) + '</p>' : '') +
+      (url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">Official details</a>' : '') + '</div>';
+  }
+
+  var UK_BOUNDS = [[49.9, -8.2], [60.9, 1.8]];
+
+  function mountIntelMap() {
+    var el = document.getElementById('intelMap');
+    if (!el) {
+      if (MAPI) { MAP_VIEW = { c: MAPI.getCenter(), z: MAPI.getZoom() }; MAPI.remove(); MAPI = null; }
+      return;
+    }
+    ensureLeaflet().then(function (L) {
+      if (!document.body.contains(el)) return;   // redrawn while loading
+      if (MAPI) { MAP_VIEW = { c: MAPI.getCenter(), z: MAPI.getZoom() }; MAPI.remove(); MAPI = null; }
+      var I = S.intel, M = I.map || {};
+      var map = MAPI = L.map(el, { scrollWheelZoom: false, zoomControl: true, attributionControl: true });
+      if (window.ResizeObserver) {   // the card changes size (rotation, sidebar): keep the tiles filling it
+        var ro = new ResizeObserver(function () { if (MAPI === map) map.invalidateSize(); });
+        ro.observe(el);
+        map.on('unload', function () { ro.disconnect(); });
+      }
+      map.setView(M.home || [52.4, -1.5], M.home ? 10 : 6);   // a starting view: circles can't measure themselves without one
+      L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 18, attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> · EA, Met Office, UKPN, NGED, NASA FIRMS'
+      }).addTo(map);
+
+      // Weather warnings cover regions: shade each region a warning covers.
+      var weather = I.sources.filter(function (s) { return s.id === 'weather' && s.enabled; })[0];
+      if (weather) {
+        weather.items.forEach(function (i) {
+          var c = LEVEL_COLOUR[i.level] || LEVEL_COLOUR.info;
+          (i.regions || []).forEach(function (code) {
+            var at = (M.met_centres || {})[code];
+            if (!at) return;
+            L.circle(at, { radius: 75000, color: c, weight: scopeOf(i) === 'yours' ? 2 : 1, fillColor: c,
+              fillOpacity: scopeOf(i) === 'yours' ? 0.22 : 0.12, dashArray: '4 6' }).bindPopup(popupHtml(weather, i)).addTo(map);
+          });
+        });
+      }
+      // Points: floods, power cuts, fires. Near you: bold; elsewhere: smaller and fainter.
+      I.sources.forEach(function (s) {
+        if (!s.enabled || s.id === 'weather') return;
+        s.items.forEach(function (i) {
+          if (i.lat == null || i.lon == null) return;
+          if (i.river && !isAlert(i)) return;   // normal rivers stay off the map
+          var sc = scopeOf(i), c = i.fire ? FIRE_COLOUR : (LEVEL_COLOUR[i.level] || LEVEL_COLOUR.info);
+          (i.rings || []).forEach(function (ring) {
+            L.polygon(ring, { color: c, weight: 2, fillColor: c, fillOpacity: sc === 'uk' ? 0.15 : 0.28 }).bindPopup(popupHtml(s, i)).addTo(map);
+          });
+          var big = sc === 'yours' && isAlert(i);
+          L.circleMarker([i.lat, i.lon], {
+            radius: i.fire ? (sc === 'uk' ? 3.5 : 6) : big ? 9 : sc === 'near' ? 6 : 4.5,
+            color: i.fire ? '#7a1d00' : '#fff', weight: big ? 2 : 1, fillColor: c,
+            fillOpacity: sc === 'uk' ? 0.55 : 0.95, opacity: sc === 'uk' ? 0.6 : 1
+          }).bindPopup(popupHtml(s, i)).addTo(map);
+        });
+      });
+
+      var ring = null;
+      if (M.home) {
+        L.marker(M.home, { title: 'Home', keyboard: false,
+          icon: L.divIcon({ className: 'map-home', html: '<span>🏠</span>', iconSize: [30, 30], iconAnchor: [15, 15] }) })
+          .bindTooltip('Home').addTo(map);
+        ring = L.circle(M.home, { radius: (M.radius_km || 15) * 1000, color: '#23803d', weight: 1.5, dashArray: '6 6',
+          fill: true, fillOpacity: 0.04, interactive: false }).addTo(map);
+      }
+      function goHome() {
+        if (ring) map.fitBounds(ring.getBounds(), { padding: [16, 16], maxZoom: 12 });
+        else map.fitBounds(UK_BOUNDS);
+      }
+      // Two buttons: back to home, or the whole of the UK.
+      var Views = L.Control.extend({
+        options: { position: 'topright' },
+        onAdd: function () {
+          var box = L.DomUtil.create('div', 'leaflet-bar map-views');
+          box.innerHTML = '<a href="#" role="button" data-v="home" title="Back to home" aria-label="Back to home">🏠</a>' +
+            '<a href="#" role="button" data-v="uk" title="Whole of the UK" aria-label="Whole of the UK">UK</a>';
+          L.DomEvent.disableClickPropagation(box);
+          L.DomEvent.on(box, 'click', function (e) {
+            L.DomEvent.preventDefault(e);
+            var v = e.target.closest('[data-v]');
+            if (!v) return;
+            if (v.dataset.v === 'uk') map.fitBounds(UK_BOUNDS); else goHome();
+          });
+          return box;
+        }
+      });
+      map.addControl(new Views());
+      // Fit once the card has its final size (fitting a map that hasn't been laid out zooms right in).
+      var saved = MAP_VIEW;
+      requestAnimationFrame(function () {
+        if (MAPI !== map) return;
+        map.invalidateSize();
+        if (saved) map.setView(saved.c, saved.z); else goHome();
+      });
+    }).catch(function () {
+      el.innerHTML = '<p class="small muted" style="padding:16px">The map couldn\'t load. The summaries below are still live.</p>';
+    });
   }
 
   var LOG_VERB = { added: 'Added', stocked: 'Stocked', used: 'Used', adjusted: 'Adjusted', edited: 'Edited', removed: 'Deleted',
@@ -531,16 +1303,30 @@
     ['out', 'Out of stock'], ['stocked', 'In stock']];
   var SORT_OPTS = [['category', 'Sort: category'], ['name', 'Sort: A–Z'], ['expiry', 'Sort: soonest expiry'],
     ['short', 'Sort: most needed'], ['recent', 'Sort: recently changed']];
+  // Desktop gets the dense table; phones and tablets the two-line rows. Redrawn when the width crosses over.
+  var ST_WIDE = window.matchMedia ? window.matchMedia('(min-width: 1100px)') : { matches: false };
+  function stWideChanged() { if (view === 'stores' && S && S.items.length) renderStoreList(); }
+  if (ST_WIDE.addEventListener) ST_WIDE.addEventListener('change', stWideChanged);
+  else if (ST_WIDE.addListener) ST_WIDE.addListener(stWideChanged);
+  // Category groups folded away on the desktop table, for this session.
+  var ST_FOLD = {};
+  try { ST_FOLD = JSON.parse(sessionStorage.getItem('da-fold') || '{}') || {}; } catch (e) { ST_FOLD = {}; }
+  function stSaveFold() { try { sessionStorage.setItem('da-fold', JSON.stringify(ST_FOLD)); } catch (e) { /* ignore */ } }
+  var ST_CHEV = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>';
 
   function renderStores(el) {
     if (!S.items.length) { endSelect(); el.dataset.view = ''; el.innerHTML = emptyCard(); return; }
     if (el.dataset.view !== 'stores' || !$('#q', el)) {
       el.dataset.view = 'stores';
       el.innerHTML =
-        '<div class="search">' + ICON.search + '<input type="search" id="q" placeholder="Search item, place or note" autocomplete="off" enterkeyhint="search" aria-label="Search stores"></div>' +
-        '<div class="chips scroll-x" id="catChips"></div>' +
-        '<div class="filters"><select id="fShow" aria-label="Show">' + SHOW_OPTS.map(opt).join('') + '</select>' +
-        '<select id="fSort" aria-label="Sort by">' + SORT_OPTS.map(opt).join('') + '</select></div>' +
+        '<div class="toolbar st-toolbar" role="search" aria-label="Find in the stores">' +
+        '<div class="st-tools">' +
+        '<div class="search st-search">' + ICON.search + '<input type="search" id="q" placeholder="Search the stores" autocomplete="off" enterkeyhint="search" aria-label="Search stores"></div>' +
+        '<div class="select st-show"><select id="fShow" aria-label="Show">' + SHOW_OPTS.map(opt).join('') + '</select></div>' +
+        '<div class="select st-sort"><select id="fSort" aria-label="Sort by">' + SORT_OPTS.map(opt).join('') + '</select></div>' +
+        '<button class="btn primary st-add" data-act="new">' + ICON.plus + '<span>Add item</span></button></div>' +
+        '<div class="st-chiprow"><div class="chips st-chips" id="catChips"></div><div class="st-meta" id="stMeta"></div></div>' +
+        '</div>' +
         '<div id="storeList"></div>';
     }
     var q = $('#q');
@@ -551,7 +1337,7 @@
     S.items.forEach(function (it) { counts[it.category] = (counts[it.category] || 0) + 1; });
     $('#catChips').innerHTML = '<button class="chip" data-act="cat" data-cat="all" aria-pressed="' + (F.cat === 'all') + '">All <span class="n">' + S.items.length + '</span></button>' +
       CATS.filter(function (c) { return counts[c.id]; }).map(function (c) {
-        return '<button class="chip" data-act="cat" data-cat="' + c.id + '" aria-pressed="' + (F.cat === c.id) + '">' + c.icon + ' ' + esc(c.short || c.label) + ' <span class="n">' + counts[c.id] + '</span></button>';
+        return '<button class="chip" data-act="cat" data-cat="' + c.id + '" aria-pressed="' + (F.cat === c.id) + '"><span aria-hidden="true">' + c.icon + '</span> ' + esc(c.short || c.label) + ' <span class="n">' + counts[c.id] + '</span></button>';
       }).join('');
     renderStoreList();
   }
@@ -594,40 +1380,161 @@
     return list;
   }
 
-  function rowHtml(it, i, showIcon) {
-    var badges = '';
-    if (i.exp === 'bad') badges += '<span class="badge bad">Expired</span>';
-    else if (i.exp === 'warn') badges += '<span class="badge warn">' + esc(shortLeft(i.soonest)) + '</span>';
-    if (i.out && it.target_qty > 0) badges += '<span class="badge bad">Out</span>';
-    else if (i.low) badges += '<span class="badge warn">Low</span>';
+  // ---- Row pieces, shared by the desktop table, the phone rows and the item sheet ----
+  // An amount in the item's own unit: "£12", "9 tins", "1,5 kg".
+  function stAmt(q, unit) { return isMoney(unit) ? unit + fq(q) : fq(q); }
+  // The stock meter: in-date stock against the target (expired stock doesn't count).
+  function stStock(it, i) {
+    var t = it.target_qty > 0 ? it.target_qty : 0;
+    var unitWord = isMoney(it.unit) ? '' : (it.unit ? ' ' + esc(plural(it.unit, t || i.fresh)) : '');
+    var cap = '<b>' + esc(stAmt(i.fresh, it.unit)) + '</b>' + (t ? ' of ' + esc(stAmt(t, it.unit)) : '') + unitWord;
+    if (!t) return '<div class="st-stock"><div class="row-meter st-blank" title="No target set" aria-hidden="true"></div><span class="row-meter-cap st-cap">' + cap + '</span></div>';
+    var top = Math.max(t, i.fresh), state = stateOf(i.fresh / t);
+    var style = '--pct:' + (i.fresh / top * 100).toFixed(1) + '%' + (i.fresh > t ? ';--target:' + (t / top * 100).toFixed(1) + '%' : '');
+    return '<div class="st-stock"><div class="row-meter" data-state="' + state + '" style="' + style + '" role="img" aria-label="' +
+      esc(fq(i.fresh) + ' of ' + fq(t) + ' in date') + '"><i></i></div><span class="row-meter-cap st-cap">' + cap + '</span></div>';
+  }
+  // How far off a date is, in words: "12 days", "3 weeks", "Expired 2 months ago".
+  function stWhen(s, short) {
+    var n = daysUntil(s);
+    if (n < 0) return short ? 'Expired' : 'Expired ' + span(-n) + ' ago';
+    if (n === 0) return 'Today';
+    return span(n);
+  }
+  function stExpChip(it, i, short) {
+    if (!i.soonest) return '<span class="st-none" aria-label="No expiry date">–</span>';
+    var cls = i.exp === 'bad' ? 'bad' : i.exp === 'warn' ? 'warn' : 'plain';
+    return '<span class="badge st-exp ' + cls + '" title="' + esc((i.exp === 'bad' ? 'Expired ' : 'Best before ') + fmtDate(i.soonest)) + '">' +
+      esc(stWhen(i.soonest, short)) + '</span>';
+  }
+  function stPlaces(it) {
     var locs = {};
-    it.batches.forEach(function (b) { if (b.location) locs[b.location] = 1; });
-    var lk = Object.keys(locs);
-    var where = lk.length === 1 ? lk[0] : lk.length > 1 ? lk.length + ' places' : '';
-    var amount;
-    if (isMoney(it.unit)) {
-      amount = '<b>' + esc(it.unit + fq(i.total)) + '</b>' + (it.target_qty > 0 ? ' of ' + esc(it.unit + fq(it.target_qty)) : '');
-    } else {
-      amount = '<b>' + fq(i.total) + '</b>' + (it.target_qty > 0 ? ' of ' + fq(it.target_qty) : '') +
-        (it.unit ? ' ' + esc(plural(it.unit, it.target_qty > 0 ? it.target_qty : i.total)) : '');
-    }
-    var left = daysLeft(it);
-    var lasts = left > 0 ? '<span>· lasts ' + esc(lastsWords(left)) + '</span>' : '';
-    var body = (showIcon ? '<span class="row-ico">' + cat(it.category).icon + '</span>' : '') +
-      '<span class="row-text"><span class="row-name">' + esc(it.name) + '</span>' +
-      '<span class="row-sub"><span>' + amount + '</span>' + (where ? '<span>· ' + esc(where) + '</span>' : '') + lasts + badges + '</span></span>';
+    it.batches.forEach(function (b) { if (b.location && b.qty > 0) locs[b.location] = 1; });
+    return Object.keys(locs).sort();
+  }
+  function stWhere(it) {
+    var lk = stPlaces(it);
+    return lk.length === 1 ? lk[0] : lk.length > 1 ? lk.length + ' places' : '';
+  }
+  function stNice(n) { return n >= 3 ? nf0.format(Math.round(n)) : fq(Math.round(n * 2) / 2); }
+  // "about 2 a week", or '' when there's nothing to go on.
+  // Days until it runs out: from the daily use you've set, or else from how fast it has been going. null if unknown.
+  function stDays(it) {
+    if (it.per_day > 0) return Math.floor(daysLeft(it) + 1e-9);
+    var d = it.usage ? it.usage.runs_out_in_days : null;
+    return d === null || d === undefined ? null : d;
+  }
+  function stRate(it) {
+    if (it.per_day > 0) return (isMoney(it.unit) ? it.unit : '') + fq(it.per_day) + ' a day';
+    var u = it.usage, pw = u && u.per_week;
+    if (!(pw > 0)) return '';
+    var m = isMoney(it.unit) ? it.unit : '';
+    if (pw >= 0.95) return 'about ' + m + stNice(pw) + ' a week';
+    var pm = pw * 30.44 / 7;
+    if (pm >= 0.95) return 'about ' + m + stNice(pm) + ' a month';
+    return 'now and then';
+  }
+  // "lasts 6 weeks", or ''.
+  function stLasts(it) {
+    var d = stDays(it);
+    if (d === null) return '';
+    if (d < 1) return 'runs out today';
+    if (d >= 3650) return 'lasts years';
+    return 'lasts ' + span(d);
+  }
+  function stUsage(it) {
+    var r = stRate(it), l = stLasts(it), d = stDays(it);
+    if (!r) return '';
+    return esc(r) + (l ? ' · <span class="' + (d !== null && d <= 14 ? 'warn-ink' : '') + '">' + esc(l) + '</span>' : '');
+  }
+  function stQuick(it, i) {
+    return '<button class="qbtn" data-act="use" data-id="' + it.id + '" aria-label="Use one ' + esc(it.name) + '"' + (i.none ? ' disabled' : '') + '>' + ICON.minus + '</button>' +
+      '<button class="qbtn add" data-act="stock" data-id="' + it.id + '" aria-label="Add ' + esc(it.name) + '">' + ICON.plus + '</button>';
+  }
+  function stNameBits(it, i) {
+    var b = '';
+    if (i.out && it.target_qty > 0) b = '<span class="badge bad st-flag">Out</span>';
+    return b;
+  }
+
+  // Phones and tablets: a two-line row. Line 1 name and expiry; line 2 the meter, where it's kept and usage.
+  function rowHtml(it, i, showIcon) {
+    var where = stWhere(it), use = stUsage(it);
+    var sub = [where ? esc(where) : '', use].filter(Boolean).join(' · ');
+    var body = (showIcon ? '<span class="row-ico" aria-hidden="true">' + cat(it.category).icon + '</span>' : '') +
+      '<span class="row-text"><span class="st-l1"><span class="row-name">' + esc(it.name) + '</span>' + stNameBits(it, i) + '</span>' +
+      '<span class="st-l2">' + stStock(it, i) + (i.soonest ? stExpChip(it, i, true) : '') + (sub ? '<span class="st-sub">' + sub + '</span>' : '') + '</span></span>';
     if (SEL) {   // picking items to delete: the whole row is a tick box
       var on = !!SEL[it.id];
-      return '<div class="row' + (on ? ' picked' : '') + (i.out ? ' is-out' : '') + '">' +
+      return '<div class="row st-row' + (on ? ' picked' : '') + (i.out ? ' is-out' : '') + '">' +
         '<button class="row-main" role="checkbox" aria-checked="' + on + '" data-act="sel-toggle" data-id="' + it.id + '">' +
         '<span class="box">' + ICON.check + '</span>' + body + '</button></div>';
     }
-    return '<div class="row' + (i.out ? ' is-out' : '') + '">' +
+    return '<div class="row st-row' + (i.out ? ' is-out' : '') + '">' +
       '<button class="row-main" data-act="open" data-id="' + it.id + '">' + body + '</button>' +
-      '<div class="row-ctl">' +
-      '<button class="qbtn" data-act="use" data-id="' + it.id + '" aria-label="Use one ' + esc(it.name) + '"' + (i.out ? ' disabled' : '') + '>' + ICON.minus + '</button>' +
-      '<button class="qbtn add" data-act="stock" data-id="' + it.id + '" aria-label="Add ' + esc(it.name) + '">' + ICON.plus + '</button>' +
-      '</div></div>';
+      '<div class="row-ctl">' + stQuick(it, i) + '</div></div>';
+  }
+
+  // Desktop: one table row.
+  function stTr(it, i, showIcon) {
+    var where = stWhere(it), places = stPlaces(it);
+    var name = (showIcon ? '<span class="st-ico" aria-hidden="true">' + cat(it.category).icon + '</span>' : '') +
+      '<span class="st-nm">' + esc(it.name) + '</span>' + stNameBits(it, i);
+    var on = SEL && !!SEL[it.id];
+    var first = SEL
+      ? '<button class="st-open" role="checkbox" aria-checked="' + on + '" data-act="sel-toggle" data-id="' + it.id + '"><span class="box">' + ICON.check + '</span>' + name + '</button>'
+      : '<button class="st-open" data-act="open" data-id="' + it.id + '">' + name + '</button>';
+    return '<tr class="is-clickable' + (on ? ' picked' : '') + (i.out ? ' is-out' : '') + '" data-act="' + (SEL ? 'sel-toggle' : 'open') + '" data-id="' + it.id + '">' +
+      '<td class="t-name">' + first + '</td>' +
+      '<td class="st-c-stock">' + stStock(it, i) + '</td>' +
+      '<td class="st-c-exp">' + stExpChip(it, i, false) + '</td>' +
+      '<td class="st-c-where"><span class="truncate"' + (places.length > 1 ? ' title="' + esc(places.join(', ')) + '"' : '') + '>' + (where ? esc(where) : '<span class="st-none">–</span>') + '</span></td>' +
+      '<td class="st-c-use"><span class="truncate">' + (stUsage(it) || '<span class="st-none">–</span>') + '</span></td>' +
+      '<td class="t-ctl">' + (SEL ? '' : stQuick(it, i)) + '</td></tr>';
+  }
+  // A group's header: name, count, and what needs doing in it (so a folded group still tells you).
+  function stGroupNote(xs) {
+    var exp = 0, low = 0;
+    xs.forEach(function (x) { if (x.i.exp === 'bad') exp++; if (x.i.low) low++; });
+    var bits = [];
+    if (exp) bits.push('<span class="bad-ink">' + exp + ' expired</span>');
+    if (low) bits.push('<span class="warn-ink">' + low + ' below target</span>');
+    return bits.join(' · ');
+  }
+  function stTable(list) {
+    var groups = [];
+    if (F.sort === 'category') {
+      list.forEach(function (x) {
+        var g = groups[groups.length - 1];
+        if (!g || g.cat !== x.it.category) groups.push(g = { cat: x.it.category, xs: [] });
+        g.xs.push(x);
+      });
+    } else groups.push({ cat: null, xs: list });
+    var html = '<div class="card flush st-card"><table class="table st-table"><colgroup><col class="st-w-name"><col class="st-w-stock">' +
+      '<col class="st-w-exp"><col class="st-w-where"><col class="st-w-use"><col class="st-w-ctl"></colgroup>' +
+      '<thead><tr><th scope="col">Item</th><th scope="col">In date</th><th scope="col">Expires</th><th scope="col">Kept</th>' +
+      '<th scope="col">Usage</th><th scope="col"><span class="sr-only">Use or add</span></th></tr></thead>';
+    groups.forEach(function (g) {
+      var folded = g.cat && ST_FOLD[g.cat] && !F.q.trim();
+      html += '<tbody>';
+      if (g.cat) {
+        var c = cat(g.cat), note = stGroupNote(g.xs);
+        html += '<tr class="table-group"><th colspan="6" scope="colgroup"><div class="st-gh">' +
+          '<button type="button" data-act="st-fold" data-cat="' + esc(g.cat) + '" aria-expanded="' + !folded + '">' + ST_CHEV +
+          '<span aria-hidden="true">' + c.icon + '</span> ' + esc(c.label) + ' <span class="n">' + g.xs.length + '</span></button>' +
+          (note ? '<span class="st-gnote">' + note + '</span>' : '') + '</div></th></tr>';
+      }
+      if (!folded) g.xs.forEach(function (x) { html += stTr(x.it, x.i, !g.cat); });
+      html += '</tbody>';
+    });
+    return html + '</table></div>';
+  }
+
+  function stMeta(n) {
+    return '<span class="result-count" aria-live="polite">' +
+      (SEL ? 'Tap the items to delete' : '<b>' + n + '</b> item' + (n === 1 ? '' : 's')) + '</span>' +
+      (SEL ? '<button class="link" id="selAll" data-act="sel-all"></button>'
+        : '<button class="link" data-act="sel-start">' + ICON.trash + ' Select to delete</button>');
   }
 
   function renderStoreList() {
@@ -635,34 +1542,43 @@
     if (!box) return;
     var list = filtered();
     if (SEL) Object.keys(SEL).forEach(function (k) { if (!byId(+k)) delete SEL[k]; });   // deleted on another phone
+    var meta = $('#stMeta');
+    if (meta) meta.innerHTML = list.length || SEL ? stMeta(list.length) : '<span class="result-count"><b>0</b> items</span>';
     var bar = SEL ? '<div class="selbar" role="region" aria-label="Delete items"><span class="selbar-n" id="selCount" aria-live="polite"></span>' +
       '<button class="btn small" data-act="sel-cancel">Cancel</button>' +
       '<button class="btn small del" id="selDelete" data-act="sel-delete"></button></div>' : '';
     if (!list.length) {
-      box.innerHTML = '<div class="card empty"><div class="crate">🔍</div><h2>Nothing here</h2><p>No items match that search or filter.</p><button class="btn" data-act="clear-filters">Clear filters</button></div>' + bar;
-      syncSel();
+      var what = F.q.trim() ? 'Nothing matches “' + esc(F.q.trim()) + '”' + (F.cat !== 'all' || F.show !== 'all' ? ' with these filters' : '') + '.'
+        : 'No items match these filters.';
+      box.innerHTML = '<div class="card empty st-empty"><div class="empty-ico">' + ICON.search + '</div><h2 class="empty-title">Nothing here</h2>' +
+        '<p>' + what + ' Try fewer words, or clear the filters.</p>' +
+        '<div class="btn-group st-empty-acts"><button class="btn" data-act="clear-filters">Clear filters</button>' +
+        (F.q.trim() ? '<button class="btn primary" data-act="st-new" data-name="' + esc(F.q.trim()) + '">' + ICON.plus + ' Add “' + esc(F.q.trim()) + '”</button>' : '') +
+        '</div></div>' + bar;
+      syncSel(list);
       return;
     }
-    var html = '<div class="list-bar"><span class="result-count">' +
-      (SEL ? 'Tap the items to delete' : list.length + ' item' + (list.length === 1 ? '' : 's')) + '</span>' +
-      (SEL ? '<button class="link" id="selAll" data-act="sel-all"></button>'
-        : '<button class="link" data-act="sel-start">' + ICON.trash + ' Select to delete</button>') +
-      '</div><div class="card flush">';
-    if (F.sort === 'category') {
-      var cur = null;
-      list.forEach(function (x) {
-        if (x.it.category !== cur) {
-          cur = x.it.category;
-          var n = list.filter(function (y) { return y.it.category === cur; }).length;
-          html += '<div class="group-head">' + cat(cur).icon + ' ' + esc(cat(cur).label) + ' <span class="n">' + n + '</span></div>';
-        }
-        html += rowHtml(x.it, x.i, false);
-      });
-    } else {
-      list.forEach(function (x) { html += rowHtml(x.it, x.i, true); });
+    var html;
+    if (ST_WIDE.matches) html = stTable(list);
+    else {
+      html = '<div class="card flush st-list">';
+      if (F.sort === 'category') {
+        var cur = null;
+        list.forEach(function (x) {
+          if (x.it.category !== cur) {
+            cur = x.it.category;
+            var n = list.filter(function (y) { return y.it.category === cur; }).length;
+            html += '<div class="group-head"><span aria-hidden="true">' + cat(cur).icon + '</span> ' + esc(cat(cur).label) + ' <span class="n">' + n + '</span></div>';
+          }
+          html += rowHtml(x.it, x.i, false);
+        });
+      } else {
+        list.forEach(function (x) { html += rowHtml(x.it, x.i, true); });
+      }
+      html += '</div>';
     }
-    box.innerHTML = html + '</div>' + bar;
-    syncSel();
+    box.innerHTML = html + bar;
+    syncSel(list);
   }
 
   // Picking several items to delete at once.
@@ -677,14 +1593,15 @@
     document.body.classList.remove('selecting');
     if (history.state && history.state.daSel) history.back();
   }
-  function syncSel() {
+  function syncSel(shown) {
     if (!SEL) return;
-    $$('[data-act="sel-toggle"]').forEach(function (b) {
+    $$('button[data-act="sel-toggle"]').forEach(function (b) {
       var on = !!SEL[b.dataset.id];
       b.setAttribute('aria-checked', String(on));
-      b.parentNode.classList.toggle('picked', on);
+      var row = b.closest('tr, .row');
+      if (row) row.classList.toggle('picked', on);
     });
-    var shown = filtered();
+    shown = shown || filtered();
     var all = shown.length && shown.every(function (x) { return SEL[x.it.id]; });
     var sa = $('#selAll');
     if (sa) sa.textContent = (all ? 'Unselect all ' : 'Select all ') + shown.length;
@@ -736,50 +1653,158 @@
     return c;
   }
 
-  function renderSupply(el) {
-    var short = shortList();
-    var todo = S.shopping.filter(function (s) { return !s.done; }).length;
-    var done = S.shopping.length - todo;
+  var supplyDrawn = false;   // the summary charts draw in once, not on every 30-second refresh
+
+  function runsOut(it) {
+    var d = stDays(it);
+    return typeof d === 'number' && isFinite(d) ? d : null;
+  }
+  // What to get first: out of stock essentials (in category order, so food and water lead), then whatever
+  // runs out soonest at the recent rate of use, then whatever is furthest below target.
+  function supplyUrgent(short) {
+    function rank(x) { return x.i.out ? 0 : runsOut(x.it) !== null ? 1 : 2; }
+    return short.slice().sort(function (a, b) {
+      var ra = rank(a), rb = rank(b);
+      if (ra !== rb) return ra - rb;
+      if (ra === 1 && runsOut(a.it) !== runsOut(b.it)) return runsOut(a.it) - runsOut(b.it);
+      if (ra === 2) {
+        var fa = a.i.fresh / a.it.target_qty, fb = b.i.fresh / b.it.target_qty;
+        if (fa !== fb) return fa - fb;
+      }
+      return catIndex(a.it.category) - catIndex(b.it.category) || byName(a.it, b.it);
+    });
+  }
+  function needWords(x) {
+    return 'Get <b>' + esc(qu(x.i.short, x.it.unit)) + '</b> · have ' + esc(fq(x.i.fresh)) + ' of ' + esc(fq(x.it.target_qty)) +
+      (x.it.price > 0 ? ' · <span class="nowrap">' + esc(money(x.i.short * x.it.price)) + '</span>' : '') +
+      (x.i.expired > 0 ? ' · <span class="bad-ink nowrap">' + esc(fq(x.i.expired)) + ' expired</span>' : '');
+  }
+  function supplyUrgentRow(x) {
+    var ro = runsOut(x.it);
+    var why = x.i.out ? pill('bad', 'Out of stock')
+      : ro !== null ? pill('warn', ro < 1 ? 'Runs out today' : 'Runs out in ' + span(Math.round(ro)))
+      : '<span class="pill plain">' + esc(Math.round(x.i.fresh / x.it.target_qty * 100)) + '% of target</span>';
+    return '<button class="li su-urgent" data-act="open" data-id="' + x.it.id + '">' +
+      '<span class="li-ico" aria-hidden="true">' + cat(x.it.category).icon + '</span>' +
+      '<span class="li-main"><span class="li-title">' + esc(x.it.name) + '</span>' +
+      '<span class="li-sub">Get ' + esc(qu(x.i.short, x.it.unit)) + '</span></span>' + why + '</button>';
+  }
+
+  function supplySummary(short, extras, anim) {
+    var targeted = S.items.filter(function (it) { return it.target_qty > 0; });
+    var met = targeted.length - short.length;
+    var ticked = extras.filter(function (s) { return s.done; }).length;
+    var todo = extras.length - ticked;
     var ha = S.server.ha && S.server.ha.todo ? S.server.ha : null;
-    var ticked = ha ? ha.ticked || [] : [];
+    var frac = targeted.length ? met / targeted.length : 1;
     var cost = supplyCost(short);
-    var html = '<section class="card"><div class="card-head"><h2>Supply run</h2><span class="small muted">' + (short.length + todo) + ' to get' +
-      (cost.priced ? ' · about ' + esc(money(cost.sum)) : '') + '</span></div>' +
-      '<p class="small muted">Everything below target, plus anything you add. Back from the shops? Tap <b>Got it</b> to put it in the stores.' +
-      (ha ? ' It\'s also on your Home Assistant list <b>' + esc(ha.todo_name) + '</b>.' : '') + '</p>' +
+
+    var html = '<section class="card sr-summary"><div class="card-kicker">Supply run</div>' +
+      '<div class="su-head">' +
+      (targeted.length ? '<div class="su-ring">' + DAChart.ring({
+        value: met, max: targeted.length, size: 112, thickness: 11, state: stateOf(frac),
+        label: Math.round(frac * 100) + '%', sub: 'at target', title: 'Items at target', noAnimate: !anim
+      }) + '</div>' : '') +
+      '<div class="su-counts"><p class="su-big"><b class="num">' + esc(short.length + todo) + '</b> to get</p>' +
+      '<p class="small muted">' + esc(short.length) + ' below target · ' + esc(todo) + ' extra' + (todo === 1 ? '' : 's') +
+      (ticked ? ' · ' + esc(ticked) + ' ticked' : '') + '</p>' +
+      (targeted.length ? '<p class="small muted">' + esc(met) + ' of ' + esc(targeted.length) + ' items at target</p>' : '') +
+      (cost.priced ? '<p class="small muted">About <b>' + esc(money(cost.sum)) + '</b>' + (cost.priced < short.length ? ' for the ' + esc(cost.priced) + ' with a price' : '') + '</p>' : '') +
+      '</div></div>' +
+      '<p class="small muted su-hint">Back from the shops? Tap <b>Got it</b> to put things in the stores.' +
+      (ha ? ' The list is also on your Home Assistant list <b>' + esc(ha.todo_name) + '</b>.' : '') + '</p>' +
       '<div class="btn-row"><button class="btn" data-act="copy-list">' + ICON.copy + ' Copy list</button>' +
       '<button class="btn" data-act="print-list">' + ICON.print + ' Print</button></div></section>';
 
-    html += '<section class="card flush"><div class="card-head"><h2>Below target</h2><span class="small muted">' + short.length + '</span></div>';
-    if (!short.length) {
-      html += '<p class="li muted">Nothing below target. All squared away.</p>';
+    if (short.length) {
+      html += '<section class="card su-urgent-card"><div class="card-head"><h2>Most urgent</h2></div><div class="list">' +
+        supplyUrgent(short).slice(0, 5).map(supplyUrgentRow).join('') + '</div></section>';
+
+      var cats = CATS.map(function (c) {
+        var tg = targeted.filter(function (it) { return it.category === c.id; });
+        var need = short.filter(function (x) { return x.it.category === c.id; }).length;
+        return { c: c, tg: tg.length, need: need };
+      }).filter(function (r) { return r.need > 0; });
+      html += '<section class="card su-cats"><div class="card-head"><h2>By category</h2><span class="small muted">at target</span></div>' +
+        DAChart.bars({
+          title: 'Items at target by category', noAnimate: !anim,
+          items: cats.map(function (r) {
+            var f = r.tg ? (r.tg - r.need) / r.tg : 0;
+            return { label: r.c.label, value: r.tg - r.need, max: r.tg, state: stateOf(f), valueText: r.need + ' to get', key: r.c.id };
+          })
+        }) + '</section>';
+    }
+    return html;
+  }
+
+  function supplyRow(x, ticked) {
+    var f = x.it.target_qty > 0 ? Math.min(1, x.i.fresh / x.it.target_qty) : 0;
+    return '<div class="li su-row"><button class="li-main" data-act="open" data-id="' + x.it.id + '">' +
+      '<span class="li-title">' + esc(x.it.name) + '</span>' +
+      '<span class="need">' + needWords(x) + '</span>' +
+      '<span class="row-meter" data-state="' + stateOf(f) + '" style="--pct:' + (f * 100).toFixed(1) + '%" aria-hidden="true"><i></i></span>' +
+      (ticked.indexOf(x.it.id) >= 0 ? '<span class="badge ok ha-tick">' + ICON.check + ' Ticked off in Home Assistant</span>' : '') + '</button>' +
+      '<button class="btn primary small su-got" data-act="stock" data-id="' + x.it.id + '" data-qty="' + esc(x.i.short) + '" aria-label="Got it: put ' + esc(x.it.name) + ' in the stores">' +
+      ICON.check + '<span>Got it</span></button></div>';
+  }
+
+  function supplyExtras(extras) {
+    var done = extras.filter(function (s) { return s.done; }).length;
+    var html = '<section class="card su-extras"><div class="card-head"><h2>Also get</h2>' +
+      (done ? '<button class="link" data-act="shop-clear">Clear ticked (' + esc(done) + ')</button>' : '<span class="small muted">' + esc(extras.length) + '</span>') + '</div>' +
+      '<form class="add-row" id="shopForm" autocomplete="off"><input type="text" name="text" placeholder="e.g. Spare fuses" maxlength="200" enterkeyhint="done" aria-label="Add to the list">' +
+      '<button class="btn primary" type="submit">' + ICON.plus + ' Add</button></form>';
+    if (!extras.length) {
+      html += '<p class="small muted su-extras-empty">Anything else for the trip that isn\'t in the stores: fuses, a spare lighter, the dog\'s biscuits.</p>';
     } else {
+      html += '<div class="list">';
+      extras.forEach(function (s) {
+        html += '<div class="li su-extra"><button class="check" role="checkbox" aria-checked="' + (s.done ? 'true' : 'false') + '" data-act="shop-toggle" data-id="' + s.id + '">' +
+          '<span class="box">' + ICON.check + '</span><span class="li-title">' + esc(s.text) + '</span></button>' +
+          (s.done ? '' : '<button class="btn small" data-act="shop-got" data-id="' + s.id + '" aria-label="Got it: add ' + esc(s.text) + ' to the stores">Got it</button>') +
+          '<button class="icon-btn" data-act="shop-edit" data-id="' + s.id + '" aria-label="Change ' + esc(s.text) + '">' + ICON.edit + '</button>' +
+          '<button class="icon-btn" data-act="shop-del" data-id="' + s.id + '" aria-label="Remove ' + esc(s.text) + '">' + ICON.close + '</button></div>';
+      });
+      html += '</div>';
+    }
+    return html + '</section>';
+  }
+
+  function renderSupply(el) {
+    var short = shortList(), extras = S.shopping;
+    var todo = extras.filter(function (s) { return !s.done; }).length;
+    var ha = S.server.ha && S.server.ha.todo ? S.server.ha : null;
+    var ticked = ha ? ha.ticked || [] : [];
+    var anim = !supplyDrawn;
+    supplyDrawn = true;
+
+    var list;
+    if (!short.length && !todo) {
+      list = '<section class="card empty sr-empty"><div class="empty-ico good">' + ICON.check + '</div>' +
+        '<h2 class="empty-title">' + (S.items.length ? 'All squared away' : 'Nothing on the list yet') + '</h2>' +
+        (S.items.length
+          ? '<p>Nothing is below target and there are no extras to get. Add anything else you need below.</p><button class="btn primary" data-tab="stores">Look over the stores</button>'
+          : '<p>The supply run fills itself from the stores: anything below its target turns up here. Start with the starter list.</p><button class="btn primary" data-act="seed">Load starter list</button>') +
+        '</section>';
+    } else if (!short.length) {
+      list = '<section class="card su-allmet"><p class="small muted" style="margin:0">' + ICON.check + ' Nothing in the stores is below target. Just the extras below.</p></section>';
+    } else {
+      list = '<section class="card flush su-list"><div class="card-head"><h2>Below target</h2><span class="small muted">' + esc(short.length) + ' item' + (short.length === 1 ? '' : 's') + '</span></div>';
       var cur = null;
       short.forEach(function (x) {
         if (x.it.category !== cur) {
           cur = x.it.category;
-          html += '<div class="group-head">' + cat(cur).icon + ' ' + esc(cat(cur).label) + '</div>';
+          var n = short.filter(function (y) { return y.it.category === cur; }).length;
+          list += '<div class="group-head"><span aria-hidden="true">' + cat(cur).icon + '</span> ' + esc(cat(cur).label) + ' <span class="n">' + n + '</span></div>';
         }
-        html += '<div class="li"><button class="li-main" data-act="open" data-id="' + x.it.id + '"><div class="li-title">' + esc(x.it.name) + '</div>' +
-          '<div class="need">Get <b>' + esc(qu(x.i.short, x.it.unit)) + '</b> · have ' + esc(fq(x.i.total)) + ' of ' + esc(fq(x.it.target_qty)) +
-          (x.it.price > 0 ? ' · ' + esc(money(x.i.short * x.it.price)) : '') + '</div>' +
-          (ticked.indexOf(x.it.id) >= 0 ? '<span class="badge ok ha-tick">' + ICON.check + ' Ticked off in Home Assistant</span>' : '') + '</button>' +
-          '<button class="btn small" data-act="stock" data-id="' + x.it.id + '" data-qty="' + x.i.short + '">Got it</button></div>';
+        list += supplyRow(x, ticked);
       });
+      list += '</section>';
     }
-    html += '</section>';
 
-    html += '<section class="card"><div class="card-head"><h2>Also get</h2>' +
-      (done ? '<button class="link" data-act="shop-clear">Clear ticked (' + done + ')</button>' : '') + '</div>' +
-      '<form class="add-row" id="shopForm" autocomplete="off"><input type="text" name="text" placeholder="e.g. Spare fuses" maxlength="200" enterkeyhint="done" aria-label="Add to the list">' +
-      '<button class="btn primary" type="submit">Add</button></form><div class="list">';
-    S.shopping.forEach(function (s) {
-      html += '<div class="li"><button class="check" role="checkbox" aria-checked="' + (s.done ? 'true' : 'false') + '" data-act="shop-toggle" data-id="' + s.id + '">' +
-        '<span class="box">' + ICON.check + '</span><span class="li-title">' + esc(s.text) + '</span></button>' +
-        '<button class="icon-btn" data-act="shop-del" data-id="' + s.id + '" aria-label="Remove ' + esc(s.text) + '">' + ICON.close + '</button></div>';
-    });
-    html += '</div></section>';
-    el.innerHTML = html;
+    el.innerHTML = '<div class="grid su-grid">' +
+      '<div class="col-4 stack su-side">' + supplySummary(short, extras, anim) + '</div>' +
+      '<div class="col-8 stack su-main">' + list + supplyExtras(extras) + '</div></div>';
   }
 
   function supplyText() {
@@ -787,7 +1812,9 @@
     var short = shortList();
     if (short.length) {
       lines.push('Below target:');
-      short.forEach(function (x) { lines.push('- ' + x.it.name + ': ' + qu(x.i.short, x.it.unit)); });
+      short.forEach(function (x) {
+        lines.push('- ' + x.it.name + ': ' + qu(x.i.short, x.it.unit) + (x.i.expired > 0 ? ' (replace ' + fq(x.i.expired) + ' expired)' : ''));
+      });
     }
     var extra = S.shopping.filter(function (s) { return !s.done; });
     if (extra.length) {
@@ -857,7 +1884,7 @@
         '<div class="card-foot btn-row"><button class="btn" data-act="check-new">' + ICON.plus + ' Add a check</button>' +
         (missing.length ? '<button class="btn" data-act="checks-seed">Suggestions (' + missing.length + ')</button>' : '') + '</div>';
     }
-    el.innerHTML = warnCard(true) + html + '</section>' + planCard();
+    el.innerHTML = warnCard(true) + '<div class="pl-grid">' + html + '</section>' + planCard() + '</div>';
   }
 
   function planEmpty(p) {
@@ -947,7 +1974,7 @@
     }
     // The Sitrep keeps it short: no test or finished Emergency Alerts, and the three most serious.
     var shown = w.items.map(function (x, i) { return [x, i]; }).filter(function (p) {
-      return full || !(p[0].source === 'govalerts' && p[0].severity < 2);
+      return full || !(p[0].source === 'govalerts' && p[0].severity < 2) && !warnOnMap(p[0]);
     });
     if (!full && !shown.length) return '';
     var more = full ? 0 : Math.max(0, shown.length - 3);
@@ -1526,84 +2553,312 @@
   // ------------------------------------------------------------------
   // HQ (settings)
   // ------------------------------------------------------------------
+  var COUNTED = { adults: 1, children: 1, pets: 1 };
   function stepperHtml(name, value, label, step, isSetting) {
     step = step || 1;
-    return '<div class="stepper"><button type="button" data-step="-' + step + '" aria-label="Less">' + ICON.minus + '</button>' +
-      '<input type="number" ' + (isSetting ? 'data-setting="' + name + '" id="set-' + name + '"' : 'name="' + name + '"') +
-      ' value="' + esc(value) + '" inputmode="decimal" min="0" step="any" aria-label="' + esc(label) + '">' +
-      '<button type="button" data-step="' + step + '" aria-label="More">' + ICON.plus + '</button></div>';
+    var lc = label.toLowerCase();
+    var less = COUNTED[name] ? 'Fewer ' + lc : 'Less (' + lc + ')', more = COUNTED[name] ? 'More ' + lc : 'More (' + lc + ')';
+    // A text box rather than type=number, so "1,5" works as well as "1.5".
+    return '<div class="stepper"><button type="button" data-step="-' + step + '" aria-label="' + esc(less) + '">' + ICON.minus + '</button>' +
+      '<input type="text" ' + (isSetting ? 'data-setting="' + name + '" id="set-' + name + '"' : 'name="' + name + '"') +
+      ' value="' + esc(value) + '" inputmode="decimal" autocomplete="off" aria-label="' + esc(label) + '">' +
+      '<button type="button" data-step="' + step + '" aria-label="' + esc(more) + '">' + ICON.plus + '</button></div>';
   }
   function setRow(key, label, hint, value, step) {
     return '<div class="set-row"><label for="set-' + key + '">' + esc(label) + (hint ? '<span class="hint">' + esc(hint) + '</span>' : '') + '</label>' +
       stepperHtml(key, value, label, step, true) + '</div>';
   }
 
-  function renderHQ(el) {
-    var st = S.settings, r = readiness(), target = st.target_days;
-    var theme = document.documentElement.dataset.theme || 'auto';
-    var html = '<section class="card"><div class="card-head"><h2>Household</h2></div>' +
+  // What the household needs a day, and what the target adds up to, against what's in the stores.
+  function needsHtml() {
+    var r = readiness(), target = S.settings.target_days;
+    var kcalT = r.kcalDay * target, waterT = r.waterDay * target;
+    var html = '<div class="hq-needs-stats">' +
+      '<div class="stat plain"><span class="stat-label">Food a day</span><span class="stat-val">' + esc(nf0.format(r.kcalDay)) + '<span class="stat-unit"> kcal</span></span></div>' +
+      '<div class="stat plain"><span class="stat-label">Water a day</span><span class="stat-val">' + esc(fq(r.waterDay)) + '<span class="stat-unit"> litres</span></span></div>' +
+      '</div>' +
+      '<p class="hq-needs-total">For <b>' + esc(daysWords(target)) + '</b> that\'s <b class="nowrap">' + esc(nf0.format(kcalT)) + ' kcal</b> and <b class="nowrap">' +
+      esc(nf0.format(waterT)) + ' litres</b> of water.</p>';
+    if (kcalT > 0 || waterT > 0) {
+      html += DAChart.bars({
+        title: 'In the stores against the target', noAnimate: true,
+        items: [
+          { label: 'Food in date', value: Math.round(r.kcal), max: Math.round(kcalT), state: stateOf(kcalT > 0 ? r.kcal / kcalT : 0),
+            valueText: fmtDays(r.foodDays) + ' of ' + target + ' days' },
+          { label: 'Water in date', value: Math.round(r.litres), max: Math.round(waterT), state: stateOf(waterT > 0 ? r.litres / waterT : 0),
+            valueText: fmtDays(r.waterDays) + ' of ' + target + ' days' }
+        ]
+      });
+    }
+    if (scalingCount()) html += '<p class="small muted hq-needs-note">Starter list targets that you haven\'t changed keep up with this.</p>';
+    return html;
+  }
+  function scalingCount() { return S.items.filter(function (it) { return it.target_rule; }).length; }
+
+  function daysWords(d) {
+    d = +d;
+    if (d === 365) return '1 year';
+    if (d === 730) return '2 years';
+    if (d === 7) return '1 week';
+    return fq(d) + (d === 1 ? ' day' : ' days');
+  }
+
+  // Sliders for a number of days. The track is a list of sensible stops (so dragging lands on round numbers and
+  // the arrow keys take useful steps); anything else is typed into the box beside it.
+  var SLIDERS = {
+    target_days: { label: 'Readiness target', stops: [1, 2, 3, 4, 5, 7, 10, 14, 21, 30, 45, 60, 90, 120, 180, 270, 365] },
+    warn_days: { label: 'Expiry warning', stops: [1, 3, 7, 10, 14, 21, 30, 45, 60, 90, 120, 180, 270, 365] }
+  };
+  function sliderIndex(key, v) {
+    var stops = SLIDERS[key].stops, best = 0;
+    for (var i = 0; i < stops.length; i++) {
+      if (Math.abs(Math.log(stops[i] / v)) < Math.abs(Math.log(stops[best] / v))) best = i;
+    }
+    return best;
+  }
+  function sliderHtml(key, value) {
+    var sl = SLIDERS[key], i = sliderIndex(key, value), p = i / (sl.stops.length - 1);
+    return '<div class="slider hq-slider" style="--p:' + p.toFixed(3) + '">' +
+      '<input type="range" id="rng-' + key + '" data-slider="' + key + '" min="0" max="' + (sl.stops.length - 1) + '" step="1" value="' + i + '"' +
+      ' aria-label="' + esc(sl.label) + '" aria-valuetext="' + esc(daysWords(value)) + '">' +
+      '<output class="slider-val" for="rng-' + key + '">' + esc(daysWords(value)) + '</output></div>' +
+      '<div class="slider-scale" aria-hidden="true"><span>' + esc(daysWords(sl.stops[0])) + '</span><span>' + esc(daysWords(sl.stops[sl.stops.length - 1])) + '</span></div>';
+  }
+  // Show a value on a slider (bubble, fill), and on the preset chips and the box that go with it.
+  function syncDays(key, v, except) {
+    if (!SLIDERS[key] || !(v > 0)) return;
+    var r = $('#rng-' + key);
+    if (r && r !== except) r.value = sliderIndex(key, v);
+    if (r) {
+      r.parentNode.style.setProperty('--p', (r.value / (SLIDERS[key].stops.length - 1)).toFixed(3));
+      r.setAttribute('aria-valuetext', daysWords(v));
+      var out = r.parentNode.querySelector('output');
+      if (out) out.textContent = daysWords(v);
+    }
+    $$('[data-setting="' + key + '"]').forEach(function (i) { if (i !== except && i !== document.activeElement) i.value = v; });
+    $$('[data-act="set"][data-key="' + key + '"]').forEach(function (b) { b.setAttribute('aria-pressed', String(+b.dataset.val === v)); });
+  }
+  function sliderMoved(t) {
+    var key = t.dataset.slider, v = SLIDERS[key].stops[+t.value];
+    syncDays(key, v, t);
+    return v;
+  }
+  function sliderSave(t) { queueSetting(t.dataset.slider, sliderMoved(t)); }
+  // Live feedback while dragging or typing; saving happens in the change handler (sliderSave, queueSetting).
+  function hqLive(e) {
+    var t = e.target;
+    if (!t || !t.dataset || view !== 'hq') return;
+    if (t.dataset.slider) { sliderMoved(t); return; }
+    if (SLIDERS[t.dataset.setting]) { var v = parseQty(t.value); if (v > 0) syncDays(t.dataset.setting, v, t); }
+  }
+  document.addEventListener('input', hqLive);
+  document.addEventListener('change', hqLive);
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest && e.target.closest('[data-act="set"]');
+    if (b && view === 'hq' && SLIDERS[b.dataset.key]) syncDays(b.dataset.key, +b.dataset.val);
+  });
+
+  // HQ was saved while a field has focus: update what's shown around it without redrawing.
+  function updateHQ() {
+    if (view !== 'hq') return;
+    var st = S.settings, a = document.activeElement;
+    var needs = $('#hqNeeds');
+    if (needs) needs.innerHTML = needsHtml();
+    $$('[data-setting]').forEach(function (i) { if (i !== a && st[i.dataset.setting] !== undefined) i.value = st[i.dataset.setting]; });
+    $$('[data-catwarn]').forEach(function (i) { if (i !== a) i.value = (st.category_warn_days || {})[i.dataset.catwarn] || ''; });
+    $$('[data-catwarn]').forEach(function (i) { i.placeholder = st.warn_days; });
+    $$('[data-act="set"]').forEach(function (b) { b.setAttribute('aria-pressed', String(st[b.dataset.key] === +b.dataset.val)); });
+    Object.keys(SLIDERS).forEach(function (k) {
+      var r = $('#rng-' + k);
+      if (r && r !== a) syncDays(k, st[k]);
+    });
+  }
+
+  // Sections. Desktop and tablet show one at a time beside the list; phones stack them all and the chips jump.
+  var HQ_SEC = 'household';
+  var HQ_ICON = {
+    household: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11l8-7 8 7M6 9.5V20h12V9.5M10 20v-6h4v6"/></svg>',
+    targets: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4"/><path d="M12 12h.01"/></svg>',
+    alerts: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 16v-5a6 6 0 0 1 12 0v5l1.5 2h-15zM10 20.5h4"/></svg>',
+    backups: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4"/></svg>',
+    ha: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 11.5L12 4l8.5 7.5M6 10v10h12V10"/><circle cx="12" cy="14" r="2"/></svg>',
+    appearance: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 0 0 16z" style="fill:currentColor"/></svg>',
+    activity: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg>'
+  };
+  function hqSections() {
+    var s = [['household', 'Household'], ['targets', 'Targets and warnings'], ['alerts', 'Warnings and alerts'], ['backups', 'Backups']];
+    if (S.server.ha) s.push(['ha', 'Home Assistant']);
+    s.push(['appearance', 'Appearance'], ['activity', 'Activity']);
+    return s;
+  }
+  function hqPhone() { return window.matchMedia ? window.matchMedia('(max-width: 699px)').matches : window.innerWidth < 700; }
+  function hqShow(sec, jump) {
+    if (!$('#hq-' + sec)) sec = 'household';
+    HQ_SEC = sec;
+    $$('.hq-sec').forEach(function (s) { s.classList.toggle('is-on', s.dataset.sec === sec); });
+    $$('[data-act="hq-sec"]').forEach(function (b) { b.setAttribute('aria-current', String(b.dataset.sec === sec)); });
+    if (!jump) return;
+    var calm = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+    var nav = $('#hq-nav-' + sec);
+    if (nav && nav.parentNode.scrollTo) nav.parentNode.scrollTo({ left: nav.offsetLeft - nav.parentNode.offsetLeft - 16, behavior: calm });
+    if (hqPhone()) { var el = $('#hq-' + sec); if (el) el.scrollIntoView({ block: 'start', behavior: calm }); }
+    else window.scrollTo(0, 0);
+  }
+  function hqSec(id, title, sub, body) {
+    return '<section class="hq-sec' + (id === HQ_SEC ? ' is-on' : '') + '" id="hq-' + id + '" data-sec="' + id + '" aria-labelledby="hq-h-' + id + '">' +
+      '<header class="hq-sec-head"><h2 class="hq-sec-title" id="hq-h-' + id + '">' + esc(title) + '</h2>' +
+      (sub ? '<p class="hq-sec-sub">' + sub + '</p>' : '') + '</header>' + body + '</section>';
+  }
+
+  function hqHousehold() {
+    var st = S.settings;
+    return '<div class="hq-two">' +
+      '<section class="card"><div class="card-head"><h2>People</h2></div>' +
       setRow('adults', 'Adults', '', st.adults, 1) +
       setRow('children', 'Children', '', st.children, 1) +
       setRow('kcal_adult', 'Calories per adult', 'kcal a day', st.kcal_adult, 100) +
       setRow('kcal_child', 'Calories per child', 'kcal a day', st.kcal_child, 100) +
       setRow('water_per_person', 'Water per person', 'litres a day (drinking & cooking)', st.water_per_person, 0.5) +
-      '<div class="needs">Your household needs <b>' + nf0.format(r.kcalDay) + ' kcal</b> and <b>' + fq(r.waterDay) + ' L of water</b> a day. ' +
-      'For ' + target + ' days that\'s <b>' + nf0.format(r.kcalDay * target) + ' kcal</b> and <b>' + nf0.format(r.waterDay * target) + ' L</b>.</div></section>';
-
-    html += '<section class="card"><div class="card-head"><h2>Readiness target</h2></div>' +
-      '<p class="small muted">How many days should your stores last?</p><div class="chips">' +
-      [3, 7, 14, 30, 90, 180, 365].map(function (d) {
-        return '<button class="chip" data-act="set" data-key="target_days" data-val="' + d + '" aria-pressed="' + (st.target_days === d) + '">' + (d === 365 ? '1 year' : d + ' days') + '</button>';
-      }).join('') + '</div>' +
-      setRow('target_days', 'Custom', 'days', st.target_days, 1) +
-      '<div class="card-head" style="margin-top:12px"><h2>Expiry warning</h2></div>' +
-      '<p class="small muted">Flag stock this many days before it expires.</p><div class="chips">' +
-      [14, 30, 60, 90].map(function (d) {
-        return '<button class="chip" data-act="set" data-key="warn_days" data-val="' + d + '" aria-pressed="' + (st.warn_days === d) + '">' + d + ' days</button>';
-      }).join('') + '</div></section>';
-
-    html += '<section class="card"><div class="card-head"><h2>Hard copy &amp; backups</h2></div>' +
-      '<p class="small muted">If the power goes, so does the Pi. Keep a printed copy with the stores, and a backup somewhere other than the Pi.</p>' +
-      '<div class="btn-stack">' +
-      '<button class="btn block" data-act="print">' + ICON.print + ' Print full inventory</button>' +
-      '<button class="btn block" data-act="print-plan">' + ICON.print + ' Print emergency plan &amp; checks</button>' +
-      '<a class="btn block" href="api/backup.json" download>' + ICON.download + ' Download backup</a>' +
-      '<a class="btn block" href="api/export.csv" download>' + ICON.download + ' Export spreadsheet (CSV)</a>' +
-      '<button class="btn block" data-act="restore">' + ICON.upload + ' Restore from a backup…</button></div>' +
-      '<p class="small muted" style="margin:10px 0 0">The Pi also saves its own copy every day' +
-      (S.server.last_backup ? ' (last one ' + esc(ago(S.server.last_backup)) + ')' : '') + '.</p></section>';
-
-    html += '<section class="card"><div class="card-head"><h2>Starter list</h2></div>' +
-      '<p class="small muted">Adds about 95 suggested essentials at zero stock, with targets sized for your household and ' + target + '-day goal. ' +
+      '<h3 class="hq-sub">Pets</h3>' +
+      setRow('pets', 'Pets', '', st.pets || 0, 1) +
+      setRow('kcal_per_pet', 'Calories per pet', 'kcal a day, if their food is in Food', st.kcal_per_pet || 0, 50) +
+      setRow('water_per_pet', 'Water per pet', 'litres a day', st.water_per_pet || 0, 0.5) + '</section>' +
+      '<div class="stack"><section class="card hq-needs"><div class="card-head"><h2>Daily needs</h2></div><div id="hqNeeds">' + needsHtml() + '</div></section>' +
+      '<section class="card"><div class="card-head"><h2>Starter list</h2></div>' +
+      '<p class="small muted">Adds about 95 suggested essentials at zero stock, with targets sized for your household and a goal of ' + esc(daysWords(st.target_days)) + '. ' +
+      'Those targets keep up when your household or goal changes, until you set one yourself. ' +
       'Anything you already have is skipped. To clear out what you don\'t need, use <b>Select to delete</b> in Stores.</p>' +
-      '<button class="btn block" data-act="seed">Load starter list</button></section>';
+      '<button class="btn block" data-act="seed">Load starter list</button></section></div></div>';
+  }
 
-    html += warnHqCard() + homeCard() + haCard();
-
-    html += '<section class="card"><div class="card-head"><h2>Appearance</h2></div><div class="seg" role="group" aria-label="Theme">' +
-      [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']].map(function (t) {
-        return '<button data-act="theme" data-val="' + t[0] + '" aria-pressed="' + (theme === t[0]) + '">' + t[1] + '</button>';
+  function hqTargets() {
+    var st = S.settings, cw = st.category_warn_days || {};
+    var chips = function (key, list) {
+      return '<div class="chips hq-presets" role="group" aria-label="Quick choices">' + list.map(function (d) {
+        return '<button class="chip" data-act="set" data-key="' + key + '" data-val="' + d + '" aria-pressed="' + (st[key] === d) + '">' + esc(daysWords(d)) + '</button>';
+      }).join('') + '</div>';
+    };
+    var overrides = Object.keys(cw).filter(function (k) { return cw[k]; }).length;
+    return '<section class="card"><div class="card-head"><h2>Readiness target</h2></div>' +
+      '<p class="small muted">How long should your stores last? The Sitrep measures everything against this.</p>' +
+      sliderHtml('target_days', st.target_days) + chips('target_days', [3, 7, 14, 30, 90, 180, 365]) +
+      setRow('target_days', 'Exactly', 'days, up to 10 years', st.target_days, 1) + '</section>' +
+      '<section class="card"><div class="card-head"><h2>Expiry warning</h2></div>' +
+      '<p class="small muted">Flag stock this long before its best-before date, so there\'s time to use it up.</p>' +
+      sliderHtml('warn_days', st.warn_days) + chips('warn_days', [7, 14, 30, 60, 90]) +
+      setRow('warn_days', 'Exactly', 'days, up to a year', st.warn_days, 1) + '</section>' +
+      '<section class="card"><div class="card-head"><h2>By category</h2>' + (overrides ? '<span class="small muted">' + overrides + ' set</span>' : '') + '</div>' +
+      '<p class="small muted">Leave a box empty to use the warning above. Handy for medicines or batteries you want to know about sooner.</p>' +
+      '<div class="hq-catwarn">' + CATS.map(function (c) {
+        return '<label class="hq-cw' + (cw[c.id] ? ' is-set' : '') + '"><span class="hq-cw-name"><span aria-hidden="true">' + c.icon + '</span> ' + esc(c.short || c.label) + '</span>' +
+          '<span class="hq-cw-box"><input type="text" inputmode="numeric" autocomplete="off" data-catwarn="' + c.id + '" value="' + esc(cw[c.id] || '') + '" placeholder="' + esc(st.warn_days) + '" aria-label="' + esc(c.label) + ': days before best-before to warn"><span aria-hidden="true">days</span></span></label>';
       }).join('') + '</div></section>';
+  }
 
-    html += '<section class="card"><div class="card-head"><h2>Activity log</h2><span class="small muted">last ' + S.log.length + '</span></div>' +
-      (S.log.length ? logHtml(S.log) : '<p class="small muted">Nothing yet.</p>') + '</section>';
-    html += '<p class="tagline">Dads Army v' + esc(S.server.version) + ' · Don\'t panic</p>';
-    el.innerHTML = html;
+  // One on/off row: title, a line of explanation, and a switch.
+  function hqToggle(key, on, title, hint, extra) {
+    return '<label class="hq-toggle" for="intel-' + key + '"><span class="hq-toggle-text"><span class="hq-toggle-title">' + title + '</span>' +
+      (hint ? '<span class="hq-toggle-hint">' + hint + '</span>' : '') + '</span>' + (extra || '') +
+      '<span class="switch"><input type="checkbox" id="intel-' + key + '" data-intel="' + esc(key) + '"' + (on ? ' checked' : '') + '></span></label>';
+  }
+  function intelField(key, label, control) {
+    return '<div class="field"><label class="field-label" for="intel-' + key + '">' + esc(label) + '</label>' + control + '</div>';
+  }
+
+  // The live alerts section: where you are, what to show, and how each source is doing.
+  function intelHQ() {
+    var I = S.intel;
+    if (!I) return '<section class="card"><p class="small muted" style="margin:0">Live alerts aren\'t available on this copy of Dads Army.</p></section>';
+    var c = I.settings;
+    var html = '<section class="card" id="intelCard">' +
+      hqToggle('intel_enabled', c.intel_enabled, 'Check live alerts', 'Flood, weather, power cut and other warnings from the official feeds.') +
+      '<p class="callout info hq-privacy">Dads Army checks the official feeds itself. Each feed is a national list filtered here, ' +
+      'so nothing about where you live is sent to them. Your county, region and postcode districts decide what counts as “near you”.</p>' +
+      (c.intel_enabled ? '' : '<p class="callout warn">Live alerts are off. Nothing is checked until you turn them on.</p>') + '</section>';
+
+    html += '<section class="card"><div class="card-head"><h2>Where you are</h2></div><div class="intel-fields hq-fields">' +
+      intelField('intel_county', 'County (flood warnings near you)',
+        '<input type="text" id="intel-intel_county" autocomplete="off" data-intel="intel_county" value="' + esc(c.intel_county) + '" placeholder="e.g. Cambridgeshire">') +
+      intelField('intel_met_region', 'Met Office region',
+        '<div class="select"><select id="intel-intel_met_region" data-intel="intel_met_region"><option value="">Choose…</option>' +
+        Object.keys(I.met_regions).map(function (k) {
+          return '<option value="' + esc(k) + '"' + (c.intel_met_region === k ? ' selected' : '') + '>' + esc(I.met_regions[k]) + '</option>';
+        }).join('') + '</select></div>') +
+      intelField('intel_postcodes', 'Postcode districts (power cuts near you)',
+        '<input type="text" id="intel-intel_postcodes" autocomplete="off" autocapitalize="characters" data-intel="intel_postcodes" value="' + esc(c.intel_postcodes) + '" placeholder="e.g. AB12 AB3">') +
+      intelField('intel_air_region', 'Air quality region',
+        '<div class="select"><select id="intel-intel_air_region" data-intel="intel_air_region"><option value="">Choose…</option>' +
+        I.air_regions.map(function (r) {
+          return '<option' + (c.intel_air_region === r ? ' selected' : '') + '>' + esc(r) + '</option>';
+        }).join('') + '</select></div>') +
+      intelField('intel_map_postcode', 'Centre the map on (postcode)',
+        '<input type="text" id="intel-intel_map_postcode" autocomplete="postal-code" autocapitalize="characters" data-intel="intel_map_postcode" value="' + esc(c.intel_map_postcode) + '" placeholder="Home Assistant\'s home">') +
+      intelField('intel_radius_km', '“Near you” distance',
+        '<div class="select"><select id="intel-intel_radius_km" data-intel="intel_radius_km">' +
+        [5, 10, 15, 25, 40].map(function (k) {
+          return '<option value="' + k + '"' + (+c.intel_radius_km === k ? ' selected' : '') + '>' + k + ' km</option>';
+        }).join('') + '</select></div>') +
+      '</div><p class="small muted hq-foot">A map postcode is looked up once at postcodes.io when you save it' +
+      (I.map && I.map.home_from ? '; the map is centred on ' + esc(I.map.home_from === 'postcode' ? 'your postcode' : 'Home Assistant\'s home') : '') + '.</p></section>';
+
+    html += '<section class="card"><div class="card-head"><h2>What to show</h2></div>' +
+      hqToggle('intel_map', c.intel_map, 'Map on the Sitrep', 'Map tiles come from OpenStreetMap.') +
+      hqToggle('intel_uk', c.intel_uk, 'Across the UK', 'Show alerts elsewhere on the map, for context.') +
+      hqToggle('intel_trends', c.intel_trends, 'Watch for trends', 'Flag a worrying direction of travel: rivers rising, power cuts or flood warnings climbing, gas emptying faster, sharp moves in the pound or markets.') +
+      '<p class="small muted hq-foot">Only alerts near you raise the alert level and the Home Assistant sensors; the rest are on the map for context.</p></section>';
+
+    html += '<section class="card hq-sources"><div class="card-head"><h2>Sources</h2>' +
+      '<button class="btn small" data-act="intel-refresh"' + (c.intel_enabled ? '' : ' disabled') + '>Check now</button></div>' +
+      I.sources.map(function (s) {
+        var key = 'intel_' + s.id;
+        var status = !s.enabled ? '<span class="pill plain">Off</span>' : s.ok === null || s.ok === undefined ? pill('warn', 'Not checked yet')
+          : s.ok ? pill(LEVEL_STATE[s.level] || 'good', s.items.some(function (i) { return LEVEL_RANK[i.level] >= LEVEL_RANK.minor; }) ? LEVEL_WORD[s.level] : 'OK')
+          : pill('bad', 'Failing');
+        var sub = (s.checked_at ? 'Checked ' + esc(ago(s.checked_at)) + ' · ' : '') + 'every ' + esc(s.refresh_minutes) + ' min';
+        var alerts = s.enabled ? s.items.filter(function (i) { return LEVEL_RANK[i.level] >= LEVEL_RANK.minor; }) : [];
+        return '<div class="hq-src">' +
+          hqToggle(key, c[key], '<span aria-hidden="true">' + (INTEL_ICON[s.id] || '') + '</span> ' + esc(s.name),
+            sub + '<span class="hq-attr">' + esc(s.attribution) + '</span>', '<span class="hq-src-status">' + status + '</span>') +
+          (s.error ? '<p class="small ha-error">' + esc(s.error) + '</p>' : '') +
+          (alerts.length ? '<div class="list hq-src-items">' + alerts.map(function (i) { return intelItemHtml(s, i); }).join('') + '</div>' : '') +
+          '</div>';
+      }).join('') + '</section>';
+
+    html += '<p class="callout hq-safety">These feeds help you get ready; they don\'t replace official warnings. In an emergency, call 999.</p>';
+    return html;
+  }
+
+  function hqBackups() {
+    return '<div class="hq-two">' +
+      '<section class="card"><div class="card-head"><h2>Hard copy</h2></div>' +
+      '<p class="small muted">A printed list to keep with the stores, with a box to tick for each batch.</p>' +
+      '<div class="btn-stack"><button class="btn block" data-act="print">' + ICON.print + ' Print full inventory</button>' +
+      '<button class="btn block" data-act="print-plan">' + ICON.print + ' Print emergency plan &amp; checks</button></div></section>' +
+      '<section class="card"><div class="card-head"><h2>Take a copy</h2></div>' +
+      '<p class="small muted">Keep a backup somewhere other than the Pi: a laptop, a USB stick, your email.</p>' +
+      '<div class="btn-stack"><a class="btn block" href="api/backup.json" download>' + ICON.download + ' Download backup</a>' +
+      '<a class="btn block" href="api/export.csv" download>' + ICON.download + ' Export spreadsheet (CSV)</a></div></section></div>' +
+      '<section class="card"><div class="card-head"><h2>Restore</h2></div>' +
+      '<div class="hq-backup-stat"><span class="stat plain"><span class="stat-label">Last automatic copy</span><span class="stat-val">' +
+      esc(S.server.last_backup ? ago(S.server.last_backup) : 'Not yet') + '</span></span>' +
+      '<p class="small muted">Dads Army saves its own copy every day.</p></div>' +
+      '<p class="callout warn">Restoring replaces everything in the stores. Dads Army keeps a copy of what\'s there now first, just in case.</p>' +
+      '<div class="btn-group hq-restore"><button class="btn" data-act="restore">' + ICON.upload + ' Restore from a file…</button>' +
+      '<button class="btn" data-act="backups">' + ICON.upload + ' Restore an automatic copy…</button></div></section>';
   }
 
   // Only shown when Dads Army runs as a Home Assistant app.
   function haCard() {
     var ha = S.server.ha;
     if (!ha) return '';
-    var html = '<section class="card"><div class="card-head"><h2>Home Assistant</h2></div>' +
-      '<h3 class="plan-h">Dashboard</h3>' + dashPart(ha) +
-      '<h3 class="plan-h">Today\'s checklist</h3>' + checksPart(ha) +
-      '<h3 class="plan-h">Supply run list</h3>';
+    var html = '<section class="card"><div class="card-head"><h2>Dashboard</h2></div>' + dashPart(ha) + '</section>' +
+      '<section class="card"><div class="card-head"><h2>Today\'s checklist</h2></div>' + checksPart(ha) + '</section>' +
+      '<section class="card"><div class="card-head"><h2>Supply run list</h2></div>';
     if (!ha.todo) {
       html += '<p class="small muted">Put the supply run on a Home Assistant to-do list. Tick things off there, and add to it from anywhere, ' +
         'including by voice: <i>“Add matches to the supply run list”</i>.</p>' +
-        '<div class="btn-stack"><button class="btn block" data-act="ha-make">' + ICON.list + ' Make a “Supply run” list</button>' +
-        '<button class="btn block" data-act="ha-pick">Use a list I already have…</button></div>';
+        '<div class="btn-group"><button class="btn primary" data-act="ha-make">' + ICON.list + ' Make a “Supply run” list</button>' +
+        '<button class="btn" data-act="ha-pick">Use a list I already have…</button></div>';
     } else {
       var state = ha.ok === false ? pill('bad', 'Not syncing') : ha.ok ? pill('good', 'In step') : pill('warn', 'Starting');
       html += '<div class="ha-link"><div class="li-main"><span class="li-title">' + esc(ha.todo_name) + '</span>' +
@@ -1611,10 +2866,11 @@
         (ha.ok === false && ha.error ? '<p class="small ha-error">' + esc(ha.error) + '</p>' : '') +
         '<p class="small muted">Everything on the supply run is on that list. Tick extras off on either side. ' +
         'Tick off a below-target item there and it\'s marked here, ready to put away with <b>Got it</b>.</p>' +
-        '<div class="btn-row"><button class="btn" data-act="ha-pick">Change list</button><button class="btn" data-act="ha-stop">Stop syncing</button></div>';
+        '<div class="btn-group"><button class="btn" data-act="ha-pick">Change list</button><button class="btn danger" data-act="ha-stop">Stop syncing</button></div>';
     }
-    return html + '<p class="small muted" style="margin:12px 0 0">For phone alerts and cards for your own dashboards, open the app\'s <b>Documentation</b> tab in Home Assistant.</p></section>';
+    return html + '</section><p class="callout info">For dashboard cards and phone alerts, open the app\'s <b>Documentation</b> tab in Home Assistant.</p>';
   }
+
   function inHomeAssistant() {
     try { return window.top !== window.self; } catch (e) { return true; }
   }
@@ -1645,14 +2901,74 @@
       '<div class="btn-row"><button class="btn" data-act="ha-pick" data-target="checks">Change list</button><button class="btn" data-act="ha-checks-stop">Stop</button></div>';
   }
 
+  function hqAppearance() {
+    var theme = document.documentElement.dataset.theme || 'auto';
+    return '<section class="card"><div class="card-head"><h2>Theme</h2></div>' +
+      '<div class="seg hq-theme" role="group" aria-label="Theme">' +
+      [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']].map(function (t) {
+        return '<button data-act="theme" data-val="' + t[0] + '" aria-pressed="' + (theme === t[0]) + '">' + t[1] + '</button>';
+      }).join('') + '</div>' +
+      '<p class="small muted hq-foot">Auto follows this device\'s light or dark setting. The choice is kept on this device only.</p></section>';
+  }
+
+  // The activity log, a day at a time.
+  function hqLogHtml(entries) {
+    var day = null, html = '', t0 = today();
+    entries.forEach(function (l) {
+      var d = String(l.ts || '').slice(0, 10);
+      if (d !== day) {
+        day = d;
+        var n = d ? -daysUntil(d) : null;
+        var label = !d ? 'Earlier' : n === 0 ? 'Today' : n === 1 ? 'Yesterday' : parseYmd(d).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
+        html += (html ? '</div>' : '') + '<h3 class="hq-log-day">' + esc(label) + '</h3><div class="hq-log">';
+      }
+      var time = String(l.ts || '').slice(11, 16);
+      html += '<div class="hq-log-item"><span class="log-dot ' + esc(l.action) + '" aria-hidden="true"></span>' +
+        '<div class="log-text"><b>' + esc(LOG_VERB[l.action] || l.action) + '</b>' + (l.item ? ' ' + esc(l.item) : '') +
+        (l.detail ? '<span class="hq-log-detail">' + esc(l.detail) + '</span>' : '') + '</div>' +
+        '<time class="log-when" datetime="' + esc(l.ts) + '" title="' + esc(ago(l.ts)) + '">' + esc(d === t0 ? ago(l.ts) : time) + '</time></div>';
+    });
+    return html ? html + '</div>' : '';
+  }
+
+  function renderHQ(el) {
+    var secs = hqSections();
+    if (!secs.some(function (s) { return s[0] === HQ_SEC; })) HQ_SEC = 'household';
+    var html = '<div class="split hq">' +
+      '<nav class="subnav hq-nav" aria-label="HQ sections">' + secs.map(function (s) {
+        return '<button type="button" id="hq-nav-' + s[0] + '" data-act="hq-sec" data-sec="' + s[0] + '" aria-current="' + (s[0] === HQ_SEC) + '">' +
+          HQ_ICON[s[0]] + '<span>' + esc(s[1]) + '</span></button>';
+      }).join('') + '</nav><div class="hq-body">';
+
+    html += hqSec('household', 'Household', 'Who the stores are for. Food, water and the starter list are all worked out from this.', hqHousehold());
+    html += hqSec('targets', 'Targets and warnings', 'How long the stores should last, and how much notice you get before things go out of date.', hqTargets());
+    html += hqSec('alerts', 'Warnings and live alerts', 'Official warnings, your home\'s sensors and live information for where you are.', warnHqCard() + homeCard() + intelHQ());
+    html += hqSec('backups', 'Backups', 'If the power goes, so does the Pi. Keep a printed copy with the stores, and a backup somewhere else.', hqBackups());
+    if (S.server.ha) html += hqSec('ha', 'Home Assistant', 'The Home front dashboard, today\'s checklist and the supply run list.', haCard());
+    html += hqSec('appearance', 'Appearance', '', hqAppearance());
+    html += hqSec('activity', 'Activity', S.log.length ? 'The last ' + esc(S.log.length) + ' changes, newest first.' : '',
+      '<section class="card hq-activity">' + (S.log.length ? hqLogHtml(S.log) : '<p class="small muted" style="margin:0">Nothing yet. Changes to the stores and settings show up here.</p>') + '</section>');
+
+    html += '<p class="tagline">Dads Army v' + esc(S.server.version) + ' · Don\'t panic</p></div></div>';
+    el.innerHTML = html;
+  }
+
   function queueSetting(key, value) {
-    settingsQueue[key] = value;
+    // Per-category warnings go one category at a time: gather them up.
+    settingsQueue[key] = key === 'category_warn_days' ? Object.assign({}, settingsQueue[key], value) : value;
     clearTimeout(settingsTimer);
     settingsTimer = setTimeout(function () {
       var body = settingsQueue;
       settingsQueue = {};
       run(function () {
-        return api('PUT', 'api/settings', body).then(refresh).then(function () { toast('Saved'); });
+        return api('PUT', 'api/settings', body).then(function (res) {
+          return refresh().then(function () {
+            toast(res.rescaled ? 'Saved · ' + res.rescaled + ' starter target' + (res.rescaled === 1 ? '' : 's') + ' updated' : 'Saved');
+          });
+        }, function (e) {
+          updateHQ();   // put back what's really saved
+          throw e;
+        });
       });
     }, 450);
   }
@@ -1672,7 +2988,8 @@
   function printInventory() {
     var st = S.settings, r = readiness();
     var html = '<h1>Dads Army · Stores</h1><p class="p-meta">Printed ' + esc(new Date().toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })) +
-      ' · ' + st.adults + ' adults, ' + st.children + ' children · Food ≈ ' + fmtDays(r.foodDays) + ' days · Water ≈ ' + fmtDays(r.waterDays) + ' days</p>';
+      ' · ' + esc(st.adults) + ' adults, ' + esc(st.children) + ' children' + (st.pets ? ', ' + esc(st.pets) + ' pets' : '') +
+      ' · Food ≈ ' + esc(fmtDays(r.foodDays)) + ' days · Water ≈ ' + esc(fmtDays(r.waterDays)) + ' days</p>';
     CATS.forEach(function (c) {
       var its = S.items.filter(function (it) { return it.category === c.id; }).sort(byName);
       if (!its.length) return;
@@ -1746,6 +3063,9 @@
   // Bottom sheets
   // ------------------------------------------------------------------
   function openSheet(s) {
+    var a = document.activeElement;
+    s.trigger = a && a !== document.body ? a : null;   // focus goes back here when it closes
+    s.triggerKey = focusKey(s.trigger);
     stack.push(s);
     try { history.pushState({ daSheet: stack.length }, ''); } catch (e) { /* ignore */ }
     showSheet(true);
@@ -1753,7 +3073,15 @@
   function closeSheet() {
     if (!stack.length) return;
     if (history.state && history.state.daSheet) history.back();
-    else { stack.pop(); showSheet(true); }
+    else popSheet();
+  }
+  function popSheet() {
+    var gone = stack.pop();
+    showSheet(true);
+    // Back to whatever opened it (or the same control, if it has been redrawn since).
+    var t = gone && gone.trigger;
+    if (t && document.contains(t) && !t.closest('[inert]')) t.focus();
+    else if (gone) refocus(gone.triggerKey, stack.length ? $('#sheet-body') : document);
   }
   // Close every open sheet at once (each was a step in history), then carry on.
   function closeAllSheets(then) {
@@ -1765,14 +3093,22 @@
     if (then) setTimeout(then, hs ? 150 : 0);
   }
   window.addEventListener('popstate', function () {
-    if (stack.length) { stack.pop(); showSheet(true); }
+    if (stack.length) popSheet();
     else if (SEL) { endSelect(); renderStoreList(); }
   });
+  // While a sheet is open, everything behind it is out of reach (screen readers and the Tab key).
+  function setInert(on) {
+    $$('body > header, #offline, main, nav.tabs').forEach(function (el) {
+      el.inert = on;
+      if (on) el.setAttribute('inert', ''); else el.removeAttribute('inert');
+    });
+  }
   function showSheet(resetScroll) {
     var root = $('#sheet-root');
     if (!stack.length) {
       root.hidden = true;
       document.body.classList.remove('sheet-open');
+      setInert(false);
       $('#sheet-body').innerHTML = '';
       return;
     }
@@ -1780,16 +3116,27 @@
     root.classList.toggle('anim', appearing);
     root.hidden = false;
     document.body.classList.add('sheet-open');
+    setInert(true);
+    var top = stack[stack.length - 1];
+    var isNew = !top.shown;
+    top.shown = true;
     renderSheet();
     if (resetScroll) $('.sheet', root).scrollTop = 0;
-    var auto = $('[data-autofocus]', root);
-    if (auto && appearing) setTimeout(function () { auto.focus(); }, 280);
+    if (isNew && stack[stack.length - 1] === top) {
+      // Into the sheet: its first field if it asks for that, otherwise its heading.
+      var auto = $('[data-autofocus]', root) || $('#sheet-title', root);
+      if (auto) {
+        try { auto.focus({ preventScroll: true }); } catch (e) { auto.focus(); }
+        if (appearing && auto.matches('input, textarea')) setTimeout(function () { if (document.activeElement === auto) auto.focus(); }, 280);
+      }
+    }
   }
   function renderSheet() {
     var s = stack[stack.length - 1];
     if (!s) return;
     var html = {
       item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText, halists: sheetHaLists,
+      backups: sheetBackups, shoptext: sheetShopText,
       check: sheetCheck, plan: sheetPlan, warning: sheetWarning, warnset: sheetWarnSet, help: sheetHelp, dashwiz: sheetDashWiz,
       level: sheetLevel, levelhelp: sheetLevelHelp, homesensors: sheetHomeSensors, area: sheetArea, resall: sheetResAll
     }[s.type](s);
@@ -1797,94 +3144,151 @@
       closeSheet();
       return;
     }
-    $('#sheet-body').innerHTML = html;
+    var body = $('#sheet-body'), a = document.activeElement;
+    var keep = a && body.contains(a) ? focusKey(a) : null;
+    body.innerHTML = html;
+    if (keep && !refocus(keep, body)) { var h = $('#sheet-title', body); if (h) h.focus(); }
     if (s.type === 'edit') perDayHint($('#itemForm'));
   }
   function sheetHead(title, sub, icon) {
     return '<div class="sheet-head">' + (icon ? '<span class="li-ico">' + icon + '</span>' : '') +
-      '<div><h2 id="sheet-title">' + esc(title) + '</h2>' + (sub ? '<p>' + esc(sub) + '</p>' : '') + '</div>' +
+      '<div><h2 id="sheet-title" tabindex="-1">' + esc(title) + '</h2>' + (sub ? '<p>' + esc(sub) + '</p>' : '') + '</div>' +
       '<button class="icon-btn" type="button" data-act="close-sheet" aria-label="Close">' + ICON.close + '</button></div>';
   }
   function stat(value, label) {
     return '<div class="stat"><span class="stat-val">' + esc(value) + '</span><span class="stat-lbl">' + esc(label) + '</span></div>';
   }
   function expiryField(val, usual) {
-    return '<div class="field"><span>Best before / expiry</span>' +
+    return '<div class="field st-date"><span>Best before / expiry</span>' +
       '<input type="date" name="expiry" value="' + esc(val || '') + '" aria-label="Best before date">' +
-      '<div class="quick">' + (usual ? '<button type="button" class="chip" data-exp="' + usual + '">Like last time (+' + monthsWords(usual) + ')</button>' : '') +
+      '<div class="quick" role="group" aria-label="Quick dates">' + (usual ? '<button type="button" class="chip" data-exp="' + usual + '">Like last time (+' + monthsWords(usual) + ')</button>' : '') +
       [[6, '6 months'], [12, '1 year'], [24, '2 years'], [60, '5 years'], [300, '25 years']].map(function (m) {
         return '<button type="button" class="chip" data-exp="' + m[0] + '">+' + m[1] + '</button>';
-      }).join('') + '<button type="button" class="chip" data-exp="">No expiry</button></div></div>';
+      }).join('') + '<button type="button" class="chip" data-exp="">No date</button></div>' +
+      '<div class="hint">Leave it empty for things that don\'t go off.</div></div>';
   }
   function locationField(val) {
     return '<label class="field"><span>Where is it kept?</span><input type="text" name="location" list="dl-locations" value="' + esc(val || '') +
       '" placeholder="e.g. Garage shelf B" maxlength="80" autocomplete="off"></label>';
+  }
+  // A labelled quantity stepper, with optional quick chips and a hint under it.
+  function stQtyField(label, value, chips, hint, err) {
+    return '<div class="field st-qty"><span>' + esc(label) + '</span>' + stepperHtml('qty', value, 'Quantity') +
+      (chips ? '<div class="quick">' + chips + '</div>' : '') +
+      (hint ? '<div class="hint">' + hint + '</div>' : '') +
+      (err ? '<p class="form-error" role="alert" hidden></p>' : '') + '</div>';
+  }
+  function stSetChip(q, text) { return '<button type="button" class="chip" data-setqty="' + esc(q) + '">' + esc(text) + '</button>'; }
+  // "9 of 15 tins in date", for sheet subtitles.
+  function stHave(it, i) {
+    return stAmt(i.fresh, it.unit) + (it.target_qty > 0 ? ' of ' + stAmt(it.target_qty, it.unit) : '') +
+      (isMoney(it.unit) || !it.unit ? '' : ' ' + plural(it.unit, it.target_qty > 0 ? it.target_qty : i.fresh)) + ' in date';
   }
 
   function sheetItem(s) {
     var it = byId(s.id);
     if (!it) return null;
     var i = info(it), c = cat(it.category), r = readiness();
-    var unitWord = isMoney(it.unit) ? '' : plural(it.unit, i.total);
-    var stats = [stat(isMoney(it.unit) ? it.unit + fq(i.total) : fq(i.total), (unitWord ? unitWord + ' ' : '') + 'in stock')];
-    if (it.target_qty > 0) stats.push(stat(fq(it.target_qty), i.low ? 'target · short ' + fq(i.short) : 'target · met ✓'));
-    if (it.category === 'food' && it.kcal_per_unit > 0 && r.kcalDay > 0) stats.push(stat(fmtDays(i.total * it.kcal_per_unit / r.kcalDay), 'days of food'));
+    var animate = !s.drawn;   // charts draw in the first time only, not on every refresh
+    s.drawn = true;
+    var t = it.target_qty > 0 ? it.target_qty : 0;
+    var state = t ? stateOf(i.fresh / t) : 'info';
+    var unitOf = function (q) { return isMoney(it.unit) || !it.unit ? '' : ' ' + plural(it.unit, q); };
+    var ring = window.DAChart ? DAChart.ring({
+      value: i.fresh, max: t || Math.max(i.fresh, 1), size: 112, thickness: 11, state: state,
+      label: stAmt(i.fresh, it.unit), sub: t ? 'of ' + stAmt(t, it.unit) : (it.unit && !isMoney(it.unit) ? plural(it.unit, i.fresh) : 'in stock'),
+      title: it.name + ' in date', noAnimate: !animate
+    }) : '';
+    var verdict = !t ? '<span class="pill plain">No target set</span>'
+      : !i.low ? pill('good', 'Target met')
+      : pill(state, i.out ? 'None in date' : fq(i.short) + unitOf(i.short) + ' short');
+    var big = '<b>' + esc(stAmt(i.fresh, it.unit)) + '</b>' + (t ? ' of ' + esc(stAmt(t, it.unit)) : '') + esc(unitOf(t || i.fresh)) + ' in date';
+
+    var facts = [];
+    function fact(k, v, cls) { facts.push('<div class="st-fact"><dt>' + esc(k) + '</dt><dd' + (cls ? ' class="' + cls + '"' : '') + '>' + v + '</dd></div>'); }
+    fact('Target', t ? esc(stAmt(t, it.unit) + unitOf(t)) + (it.target_rule ? ' <span class="muted">· scales with your household</span>' : '')
+      : '<span class="muted">None. Set one in Edit details.</span>');
+    var rate = stRate(it), lasts = stLasts(it), d = stDays(it);
+    if (rate) {
+      var until = d !== null && d >= 1 && d < 3650 ? ' <span class="muted">(about ' + esc(fmtDate(addDays(d))) + ')</span>' : '';
+      fact('Usage', esc(rate) + (lasts ? ' · <span class="' + (d <= 14 ? 'warn-ink' : '') + '">' + esc(lasts) + '</span>' + until : ''));
+    } else fact('Usage', '<span class="muted">Nothing used yet, so no forecast</span>');
+    if (it.price > 0) fact('Worth', esc(money(i.total * it.price)) + ' <span class="muted">· ' + esc(money(it.price)) + ' each</span>');
+    if (it.category === 'food' && it.kcal_per_unit > 0 && r.kcalDay > 0) fact('Food', esc(fmtDays(i.fresh * it.kcal_per_unit / r.kcalDay)) + ' days for the household <span class="muted">· ' + esc(nf0.format(it.kcal_per_unit)) + ' kcal each</span>');
     if (it.category === 'water' && it.litres_per_unit > 0) {
-      stats.push(stat(fq(Math.round(i.total * it.litres_per_unit * 10) / 10) + ' L', r.waterDay > 0 ? fmtDays(i.total * it.litres_per_unit / r.waterDay) + ' days of water' : 'of water'));
+      var litres = Math.round(i.fresh * it.litres_per_unit * 10) / 10;
+      fact('Water', esc(fq(litres)) + ' L' + (r.waterDay > 0 ? ' · ' + esc(fmtDays(litres / r.waterDay)) + ' days for the household' : ''));
     }
-    if (it.per_day > 0) stats.push(stat(fmtDays(daysLeft(it)), 'days at ' + fq(it.per_day) + ' a day'));
-    if (it.price > 0) stats.push(stat(money(i.total * it.price), 'worth, at ' + money(it.price) + ' each'));
-    var batches = it.batches.map(function (b) {
-      var es = expState(b.expiry);
-      var exp = b.expiry
-        ? '<span class="badge ' + (es === 'ok' ? 'ok' : es) + '">' + esc(expiryWords(b.expiry)) + '</span>' + esc(fmtDate(b.expiry))
-        : '<span class="badge plain">No expiry</span>';
-      return '<div class="batch"><button class="batch-main" data-act="batch" data-id="' + b.id + '" data-item="' + it.id + '">' +
-        '<span class="batch-exp">' + exp + '</span><span class="batch-meta">' + (b.location ? esc(b.location) : 'No location set') +
-        ' · added ' + esc(fmtDate(b.added_at)) + '</span></button>' +
-        '<div class="mini-step"><button class="qbtn" data-act="bstep" data-id="' + b.id + '" data-d="-1" aria-label="One less">' + ICON.minus + '</button>' +
-        '<output>' + esc(fq(b.qty)) + '</output>' +
-        '<button class="qbtn" data-act="bstep" data-id="' + b.id + '" data-d="1" aria-label="One more">' + ICON.plus + '</button></div></div>';
+    var places = stPlaces(it);
+    fact('Kept', places.length ? esc(places.join(', ')) : '<span class="muted">Nowhere set</span>');
+    if (i.expired > 0) fact('Replace', esc(stAmt(i.expired, it.unit) + unitOf(i.expired)) + ' past best before', 'bad-ink');
+    if (it.notes) fact('Notes', '<span class="st-notes">' + esc(it.notes) + '</span>');
+
+    var live = it.batches.filter(function (b) { return b.qty > 0; });
+    var batches = it.batches.map(function (b, n) {
+      var es = expState(b.expiry, it.category);
+      var next = n === 0 && live.length > 1 && b.qty > 0;
+      var when = b.expiry
+        ? '<span class="st-b-date">' + esc(fmtDate(b.expiry)) + '</span><span class="badge ' + (es === 'ok' ? 'plain' : es) + '">' + esc(expiryWords(b.expiry)) + '</span>'
+        : '<span class="st-b-date">No expiry date</span>';
+      var label = b.expiry ? fmtDate(b.expiry) : 'no date';
+      return '<li class="st-b" data-state="' + es + '"' + (next ? ' data-next' : '') + '><span class="st-dot" aria-hidden="true"></span>' +
+        '<button class="st-b-main" data-act="batch" data-id="' + b.id + '" data-item="' + it.id + '" aria-label="Edit the batch: ' + esc(fq(b.qty) + unitOf(b.qty) + ', ' + label) + '">' +
+        (next ? '<span class="st-next">Use first</span>' : '') +
+        '<span class="st-b-l1">' + when + '</span>' +
+        '<span class="st-b-l2">' + (b.location ? esc(b.location) : 'No place set') + ' · added ' + esc(fmtDate(b.added_at)) + '</span></button>' +
+        '<div class="mini-step st-step"><button class="qbtn" data-act="bstep" data-id="' + b.id + '" data-d="-1" aria-label="One less in the batch from ' + esc(label) + '">' + ICON.minus + '</button>' +
+        '<output aria-label="' + esc(fq(b.qty) + unitOf(b.qty)) + '">' + esc(fq(b.qty)) + '</output>' +
+        '<button class="qbtn" data-act="bstep" data-id="' + b.id + '" data-d="1" aria-label="One more in the batch from ' + esc(label) + '">' + ICON.plus + '</button></div></li>';
     }).join('');
-    return sheetHead(it.name, c.label + (it.unit ? ' · per ' + it.unit : ''), c.icon) +
-      '<div class="stats">' + stats.join('') + '</div>' +
-      '<div class="btn-row"><button class="btn" data-act="use-sheet" data-id="' + it.id + '"' + (i.out ? ' disabled' : '') + '>' + ICON.minus + ' Use</button>' +
-      '<button class="btn primary" data-act="stock" data-id="' + it.id + '">' + ICON.plus + ' Add stock</button></div>' +
-      '<h3>Batches' + (it.batches.length > 1 ? ' <small>oldest is used first</small>' : '') + '</h3>' +
-      (batches || '<p class="small muted">None in stock.</p>') +
-      (it.notes ? '<h3>Notes</h3><div class="notes">' + esc(it.notes) + '</div>' : '') +
-      '<div class="btn-row" style="margin-top:20px"><button class="btn" data-act="edit" data-id="' + it.id + '">' + ICON.edit + ' Edit details</button>' +
-      '<button class="btn danger" data-act="del-item" data-id="' + it.id + '">' + ICON.trash + ' Delete</button></div>';
+
+    return sheetHead(it.name, c.label + (it.unit ? ' · counted in ' + plural(it.unit, 2) : ''), c.icon) +
+      '<div class="st-hero"><div class="st-ring">' + ring + '</div><div class="st-hero-txt"><div class="st-big">' + big + '</div>' + verdict +
+      (i.soonest ? '<div class="st-soon">' + (i.exp === 'bad' ? 'Some has expired' : 'Next best before ' + esc(fmtDate(i.soonest))) + '</div>' : '') + '</div></div>' +
+      '<dl class="st-facts">' + facts.join('') + '</dl>' +
+      '<h3>Batches' + (it.batches.length > 1 ? ' <small>used in this order</small>' : '') + '</h3>' +
+      (batches ? '<ol class="st-tl">' + batches + '</ol>'
+        : '<div class="empty compact st-nobatch"><p>None in stock. Add some when you next stock up.</p></div>') +
+      '<div class="btn-row st-more"><button class="btn" data-act="edit" data-id="' + it.id + '">' + ICON.edit + ' Edit details</button>' +
+      '<button class="btn danger" data-act="del-item" data-id="' + it.id + '">' + ICON.trash + ' Delete</button></div>' +
+      '<div class="sheet-actions st-acts"><button class="btn" data-act="use-sheet" data-id="' + it.id + '"' + (i.none ? ' disabled' : '') + '>' + ICON.minus + ' Use</button>' +
+      '<button class="btn primary" data-act="stock" data-id="' + it.id + '">' + ICON.plus + ' Add stock</button></div>';
   }
+  function addDays(n) { var x = new Date(); x.setDate(x.getDate() + n); return ymd(x); }
 
   function sheetEdit(s) {
     var it = s.id ? byId(s.id) : null;
     if (s.id && !it) return null;
-    var v = it || { name: '', category: s.cat || 'food', unit: '', kcal_per_unit: 0, litres_per_unit: 0, target_qty: 0, per_day: 0, price: 0, notes: '' };
+    var v = it || { name: s.name || '', category: s.cat || 'food', unit: '', kcal_per_unit: 0, litres_per_unit: 0, target_qty: 0, per_day: 0, price: 0, notes: '' };
     var cats = CATS.map(function (c) {
       return '<label class="cat-opt"><input type="radio" name="category" value="' + c.id + '"' + (c.id === v.category ? ' checked' : '') + '>' +
-        '<span><i>' + c.icon + '</i>' + esc(c.short || c.label) + '</span></label>';
+        '<span><i aria-hidden="true">' + c.icon + '</i>' + esc(c.short || c.label) + '</span></label>';
     }).join('');
     return sheetHead(it ? 'Edit item' : 'New item', it ? it.name : 'Add something to the stores') +
-      '<form id="itemForm" data-cat="' + esc(v.category) + '" data-id="' + (it ? it.id : '') + '" novalidate>' +
+      '<form id="itemForm" class="st-form" data-cat="' + esc(v.category) + '" data-id="' + (it ? it.id : '') + '"' + (s.shop ? ' data-shop="' + esc(s.shop) + '"' : '') + ' novalidate>' +
       '<label class="field"><span>Name</span><input type="text" name="name" value="' + esc(v.name) + '" maxlength="120" placeholder="e.g. Baked beans (415g)" autocomplete="off"' + (it ? '' : ' data-autofocus') + '></label>' +
+      '<p class="form-error" role="alert" hidden></p>' +
       '<fieldset class="field"><legend>Category</legend><div class="cat-grid">' + cats + '</div></fieldset>' +
-      '<div class="grid2"><label class="field"><span>Unit</span><input type="text" name="unit" value="' + esc(v.unit) + '" list="dl-units" placeholder="tin, pack, kg" maxlength="30" autocomplete="off"></label>' +
-      '<label class="field"><span>Target stock</span><input type="number" name="target_qty" value="' + (v.target_qty || '') + '" inputmode="decimal" min="0" step="any" placeholder="0"></label></div>' +
-      '<div class="field"><div class="grid2"><label><span class="sub-label">Used a day</span><input type="number" name="per_day" value="' + (v.per_day || '') + '" inputmode="decimal" min="0" step="any" placeholder="0"></label>' +
-      '<label><span class="sub-label">Price each (£)</span><input type="number" name="price" value="' + (v.price || '') + '" inputmode="decimal" min="0" step="0.01" placeholder="Optional"></label></div>' +
-      '<div class="hint" id="perDayHint"></div></div>' +
-      '<div class="only-food"><label class="field"><span>Calories per unit</span><input type="number" name="kcal_per_unit" value="' + (v.kcal_per_unit || '') + '" inputmode="decimal" min="0" step="any" placeholder="e.g. 340">' +
+      '<h3>Counting it</h3>' +
+      '<div class="grid2"><label class="field"><span>Unit</span><input type="text" name="unit" value="' + esc(v.unit) + '" list="dl-units" placeholder="tin, pack, kg" maxlength="30" autocomplete="off">' +
+      '<div class="hint">What you count it in.</div></label>' +
+      '<div class="field"><span>Target stock</span>' + stepperHtml('target_qty', v.target_qty || 0, 'Target stock') +
+      '<div class="hint">' + (it && it.target_rule ? 'Scales with your household. Change it to set your own.' : 'How many you want in. 0 for no target.') + '</div></div></div>' +
+      '<div class="grid2"><label class="field"><span>Used a day</span><input type="text" name="per_day" value="' + esc(v.per_day || '') + '" inputmode="decimal" autocomplete="off" placeholder="Optional"></label>' +
+      '<label class="field"><span>Price each (£)</span><input type="text" name="price" value="' + esc(v.price || '') + '" inputmode="decimal" autocomplete="off" placeholder="Optional"></label></div>' +
+      '<div class="hint st-perday" id="perDayHint"></div>' +
+      '<div class="only-food"><label class="field"><span>Calories per unit</span><input type="text" name="kcal_per_unit" value="' + esc(v.kcal_per_unit || '') + '" inputmode="decimal" autocomplete="off" placeholder="e.g. 340">' +
       '<div class="hint">Used to work out how many days your food will last.</div></label>' +
       '<details class="calc"><summary>Work it out from the label</summary><div class="grid2">' +
       '<label class="field"><span>kcal per 100g</span><input type="number" data-calc="per100" inputmode="decimal" min="0" step="any"></label>' +
       '<label class="field"><span>Weight (g)</span><input type="number" data-calc="grams" inputmode="decimal" min="0" step="any"></label></div></details></div>' +
-      '<label class="field only-water"><span>Litres per unit</span><input type="number" name="litres_per_unit" value="' + (v.litres_per_unit || '') + '" inputmode="decimal" min="0" step="any" placeholder="e.g. 5">' +
+      '<label class="field only-water"><span>Litres per unit</span><input type="text" name="litres_per_unit" value="' + esc(v.litres_per_unit || '') + '" inputmode="decimal" autocomplete="off" placeholder="e.g. 5">' +
       '<div class="hint">Drinkable water only. Leave empty for filters, tablets and containers.</div></label>' +
-      (it ? '' : '<h3>Opening stock</h3><div class="field"><span>How many?</span>' + stepperHtml('qty', 1, 'Quantity') + '</div>' +
+      (it ? '' : '<h3>Opening stock</h3>' + stQtyField('How many have you got?', 1, '', 'Put 0 if you haven\'t any yet.') +
         expiryField('') + locationField(lastLocation(lastTouched()))) +
-      '<label class="field"><span>Notes</span><textarea name="notes" rows="2" maxlength="2000" placeholder="Optional">' + esc(v.notes) + '</textarea></label>' +
-      '<div class="sheet-actions"><button class="btn primary block" type="submit">' + (it ? 'Save changes' : 'Add to stores') + '</button></div></form>';
+      '<h3>Anything else</h3>' +
+      '<label class="field"><span>Notes</span><textarea name="notes" rows="2" maxlength="2000" placeholder="Optional: brand, size, where to buy">' + esc(v.notes) + '</textarea></label>' +
+      '<div class="sheet-actions"><button class="btn primary block" type="submit">' + (it ? 'Save changes' : ICON.plus + ' Add to stores') + '</button></div></form>';
   }
   function lastTouched() {
     var best = null;
@@ -1908,9 +3312,11 @@
   function sheetStock(s) {
     var it = byId(s.id);
     if (!it) return null;
-    return sheetHead('Add stock', it.name, cat(it.category).icon) +
-      '<form id="stockForm" data-id="' + it.id + '" novalidate>' +
-      '<div class="field"><span>' + esc(howMany(it.unit)) + '</span>' + stepperHtml('qty', s.qty || 1, 'Quantity') + '</div>' +
+    var i = info(it);
+    var chips = i.short > 0 ? stSetChip(i.short, 'Up to target (' + stAmt(i.short, it.unit) + ')') : '';
+    return sheetHead('Add stock', it.name + ' · ' + stHave(it, i), cat(it.category).icon) +
+      '<form id="stockForm" class="st-form" data-id="' + it.id + '" novalidate>' +
+      stQtyField(howMany(it.unit), s.qty || 1, chips, '', true) +
       expiryField('', usualLife(it)) + locationField(lastLocation(it) || lastLocation(lastTouched())) +
       '<div class="sheet-actions"><button class="btn primary block" type="submit">' + ICON.plus + ' Add to stores</button></div></form>';
   }
@@ -1919,11 +3325,13 @@
     var it = byId(s.id);
     if (!it) return null;
     var i = info(it);
-    return sheetHead('Use stock', it.name, cat(it.category).icon) +
-      '<form id="useForm" data-id="' + it.id + '" novalidate>' +
-      '<div class="field"><span>' + esc(howMany(it.unit)) + '</span>' + stepperHtml('qty', 1, 'Quantity') +
-      '<div class="quick"><button type="button" class="chip" data-setqty="' + i.total + '">All of it (' + esc(fq(i.total)) + ')</button></div>' +
-      '<div class="hint">You have ' + esc(qu(i.total, it.unit)) + '. The oldest expiry date is used first.</div></div>' +
+    var first = it.batches.filter(function (b) { return b.qty > 0; })[0];
+    var from = first ? (first.expiry
+      ? 'It comes out of the batch that ' + (daysUntil(first.expiry) < 0 ? 'expired on ' : 'goes off first, ') + esc(fmtDate(first.expiry)) + (first.location ? ' (' + esc(first.location) + ')' : '') + '.'
+      : 'It comes out of the oldest batch' + (first.location ? ' (' + esc(first.location) + ')' : '') + '.') : '';
+    return sheetHead('Use stock', it.name + ' · ' + qu(i.total, it.unit) + ' in all', cat(it.category).icon) +
+      '<form id="useForm" class="st-form" data-id="' + it.id + '" novalidate>' +
+      stQtyField(howMany(it.unit), 1, stSetChip(i.total, 'All of it (' + fq(i.total) + ')'), from, true) +
       '<div class="sheet-actions"><button class="btn primary block" type="submit">' + ICON.minus + ' Use it</button></div></form>';
   }
 
@@ -1931,17 +3339,47 @@
     var it = byId(s.item);
     var b = it && it.batches.filter(function (x) { return x.id === s.id; })[0];
     if (!b) return null;
-    return sheetHead('Edit batch', it.name, cat(it.category).icon) +
-      '<form id="batchForm" data-id="' + b.id + '" novalidate>' +
-      '<div class="field"><span>Quantity</span>' + stepperHtml('qty', fq(b.qty).replace(/,/g, ''), 'Quantity') + '</div>' +
+    return sheetHead('Edit batch', it.name + ' · added ' + fmtDate(b.added_at), cat(it.category).icon) +
+      '<form id="batchForm" class="st-form" data-id="' + b.id + '" novalidate>' +
+      stQtyField('How many are in this batch?', b.qty, '', '', true) +
       expiryField(b.expiry) + locationField(b.location) +
-      '<div class="sheet-actions"><button class="btn primary block" type="submit">Save batch</button>' +
-      '<button class="btn danger block" type="button" data-act="del-batch" data-id="' + b.id + '">' + ICON.trash + ' Remove this batch</button></div></form>';
+      '<div class="sheet-actions st-acts st-acts-b"><button class="btn danger" type="button" data-act="del-batch" data-id="' + b.id + '">' + ICON.trash + ' Remove this batch</button>' +
+      '<button class="btn primary" type="submit">Save batch</button></div></form>';
   }
 
   function sheetText(s) {
     return sheetHead(s.title, 'Select all and copy') +
       '<textarea readonly rows="12" style="font-family:ui-monospace,monospace;font-size:14px">' + esc(s.text) + '</textarea>';
+  }
+
+  function sheetShopText(s) {
+    var x = S.shopping.filter(function (r) { return r.id === s.id; })[0];
+    if (!x) return null;
+    return sheetHead('Change it', 'Also get', '📝') +
+      '<form id="shopEditForm" data-id="' + x.id + '" novalidate autocomplete="off">' +
+      '<label class="field"><span>What to get</span><input type="text" name="text" value="' + esc(x.text) + '" maxlength="200" data-autofocus></label>' +
+      '<p class="form-error" role="alert" hidden></p>' +
+      '<div class="sheet-actions"><button class="btn primary block" type="submit">Save</button></div></form>';
+  }
+
+  function sheetBackups(s) {
+    var d = s.data, body;
+    if (!d) body = '<p class="small muted">Looking for them…</p>';
+    else if (d.error) body = '<p class="small ha-error">' + esc(d.error) + '</p>';
+    else if (!d.backups.length) body = '<p class="small muted">There aren\'t any yet. Dads Army makes one each day.</p>';
+    else {
+      body = '<p class="small muted">Dads Army keeps a copy from each of the last ' + esc(d.keep) + ' days, plus a copy from just before each restore. ' +
+        'Restoring one replaces everything in the stores, but a copy of what\'s there now is kept first.</p><div class="list">' +
+        d.backups.map(function (b) {
+          var when = new Date(String(b.at).replace(' ', 'T'));
+          var label = isNaN(when) ? b.at : when.toLocaleString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+          var what = b.items === null ? 'Can\'t be read' : b.items + ' item' + (b.items === 1 ? '' : 's');
+          return '<div class="li"><button class="li-main" data-act="backup-use" data-name="' + esc(b.name) + '"' + (b.items === null ? ' disabled' : '') + '>' +
+            '<span class="li-title">' + esc(label) + '</span><span class="small muted">' + esc(what) +
+            (b.kind === 'pre-restore' ? ' · saved before a restore' : '') + '</span></button></div>';
+        }).join('') + '</div>';
+    }
+    return sheetHead('Automatic copies', 'Saved by Dads Army', '🗄️') + body;
   }
 
   function sheetHaLists(s) {
@@ -2034,6 +3472,17 @@
   // ------------------------------------------------------------------
   // Toast + undo
   // ------------------------------------------------------------------
+  // Something else has changed since: an old Undo would wipe it out, so take the offer away.
+  function dropUndo() {
+    var t = $('#toast');
+    if (t && t._undo) { t.hidden = true; t._undo = null; }
+  }
+  function formError(f, msg, field) {
+    var e = $('.form-error', f);
+    if (e) { e.textContent = msg; e.hidden = !msg; } else if (msg) toast(msg, { error: true });
+    if (msg && field) field.focus();
+  }
+
   function toast(msg, opts) {
     opts = opts || {};
     var t = $('#toast');
@@ -2087,8 +3536,41 @@
     var act = a.dataset.act;
     var id = a.dataset.id ? +a.dataset.id : null;
     switch (act) {
+      // [sitrep actions: add new cases here]
+      case 'sr-alert':   // a live alert from Next actions: open its source's details and bring the card into view
+        INTEL_OPEN = a.dataset.src;
+        render();
+        setTimeout(function () { var c = $('#view .intel'); if (c) c.scrollIntoView({ block: 'start' }); }, 30);
+        return;
       case 'retry':
         return run(refresh, a);
+      case 'intel-jump':
+        if (a.dataset.src) INTEL_OPEN = a.dataset.src;
+        render();
+        setTimeout(function () {
+          var t = document.querySelector('.intel-open') || document.querySelector('.sr-intel');
+          if (t) t.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 60);
+        return;
+      case 'intel-src':
+        INTEL_OPEN = INTEL_OPEN === a.dataset.src ? null : a.dataset.src;
+        render();
+        return;
+      // [supply and hq actions: add new cases here]
+      case 'hq-sec':
+        return hqShow(a.dataset.sec, true);
+      case 'go-hq-intel':
+        HQ_SEC = 'alerts';
+        go('hq');
+        setTimeout(function () { hqShow('alerts', true); }, 50);
+        return;
+      case 'intel-refresh':
+        return run(function () {
+          return api('POST', 'api/intel/refresh').then(function () {
+            toast('Checking the feeds…');
+            return new Promise(function (ok) { setTimeout(ok, 9000); }).then(refresh);
+          });
+        }, a);
       case 'new':
         return openSheet({ type: 'edit', id: null, cat: F.cat !== 'all' && view === 'stores' ? F.cat : 'food' });
       case 'open':
@@ -2120,6 +3602,14 @@
           });
         }, a);
       }
+      // [stores actions: add new cases here]
+      case 'st-fold':
+        if (ST_FOLD[a.dataset.cat]) delete ST_FOLD[a.dataset.cat]; else ST_FOLD[a.dataset.cat] = 1;
+        stSaveFold();
+        renderStoreList();
+        return refocus('button[data-act="st-fold"][data-cat="' + a.dataset.cat + '"]', $('#storeList'));
+      case 'st-new':
+        return openSheet({ type: 'edit', id: null, cat: F.cat !== 'all' ? F.cat : 'food', name: a.dataset.name || '' });
       case 'sel-start':
         startSelect();
         return renderStoreList();
@@ -2149,6 +3639,7 @@
       case 'undo': {
         var t = $('#toast'), snap = t._undo, path = t._undoPath || 'api/restore-item';
         t.hidden = true;
+        t._undo = null;
         if (!snap) return;
         return run(function () {
           return api('POST', path, snap).then(refresh).then(function () { toast('Undone'); });
@@ -2351,10 +3842,49 @@
         return $('#restoreFile').click();
       case 'shop-toggle': {
         var s = S.shopping.filter(function (x) { return x.id === id; })[0];
-        if (!s) return;
-        s.done = s.done ? 0 : 1;   // instant feedback
+        if (!s || shopBusy[id]) return;   // one tap at a time per line
+        var was = s.done;
+        shopBusy[id] = true;
+        s.done = was ? 0 : 1;   // instant feedback
         a.setAttribute('aria-checked', s.done ? 'true' : 'false');
-        return run(function () { return api('PUT', 'api/shopping/' + id, { done: !!s.done }).then(refresh); });
+        return api('PUT', 'api/shopping/' + id, { done: !!s.done }).then(function () {
+          delete shopBusy[id];
+          return refresh();
+        }, function (e) {
+          delete shopBusy[id];
+          s.done = was;   // it didn't happen: put the tick back as it was
+          $$('[data-act="shop-toggle"][data-id="' + id + '"]').forEach(function (b) { b.setAttribute('aria-checked', was ? 'true' : 'false'); });
+          toast(e.message || 'Something went wrong', { error: true });
+        }).catch(function (e) { toast(e.message || 'Something went wrong', { error: true }); });
+      }
+      case 'shop-edit':
+        return openSheet({ type: 'shoptext', id: id });
+      case 'shop-got': {
+        var x = S.shopping.filter(function (r) { return r.id === id; })[0];
+        if (!x) return;
+        return openSheet({ type: 'edit', id: null, cat: 'other', name: x.text, shop: x.id });
+      }
+      case 'backups': {
+        var bs = { type: 'backups', data: null };
+        openSheet(bs);
+        return api('GET', 'api/backups').then(function (d) { bs.data = d; }, function (e) {
+          bs.data = { error: e.message, backups: [] };
+        }).then(function () { if (stack[stack.length - 1] === bs) renderSheet(); });
+      }
+      case 'backup-use': {
+        var top = stack[stack.length - 1];
+        var b = top && top.data && top.data.backups.filter(function (x) { return x.name === a.dataset.name; })[0];
+        if (!b) return;
+        var label = $('.li-title', a).textContent;
+        if (!b.items) {
+          if (!confirm('The copy from ' + label + ' has NO items in it.\n\nRestoring it EMPTIES the stores. Dads Army keeps a copy of the current data first, just in case.\n\nEmpty the stores?')) return;
+        } else if (!confirm('Restore the copy from ' + label + ' (' + b.items + ' items)?\n\nThis REPLACES everything currently in the stores. Dads Army keeps a copy of the current data first, just in case.')) return;
+        return run(function () {
+          return api('POST', 'api/backups/restore', { name: b.name, confirm_empty: !b.items }).then(function (res) {
+            closeSheet();
+            return refresh().then(function () { toast('Restored ' + res.items + ' items from ' + label); });
+          });
+        }, a);
       }
       case 'shop-del':
         return run(function () { return api('DELETE', 'api/shopping/' + id).then(refresh); }, a);
@@ -2421,6 +3951,10 @@
     if (!input) return;
     var d = parseFloat(btn.dataset.step);
     var v = Math.max(0, Math.round((num(input.value) + d) * 1000) / 1000);
+    if (input.dataset.setting === 'adults' || input.dataset.setting === 'children') {
+      var other = $('[data-setting="' + (input.dataset.setting === 'adults' ? 'children' : 'adults') + '"]');
+      if (v === 0 && other && num(other.value) === 0) { toast('The household needs at least one person in it', { error: true }); return; }
+    }
     input.value = v;
     input.dispatchEvent(new Event('change', { bubbles: true }));
   }
@@ -2429,36 +3963,44 @@
     var fd = new FormData(f), d = {};
     fd.forEach(function (v, k) { d[k] = typeof v === 'string' ? v.trim() : v; });
     var btn = $('[type="submit"]', f);
+    formError(f, '');
     if (f.id === 'itemForm') {
-      if (!d.name) { toast('Give the item a name', { error: true }); f.elements.name.focus(); return; }
+      if (!d.name) { formError(f, 'Give the item a name', f.elements.name); return; }
+      var bad = ['target_qty', 'kcal_per_unit', 'litres_per_unit', 'qty'].filter(function (k) {
+        return d[k] !== undefined && d[k] !== '' && !(parseQty(d[k]) >= 0);
+      })[0];
+      if (bad) { formError(f, 'That isn\'t a number: ' + d[bad], f.elements[bad]); return; }
       var body = {
         name: d.name, category: d.category || 'other', unit: d.unit || '', notes: d.notes || '',
         target_qty: num(d.target_qty), kcal_per_unit: num(d.kcal_per_unit), litres_per_unit: num(d.litres_per_unit),
         per_day: num(d.per_day), price: num(d.price)
       };
-      var id = f.dataset.id;
+      var id = f.dataset.id, shop = f.dataset.shop;
       if (!id) { body.qty = num(d.qty); body.expiry = d.expiry || null; body.location = d.location || ''; }
       return run(function () {
         return api(id ? 'PUT' : 'POST', id ? 'api/items/' + id : 'api/items', body).then(function () {
+          // Bought from the "Also get" list: it's in the stores now, so it comes off the list.
+          return shop ? api('DELETE', 'api/shopping/' + shop).catch(function () { /* already gone */ }) : null;
+        }).then(function () {
           closeSheet();
           return refresh().then(function () { toast(id ? 'Saved' : body.name + ' added to the stores'); });
         });
       }, btn);
     }
     if (f.id === 'stockForm') {
-      var qty = num(d.qty);
-      if (qty <= 0) { toast('How many are you adding?', { error: true }); return; }
+      var qty = parseQty(d.qty);
+      if (!(qty > 0)) { formError(f, 'How many are you adding?', f.elements.qty); return; }
       return run(function () {
-        return api('POST', 'api/items/' + f.dataset.id + '/stock', { qty: qty, expiry: d.expiry || null, location: d.location || '' }).then(function () {
+        return api('POST', 'api/items/' + f.dataset.id + '/stock', { qty: qty, expiry: d.expiry || null, location: d.location || '' }).then(function (res) {
           var it = byId(+f.dataset.id);
           closeSheet();
-          return refresh().then(function () { toast('Added ' + qu(qty, it ? it.unit : '') + (it ? ' · ' + it.name : '')); });
+          return refresh().then(function () { toast('Added ' + qu(qty, it ? it.unit : '') + (it ? ' · ' + it.name : ''), { undo: res.undo }); });
         });
       }, btn);
     }
     if (f.id === 'useForm') {
-      var uq = num(d.qty);
-      if (uq <= 0) { toast('How many are you using?', { error: true }); return; }
+      var uq = parseQty(d.qty);
+      if (!(uq > 0)) { formError(f, 'How many are you using?', f.elements.qty); return; }
       return run(function () {
         return api('POST', 'api/items/' + f.dataset.id + '/use', { qty: uq }).then(function (res) {
           var it = byId(+f.dataset.id);
@@ -2468,10 +4010,25 @@
       }, btn);
     }
     if (f.id === 'batchForm') {
+      var bq = parseQty(d.qty);
+      if (!(bq >= 0)) {   // empty or not a number: never send 0 (that removes the batch)
+        formError(f, d.qty ? 'That isn\'t a number: ' + d.qty : 'How many are in this batch?', f.elements.qty);
+        return;
+      }
+      if (bq === 0 && !confirm('Set this batch to 0?\n\nThat removes it from the stores.')) return;
       return run(function () {
-        return api('PUT', 'api/batches/' + f.dataset.id, { qty: num(d.qty), expiry: d.expiry || null, location: d.location || '' }).then(function (res) {
+        return api('PUT', 'api/batches/' + f.dataset.id, { qty: bq, expiry: d.expiry || null, location: d.location || '' }).then(function (res) {
           closeSheet();
           return refresh().then(function () { toast(res.removed ? 'Batch removed' : 'Batch saved', res.removed ? { undo: res.undo } : {}); });
+        });
+      }, btn);
+    }
+    if (f.id === 'shopEditForm') {
+      if (!d.text) { formError(f, 'Type what to get, or remove it from the list instead', f.elements.text); return; }
+      return run(function () {
+        return api('PUT', 'api/shopping/' + f.dataset.id, { text: d.text }).then(function () {
+          closeSheet();
+          return refresh().then(function () { toast('Saved'); });
         });
       }, btn);
     }
@@ -2598,7 +4155,12 @@
 
   document.addEventListener('input', function (e) {
     var t = e.target;
-    if (t.id === 'q') { F.q = t.value; renderStoreList(); return; }
+    if (t.id === 'q') {
+      F.q = t.value;
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(renderStoreList, 120);
+      return;
+    }
     if (t.dataset.calc) {
       var f = t.form;
       var per = num($('[data-calc="per100"]', f).value), g = num($('[data-calc="grams"]', f).value);
@@ -2610,6 +4172,7 @@
 
   document.addEventListener('change', function (e) {
     var t = e.target;
+    // [stores change handlers: add here]
     if (t.id === 'fShow') { F.show = t.value; renderStoreList(); return; }
     if (t.id === 'fSort') {
       F.sort = t.value;
@@ -2617,7 +4180,32 @@
       renderStoreList();
       return;
     }
-    if (t.dataset.setting) { queueSetting(t.dataset.setting, num(t.value)); return; }
+    if (t.dataset.setting) {
+      var sv = parseQty(t.value);
+      if (!(sv >= 0)) { toast('That isn\'t a number: ' + t.value, { error: true }); updateHQ(); return; }
+      queueSetting(t.dataset.setting, sv);
+      return;
+    }
+    // [hq change handlers: add here]
+    if (t.dataset.slider) { sliderSave(t); return; }
+    if (t.dataset.intel) {
+      var iv = {};
+      iv[t.dataset.intel] = t.type === 'checkbox' ? t.checked : t.value.trim();
+      run(function () {
+        return api('PUT', 'api/intel', iv).then(function () {
+          toast('Saved · checking the feeds');
+          return new Promise(function (ok) { setTimeout(ok, 4000); }).then(refresh);
+        }, function (e) { render(); throw e; });   // put back what's really saved
+      });
+      return;
+    }
+    if (t.dataset.catwarn) {
+      var cv = {};
+      if (t.value.trim() && !(parseQty(t.value) > 0)) { toast('That isn\'t a number of days: ' + t.value, { error: true }); return; }
+      cv[t.dataset.catwarn] = t.value.trim() ? Math.round(parseQty(t.value)) : null;
+      queueSetting('category_warn_days', cv);
+      return;
+    }
     if (t.name === 'every_days') { syncEvery(t.closest('.field')); return; }
     if (t.name === 'category' && t.form) { t.form.dataset.cat = t.value; return; }
     if (t.id === 'restoreFile' && t.files && t.files[0]) {
@@ -2627,7 +4215,10 @@
         var data;
         try { data = JSON.parse(reader.result); } catch (err) { toast('That file isn\'t a Dads Army backup', { error: true }); return; }
         var n = data && data.items ? data.items.length : 0;
-        if (!confirm('Restore ' + n + ' items from "' + file.name + '"?\n\nThis REPLACES everything currently in the stores. The Pi keeps a copy of the current data first, just in case.')) return;
+        if (data && data.items && !n) {
+          if (!confirm('"' + file.name + '" has NO items in it.\n\nRestoring it EMPTIES the stores. Dads Army keeps a copy of the current data first, just in case.\n\nEmpty the stores?')) return;
+          data.confirm_empty = true;
+        } else if (!confirm('Restore ' + n + ' items from "' + file.name + '"?\n\nThis REPLACES everything currently in the stores. Dads Army keeps a copy of the current data first, just in case.')) return;
         run(function () {
           return api('POST', 'api/restore', data).then(refresh).then(function () { toast('Restored ' + n + ' items'); });
         });

@@ -13,7 +13,8 @@ A stores tracker for food, water and emergency kit. It runs on a Raspberry Pi or
 - **Plan:**
   - **Routine checks:** test the smoke alarms, charge the power banks, rotate the water. Dads Army tells you when each is due.
   - **Household emergency plan:** contacts, meeting places, how to turn off the water, gas and electricity, and medical needs. It's ready to print for the grab bag.
-- **HQ:** household size, calorie and water needs, readiness target (3 days to a year), backups, a printed hard copy, a starter list of about 95 essentials, light/dark mode, and the activity log.
+- **Live alerts (UK):** flood warnings, river levels, severe weather, power cuts, wildfires, grid notices, air quality, gas storage, the pound and markets on a map, with a warning when a trend looks worrying. Nothing about where you live is sent to any feed.
+- **HQ:** household size (pets too), calorie and water needs, readiness target (3 days to a year), expiry warnings (by category if you like), backups, a printed hard copy, a starter list of about 95 essentials, light/dark mode, and the activity log.
 - **Undo** on anything you use or delete. Several phones can use it at once.
 
 It needs no internet to run, and nothing about you leaves your network. The only time it uses the internet is if you switch on warnings, and then it just downloads the public warning feeds.
@@ -103,7 +104,7 @@ To update, run `git pull` and then `bash install.sh` again. Your data is kept.
 
 ## Backups and the paper copy
 
-- **Automatic:** once a day, Dads Army saves a copy of its database and keeps the last 14.
+- **Automatic:** once a day, Dads Army saves a copy of its database and keeps the last 14. HQ → **Restore an automatic copy…** brings one back.
 - **Download a backup:** HQ → **Download backup** saves a `.json` file to your phone. HQ → **Restore from a backup…** brings it back.
 - **Spreadsheet:** HQ → **Export spreadsheet (CSV)**.
 - **Print it:** HQ → **Print full inventory** gives a paper list with a tick column. Keep it with the stores, in case the power or the Pi goes down. **Print emergency plan & checks** does the same for the plan.

@@ -5,7 +5,7 @@ FROM ${BUILD_FROM}
 RUN apk add --no-cache python3 tzdata
 
 WORKDIR /app
-COPY server.py /app/server.py
+COPY server.py intel.py /app/
 COPY static /app/static
 
 # /data is the add-on's own storage: it survives restarts and updates

@@ -1,0 +1,78 @@
+/* Dads Army - chart styles (pairs with charts.js). Colours come from the app's tokens:
+   --good --warn --bad --info, --c-food --c-water --c-kit --c-track --c-grid --c-target,
+   --ink --muted --surface --font --ease. Every one has a fallback, so charts render without app.css. */
+
+.dac {
+  display: block;
+  max-width: 100%;
+  overflow: visible;
+  /* app.css styles bare svg elements as line icons; charts set their own paint. */
+  fill: none;
+  stroke: none;
+  stroke-width: 1;
+  font-family: var(--font, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-feature-settings: "tnum";
+  font-feature-settings: "tnum";
+  -webkit-user-select: none;
+  user-select: none;
+}
+.dac svg { fill: none; stroke: none; stroke-width: 1; }
+.dac-ring, .dac-rings, .dac-donut, .dac-gauge { margin: 0 auto; }
+
+.dac text { stroke: none; fill: var(--ink, currentColor); font-size: 12px; }
+.dac .dac-big { font-weight: 650; letter-spacing: -.02em; }
+.dac .dac-unit { font-weight: 500; letter-spacing: 0; fill: var(--muted, #7d806f); }
+.dac .dac-sub { fill: var(--muted, #7d806f); font-size: 12px; }
+.dac .dac-axis { fill: var(--muted, #7d806f); font-size: 11px; }
+.dac .dac-strong { fill: var(--ink, currentColor); font-weight: 650; }
+.dac .dac-label { font-size: 13.5px; font-weight: 500; }
+.dac .dac-value { font-size: 12px; font-weight: 600; fill: var(--ink-2, var(--ink, currentColor)); }
+.dac .dac-target-label {
+  fill: var(--c-target, var(--ink, currentColor)); font-weight: 600;
+  /* a halo in the card colour keeps it readable where a line runs behind it */
+  paint-order: stroke; stroke: var(--surface, transparent); stroke-width: 4px; stroke-linejoin: round;
+}
+
+/* Tappable columns (the app adds the handlers). */
+.dac-col[data-key] { cursor: pointer; }
+.dac-col:hover .dac-grow { opacity: .85; }
+
+/* Matching legend (HTML). */
+.dac-legend {
+  display: flex; flex-wrap: wrap; gap: 6px 16px;
+  margin: 0; padding: 0; list-style: none;
+  font-size: var(--t-sm, 13.5px); color: var(--ink-2, inherit);
+  font-variant-numeric: tabular-nums;
+}
+.dac-legend.dac-legend-v { flex-direction: column; flex-wrap: nowrap; gap: 8px; }
+.dac-legend-item { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dac-legend-v .dac-legend-item { justify-content: space-between; }
+.dac-swatch { flex: none; width: 10px; height: 10px; border-radius: 3px; }
+.dac-legend-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dac-legend-v .dac-legend-label { flex: 1; }
+.dac-legend-value { color: var(--muted, #7d806f); font-weight: 600; white-space: nowrap; }
+.dac-legend-v .dac-legend-value { min-width: 0; max-width: 50%; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------- Draw-in (first render only: the app passes noAnimate on refresh) ---------- */
+@keyframes dac-draw { from { stroke-dashoffset: 100; } }
+@keyframes dac-reveal {
+  from { -webkit-clip-path: inset(0 100% 0 0); clip-path: inset(0 100% 0 0); }
+  to { -webkit-clip-path: inset(0 0 0 0); clip-path: inset(0 0 0 0); }
+}
+@keyframes dac-grow-x { from { -webkit-transform: scaleX(0); transform: scaleX(0); } }
+@keyframes dac-grow-y { from { -webkit-transform: scaleY(0); transform: scaleY(0); } }
+@keyframes dac-fade { from { opacity: 0; } }
+
+.dac-bar-fill { transform-box: fill-box; -webkit-transform-origin: 0 50%; transform-origin: 0 50%; }
+.dac-grow { transform-box: fill-box; -webkit-transform-origin: 50% 100%; transform-origin: 50% 100%; }
+
+.dac-anim .dac-arc { animation: dac-draw 320ms var(--ease, cubic-bezier(.2, .8, .2, 1)) both; }
+.dac-anim .dac-line { animation: dac-reveal 320ms var(--ease, cubic-bezier(.2, .8, .2, 1)) both; }
+.dac-anim .dac-bar-fill { animation: dac-grow-x 320ms var(--ease, cubic-bezier(.2, .8, .2, 1)) both; }
+.dac-anim .dac-grow { animation: dac-grow-y 320ms var(--ease, cubic-bezier(.2, .8, .2, 1)) both; }
+.dac-anim .dac-fade { animation: dac-fade 200ms ease-out 200ms both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .dac, .dac * { animation: none !important; transition: none !important; }
+}

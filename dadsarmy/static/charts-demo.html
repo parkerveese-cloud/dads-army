@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dads Army charts</title>
+<link rel="stylesheet" href="charts.css">
+<style>
+  /* Minimal stand-in tokens so this page renders on its own (the app defines the real ones in app.css). */
+  [data-theme="light"] {
+    --bg: #e8e5d3; --surface: #f7f5ea; --surface-2: #eeebdb; --line: #d9d5bf;
+    --ink: #1f2318; --ink-2: #4a5040; --muted: #5f6453; --olive: #4b5320;
+    --good: #2f6a2b; --warn: #b77600; --bad: #b0342c; --info: #5d84ad;
+    --c-food: #7c8a35; --c-water: #4f7fae; --c-kit: #a07f4f;
+    --c-track: rgba(75, 83, 32, .12); --c-grid: rgba(75, 83, 32, .14); --c-target: #3b4218;
+    color-scheme: light;
+  }
+  [data-theme="dark"] {
+    --bg: #11130d; --surface: #1b1e15; --surface-2: #23271b; --line: #2d3224;
+    --ink: #ebe8d5; --ink-2: #c3c3ac; --muted: #93967f; --olive: #a3b061;
+    --good: #84c472; --warn: #e6a93c; --bad: #f07b6e; --info: #86acd6;
+    --c-food: #b3c06a; --c-water: #7fa9d6; --c-kit: #cfb084;
+    --c-track: rgba(235, 232, 213, .09); --c-grid: rgba(235, 232, 213, .09); --c-target: #ebe8d5;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: #d8d5c3; }
+  body { font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .top { padding: 16px; display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; color: #1f2318; }
+  .top h1 { margin: 0; font-size: 18px; letter-spacing: .12em; text-transform: uppercase; }
+  .top button { font: inherit; padding: 6px 12px; border-radius: 10px; border: 1px solid #b8b39a; background: #f7f5ea; cursor: pointer; }
+  .themes { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  @media (max-width: 899px) { .themes { grid-template-columns: minmax(0, 1fr); } }
+  .theme { background: var(--bg); color: var(--ink); padding: 16px; min-width: 0; }
+  .theme > h2 { margin: 0 0 12px; font-size: 13px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+  .gal { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 16px; min-width: 0; }
+  .card.wide { grid-column: 1 / -1; }
+  .card h3 { margin: 0 0 12px; font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); font-weight: 650; }
+  .row { display: flex; gap: 12px; align-items: center; justify-content: space-around; flex-wrap: wrap; }
+  .row > div { flex: 1 1 90px; min-width: 0; max-width: 140px; text-align: center; }
+  .row.gauges > div { flex-basis: 160px; max-width: 220px; }
+  .row > div p, .cap { margin: 6px 0 0; font-size: 12px; color: var(--muted); }
+  .stack > * + * { margin-top: 16px; }
+  .meter-row { display: grid; grid-template-columns: minmax(0, 1fr) 90px auto; gap: 10px; align-items: center; font-size: 14px; }
+  .meter-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meter-row b { font-weight: 600; font-variant-numeric: tabular-nums; font-size: 13px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="top">
+  <h1>Dads Army charts</h1>
+  <button type="button" id="replay">Replay draw-in</button>
+</div>
+<div class="themes">
+  <section class="theme" data-theme="light" aria-label="Light theme"><h2>Light</h2><div class="gal"></div></section>
+  <section class="theme" data-theme="dark" aria-label="Dark theme"><h2>Dark</h2><div class="gal"></div></section>
+</div>
+<script src="charts.js"></script>
+<script src="charts-demo.js"></script>
+</body>
+</html>

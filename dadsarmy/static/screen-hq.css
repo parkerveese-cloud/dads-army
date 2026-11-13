@@ -1,0 +1,183 @@
+/* hq screen styles (2.0). Tokens and shared components live in app.css.
+   Also holds the Supply run screen (sr-*). */
+
+/* =====================================================================
+   Supply run
+   ===================================================================== */
+.su-grid { align-items: start; }
+@media (min-width: 1100px) {
+  .su-grid > .su-side { order: 2; position: sticky; top: calc(var(--header-h) + var(--gap)); }
+  .su-grid > .su-main { order: 1; }
+}
+
+.su-head { display: flex; align-items: center; gap: var(--s-4); margin: var(--s-3) 0 var(--s-3); }
+.su-ring { flex: none; width: 112px; }
+.su-counts { min-width: 0; }
+.su-counts p { margin: 0; }
+.su-counts p + p { margin-top: 2px; }
+.su-big { font-size: var(--t-lg); font-weight: 600; color: var(--ink-2); line-height: 1.2; margin-bottom: 4px !important; }
+.su-big b { font-size: var(--t-2xl); font-weight: 700; color: var(--ink); letter-spacing: -.02em; margin-right: 4px; }
+.su-hint { margin-bottom: var(--s-3); }
+
+.su-urgent-card .list .li:first-child { border-top: 0; }
+.su-urgent { min-height: 56px; gap: var(--s-3); padding-top: 8px; padding-bottom: 8px; border-radius: 0; }
+.card:not(.flush) .su-urgent { padding-left: 0; padding-right: 0; }
+.su-urgent .li-ico { font-size: 18px; width: 24px; }
+.su-urgent .pill { flex: none; }
+
+.su-cats .dac-bars { margin-top: var(--s-1); }
+
+/* The list: big rows, a clear Got it */
+.su-list .group-head .n { margin-left: 2px; }
+.su-row { min-height: 72px; padding-top: 12px; padding-bottom: 12px; gap: var(--s-4); }
+.su-row .li-main { padding: 2px 0; }
+.su-row .li-title { font-size: var(--t-md); }
+.su-row .need { display: block; margin-top: 3px; }
+.su-row .row-meter { display: block; margin-top: 9px; max-width: 260px; }
+.su-got { flex: none; min-height: 44px; padding: 0 16px; }
+.su-got svg { width: 17px; height: 17px; stroke-width: 2.6; }
+@media (max-width: 380px) {
+  .su-got { padding: 0 12px; }
+  .su-got svg { display: none; }
+}
+
+.su-extras .add-row { margin-bottom: var(--s-3); }
+.su-extras .list .li:first-child { border-top: 0; }
+.su-extra { min-height: 56px; gap: var(--s-2); }
+.su-extras-empty { margin: 0; }
+
+.su-allmet p { display: flex; align-items: center; gap: var(--s-2); }
+.su-allmet svg { width: 18px; height: 18px; color: var(--good); stroke-width: 2.6; flex: none; }
+.empty-ico.good { background: var(--good-bg); color: var(--good-ink); }
+.empty-ico.good svg { stroke-width: 2.6; }
+
+/* =====================================================================
+   HQ
+   ===================================================================== */
+/* Phones: the section chips stay in reach under the header; every section is shown, one after another. */
+@media (max-width: 699px) {
+  .hq > .hq-nav {
+    position: sticky; top: calc(var(--header-h) + env(safe-area-inset-top)); z-index: 8;
+    margin-top: calc(-1 * var(--s-2)); margin-bottom: 0;
+    padding-top: var(--s-2); padding-bottom: var(--s-2);
+    background: var(--bg);
+  }
+  .hq > .hq-nav > button { min-height: 40px; padding: 0 14px; }
+  .hq > .hq-nav > button svg { display: none; }
+  .hq-sec { scroll-margin-top: calc(var(--header-h) + env(safe-area-inset-top) + 64px); }
+  .hq-sec + .hq-sec { margin-top: var(--s-6); }
+}
+/* Wider: one section at a time beside the list. */
+@media (min-width: 700px) {
+  .hq-body > .hq-sec:not(.is-on) { display: none; }
+  .hq-nav > button svg { opacity: .8; }
+  .hq-nav > button[aria-current="true"] svg { opacity: 1; color: var(--olive); }
+}
+
+.hq-body { min-width: 0; }
+.hq-sec > .card, .hq-sec > .stack, .hq-sec > .hq-two, .hq-sec > .callout { margin: 0 0 var(--gap); }
+.hq-sec-head { margin: var(--s-2) 0 var(--s-4); }
+.hq-sec-title {
+  margin: 0; font-size: var(--t-xl); line-height: 1.2; font-weight: 700; letter-spacing: -.01em; color: var(--ink);
+}
+.hq-sec-sub { margin: 4px 0 0; color: var(--muted); font-size: var(--t-sm); max-width: 62ch; }
+
+.hq-two { display: grid; gap: var(--gap); align-items: start; }
+.hq-two > .card, .hq-two > .stack > .card { margin: 0; }
+@media (min-width: 1100px) { .hq-two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+
+.hq-sub {
+  font: 700 12.5px/1.2 var(--font-display); letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2);
+  margin: var(--s-5) 0 0; padding-top: var(--s-4); border-top: 1px solid var(--line);
+}
+.hq-sub + .set-row { border-top: 0; }
+.hq-foot { margin: var(--s-3) 0 0; }
+
+/* Daily needs */
+.hq-needs-stats { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-4); }
+.hq-needs-stats .stat-val { font-size: var(--t-xl); font-weight: 700; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.hq-needs-total { margin: var(--s-4) 0; padding: 12px 14px; border-radius: var(--r-ctl); background: var(--surface-2); font-size: var(--t-sm); color: var(--ink-2); }
+.hq-needs-total b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.hq-needs-note { margin: var(--s-3) 0 0; }
+
+/* Targets and warnings */
+.hq-slider { margin-top: var(--s-4); }
+.hq-presets { margin: var(--s-4) 0 var(--s-2); }
+.hq-presets .chip { min-height: 36px; padding: 0 12px; font-size: var(--t-sm); }
+@media (pointer: coarse) { .hq-presets .chip { min-height: 44px; } }
+.hq-catwarn { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: var(--s-2); margin-top: var(--s-3); }
+.hq-cw {
+  display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; min-width: 0;
+  border: 1px solid var(--line); border-radius: var(--r-ctl); background: var(--surface-2);
+}
+.hq-cw.is-set { border-color: var(--line-strong); background: var(--surface); }
+.hq-cw-name { font-size: var(--t-sm); font-weight: 600; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hq-cw-box { display: flex; align-items: center; gap: 8px; font-size: var(--t-xs); color: var(--muted); }
+.hq-cw-box input[type="text"] { width: 72px; min-height: 40px; padding: 8px 10px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* On/off rows */
+.hq-toggle {
+  display: flex; align-items: center; gap: var(--s-3); min-height: 60px; padding: var(--s-3) 0;
+  border-top: 1px solid var(--line); cursor: pointer;
+}
+.card-head + .hq-toggle, .card > .hq-toggle:first-child, .hq-src:first-of-type .hq-toggle { border-top: 0; }
+.hq-toggle-text { flex: 1; min-width: 0; display: block; }
+.hq-toggle-title { display: block; font-weight: 600; }
+.hq-toggle-hint { display: block; font-size: var(--t-sm); color: var(--muted); margin-top: 2px; }
+.hq-toggle .switch { flex: none; min-height: 0; }
+#intelCard > .hq-toggle { padding-top: 0; }
+#intelCard .hq-toggle-title { font-size: var(--t-lg); }
+.hq-privacy { margin-top: var(--s-2); }
+#intelCard > .callout + .callout { margin-top: var(--s-2); }
+
+.hq-fields { margin-top: 0; }
+.hq-fields .field { margin-bottom: var(--s-4); }
+
+.hq-src + .hq-src { border-top: 1px solid var(--line); }
+.hq-src .hq-toggle { border-top: 0; align-items: flex-start; }
+.hq-src .hq-toggle .switch { margin-top: 2px; }
+.hq-src-status { flex: none; margin-top: 3px; }
+.hq-attr { display: block; font-size: var(--t-xs); margin-top: 4px; line-height: 1.4; }
+.hq-src .ha-error { margin: 0 0 var(--s-3); }
+.hq-src-items { margin: 0 0 var(--s-3); }
+.hq-src-items .li:first-child { border-top: 0; }
+@media (max-width: 479px) {
+  .hq-src .hq-toggle { flex-wrap: wrap; }
+  .hq-src .hq-toggle-text { flex-basis: calc(100% - 60px); }
+  .hq-src-status { order: 3; margin: -4px 0 0; }
+}
+
+/* Backups */
+.hq-backup-stat { display: flex; align-items: baseline; gap: var(--s-2) var(--s-4); flex-wrap: wrap; margin-bottom: var(--s-3); }
+.hq-backup-stat .stat-val { font-size: var(--t-xl); font-weight: 700; }
+.hq-backup-stat p { margin: 0; }
+.hq-restore { margin-top: var(--s-4); }
+@media (max-width: 479px) { .hq-restore > .btn { width: 100%; } }
+.card .btn-group > .btn { flex: 1 1 auto; }
+
+/* Appearance */
+.hq-theme { max-width: 360px; }
+
+/* Activity */
+.hq-activity { padding-top: var(--s-2); }
+.hq-log-day {
+  font: 700 12px/1.2 var(--font-display); letter-spacing: .14em; text-transform: uppercase; color: var(--muted);
+  margin: var(--s-4) 0 var(--s-1);
+}
+.hq-log-day:first-child { margin-top: var(--s-2); }
+.hq-log { margin: 0; }
+.hq-log-item { display: flex; gap: var(--s-3); padding: 9px 0; border-top: 1px solid var(--line); font-size: var(--t-sm); line-height: 1.45; }
+.hq-log-item:first-child { border-top: 0; }
+.hq-log-item .log-dot { margin-top: 7px; }
+.hq-log-item .log-text { color: var(--ink-2); }
+.hq-log-item .log-text b { color: var(--ink); font-weight: 650; }
+.hq-log-detail { display: block; color: var(--muted); font-size: var(--t-xs); margin-top: 1px; }
+.hq-log-item .log-when { font-variant-numeric: tabular-nums; min-width: 3.5em; text-align: right; }
+
+.hq-body > .tagline { margin-top: var(--s-6); }
+
+/* Stacked cards: the stack owns the spacing */
+.su-grid .stack > .card, .hq-two > .stack > .card { margin: 0; }
+@media (max-width: 699px) {
+  .su-cats { display: none; }   /* on a phone the list's category headings carry the counts */
+}

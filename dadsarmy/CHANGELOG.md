@@ -1,5 +1,74 @@
 # Changelog
 
+## 2.0.0
+
+Re-formatted for wall tablets, with live information added. Everything you could do before still works, and phones keep the bottom tabs. On a wall tablet or desktop the screens use the full width.
+
+### Layout for wall tablets and larger screens
+
+- **Sitrep:** on a wall tablet or desktop the alert level and resilience sit side by side at the top. Below them, how long you could hold out with rings for food, water and kit, and a trend over the last weeks. **Next actions** lists the few most useful things to do now. Tiles for expired, expiring, below target and out of stock show their trend. An **expiry timeline** shows what goes out of date month by month, and **stock by category** shows what's complete.
+- **Stores:** a table on desktop with stock against target, the soonest expiry, where it's kept and how fast you use it. The toolbar stays in view. Item details open in a side drawer (a sheet on phones) with batches in the order to use them.
+- **Supply run:** progress at a glance, what's most urgent, a breakdown by category, and the checklist.
+- **HQ:** sections with a menu (Household, Targets and warnings, Live alerts, Backups, Home Assistant, Appearance, Activity), sliders for targets, and switches.
+- **History:** Dads Army now keeps a daily record of readiness, so trends build up from today.
+- **Usage:** it notes what you use, and works out how fast each thing goes and when it will run out.
+- **First run:** a three-step start for new stores.
+- Navigation moves into the header on tablets and desktops. Light and dark themes throughout.
+- Charts are drawn by the app itself (no outside libraries or requests).
+- **Colours:** a brighter green palette with stronger blue, amber and red, so status reads from across the room on a wall tablet. The header stays dark green.
+
+### Live alerts (UK)
+
+These sit alongside the warnings, household alert level and resilience from 1.6.0 to 1.9.0, which lead the Sitrep. Live alerts add the map, more sources and trends. With live alerts on, weather, flood and fire warnings show once on the Sitrep, on the live map and in Things to watch; the Plan tab still lists every warning.
+
+- **Live alerts.** Flood warnings (Environment Agency), severe weather (Met Office), power cuts (UK Power Networks), national grid warnings (Elexon), air quality (DEFRA UK-AIR) and space weather (NOAA), straight from the official open feeds. A card on the Sitrep, settings in HQ, and `sensor.dads_army_live_alerts` / `sensor.dads_army_alert_level` in Home Assistant. Off until you switch it on.
+- **Live alerts map** on the Sitrep: home, a ring for the distance you choose, every flood warning area in your county (outlined and coloured when there's an alert), and power cuts around home. Tap anything for the details and a link to the official page.
+- **Colour-coded summaries** under the map, one per source (All clear, Be aware, Be prepared, Take action). Tap one for its details.
+- Power cuts near home but outside your postcode districts show on the map as "nearby", without raising an alert.
+- HQ → Live alerts: map on or off, and how far around home to show (5 to 40 km). Home comes from Home Assistant's own settings.
+- The map uses the bundled Leaflet 1.9.4 library (BSD-2-Clause) with OpenStreetMap tiles, darkened in the dark theme.
+- **Across the UK:** floods (all of England), Met Office warnings (every region, shaded on the map) and the bigger power cuts nationwide now show on the map. Only alerts near you raise the alert level and the Home Assistant sensors; the rest are context, drawn smaller and fainter. Switch them off in HQ if you'd rather not see them.
+- **Map centred on a postcode** of your choice (HQ → Live alerts), with Home and UK buttons on the map.
+- **Wildfires:** NASA satellite heat detections from the last 24 hours across the UK and Ireland, with offshore platform flares left out. One within your "near you" distance counts as an alert.
+- **Gas storage:** how full Great Britain's gas storage is, the week's change and roughly how long it would last at the current rate (National Gas).
+- **More power cuts:** National Grid (NGED) live power cuts added alongside UK Power Networks, covering the Midlands, South West and Wales too.
+- The map no longer shows every quiet flood area: only what's happening.
+- Fixed: two Met Office region codes (London & South East England is "se"; "ls" didn't exist).
+- Privacy: no feed is told where you live any more. Every one is a national list filtered on the Pi.
+- **River levels:** a new live alert. It shows every Environment Agency river gauge within your "near you" distance against its normal range, with the trend, and flags any that are above normal. Rivers running high elsewhere in England appear on the map. A gauge above its normal range near you counts as an alert.
+- **Trends to watch:** Dads Army now keeps a few numbers from every check for two weeks (power cuts, flood warnings, rivers above normal, heat detections, grid notices) and looks for a worrying direction of travel: a river near you rising towards the top of its normal range, power cuts or flood warnings climbing, gas storage emptying faster. Trends appear at the top of Live alerts and count as alerts. Each source's details show its history as a chart.
+- **The pound:** sterling against the US dollar, euro, yen, yuan, Canadian and Australian dollars and Swiss franc, with day, week and month moves. A fall of 3% in a week (or 6% in a month) against the dollar or euro is flagged.
+- **Markets:** nine major stock indices plus Brent crude, wheat and gold, refreshed every three hours. A fall of 7% in a week (12% in a month) in an index, or a rise of 15% in a week in oil or wheat, is flagged. Context only, not financial advice.
+- **Home Assistant:** a new `sensor.dads_army_trends`, and a `dads_army_alert` event for each new live alert or trend (kind, level, level_word, source, title, message, url), for phone notifications. The same alert doesn't repeat within six hours.
+- **Things to watch** is now a banner at the very top of the Sitrep, showing trends and anything active near you. Tap one to jump to its details.
+- **Live alerts:** a source with a trend or alert now turns amber or red, says what it is on the tile, and moves to the front. The pill on the card names the source when there's only one. The trend's explanation shows in the source's details.
+- Live alerts show on the Sitrep even before you've added any stock.
+
+### Also new
+
+- **Pets.** HQ → Household now has pets, with the calories and water they need a day. They count towards food days, water days and hold-out. With no pets nothing changes.
+- **Starter targets keep up with the household.** Change the people, pets or readiness target and the starter list's targets are worked out again. Targets you set yourself stay as they are.
+- **Expiry warning by category**, for example 90 days for Medical.
+- **Restore an automatic copy** from HQ, with the date and number of items for each.
+- **Supply run extras:** change the text, or tap **Got it** to add one to the stores as a new item.
+- **Undo** after **Add stock** and **Got it**.
+- **Home Assistant:** `sensor.dads_army_expiring_soon` now lists what goes out of date in exactly seven days (`expires_in_7_days`) alongside `expires_today`, for phone reminders.
+- Daily use and prices (1.5.0) are part of the wider layout: Stores shows how long each thing lasts, the Sitrep has **Daily supplies** and **Checks due** cards, and the supply run adds up the cost.
+
+### Fixes
+
+- Expired stock no longer counts towards targets, running low, out of stock or kit stocked. The supply run says how much to replace (*Get 3 tins · 2 expired*).
+- Undo won't overwrite a newer change: if the item has changed since, it says so. The Undo offer goes as soon as you change something else.
+- "Went out of date overnight" and "last day" alerts include every batch, not just each item's oldest.
+- Home Assistant to-do list: an emptied list no longer forgets which items aren't Dads Army's; a below-target line that changes is unticked; changes made in Dads Army during a sync aren't overwritten; the link table is only rewritten when something changed.
+- "Ran out" events are no longer lost when Home Assistant can't be reached for a while.
+- Backups are checked before they're kept and never overwrite each other. Copies made before a restore are kept for 14 days. Restoring an empty backup asks first.
+- The household needs at least one person. The health check now checks the database too.
+- Safer input: dates, numbers and ids take plain digits only; "done" on the supply run must be true or false; spreadsheet export can't be made to run formulas. Quantities accept a comma ("1,5") and show up to 3 decimals.
+- Editing a batch with the quantity left empty no longer deletes it. Setting it to 0 asks first.
+- Accessibility: calmer screen reader announcements, focus moves into and back out of sheets, named buttons and meters, better contrast for muted and green text.
+- The offline banner now fits Home Assistant: "Can't reach Dads Army. Check Home Assistant is running and you're connected."
+- Saving a setting no longer wipes out another one you're typing. Several smaller fixes to refreshing and the supply run tick.
 ## 1.9.0
 
 - **Resilience, in ten areas.** Being ready isn't just food and water. Dads Army now looks at:
