@@ -30,6 +30,7 @@ import base64
 import csv
 import hashlib
 import datetime as dt
+import gzip
 import html as htmllib
 import io
 import json
@@ -49,7 +50,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -744,6 +745,8 @@ def summary():
                                              today)),
     }
     out["situation"] = assess(out, home_snapshot())
+    with LOCK:
+        out["places"] = places_view(out)
     return out
 
 
@@ -795,6 +798,8 @@ def api_state(body, query):
         return {
             "situation": sm["situation"],
             "resilience": sm["resilience"],
+            "places": sm["places"],
+            "place_hazards": [[k, w, e] for k, w, e, _, _ in PLACE_HAZARDS],
             "home": home,
             "items": all_items(),
             "shopping": [dict(r) for r in DB.execute("SELECT * FROM shopping ORDER BY done, id")],
@@ -1891,6 +1896,7 @@ def api_backup(body, query):
             "checks": all_checks(),
             "plan": get_plan(),
             "resilience": res_answers(),
+            "places": own_places(),
         }
     data = json.dumps(payload, indent=1, ensure_ascii=False).encode("utf-8")
     return Raw(data, "application/json; charset=utf-8", "dadsarmy-backup-%s.json" % dt.date.today().isoformat())
@@ -1929,6 +1935,10 @@ def api_restore(body, query):
     if isinstance(body.get("plan"), dict):
         plan = clean_plan(body["plan"])
         plan["updated_at"] = clean_text(body["plan"].get("updated_at"), 30) or None
+    # Your own places arrived in 1.10.0.
+    places = None
+    if isinstance(body.get("places"), list):
+        places = clean_places({"places": body["places"]})
     # Your resilience answers arrived in 1.9.0.
     answers = None
     if isinstance(body.get("resilience"), dict):
@@ -1964,6 +1974,8 @@ def api_restore(body, query):
             set_setting_raw(db, "plan", plan)
         if answers is not None:
             set_setting_raw(db, "resilience", answers)
+        if places is not None:
+            set_setting_raw(db, "places", places)
         add_log("restored", "", "Restored %d items from backup" % len(clean_items))
     HA_REBASE.set()  # a restore isn't things running out
     return {"items": len(clean_items)}
@@ -2033,7 +2045,7 @@ CHECKS_LIST_NAME = "Dads Army checks"
 CHECKS_STATUS = {"ok": None, "error": "", "synced_at": None, "name": ""}
 HA_WS = os.environ.get("DADSARMY_HA_WS", "ws://supervisor/core/websocket")
 DASH_URL = "dads-army"
-DASH_LAYOUT = 4   # bump when the dashboard changes, so the app offers to rebuild it
+DASH_LAYOUT = 5   # bump when the dashboard changes, so the app offers to rebuild it
 
 
 class HAError(Exception):
@@ -2157,6 +2169,38 @@ def ha_entities(s):
         # Short keys: every recommendation, by area, for the dashboard's Resilience page.
         "measures": dict((a[0], [{"t": m["title"], "s": m["status"], "p": m["priority"], "l": m["label"]}
                                  for m in res["items"] if m["area"] == a[0]]) for a in AREAS)})
+    # Places to go: a summary, and each place as a point for Home Assistant's map card
+    # (geo_location entities with source "dads_army").
+    pl = s["places"]
+    brief = lambda p: {"name": p["name"], "what": p["what"], "text": p["text"], "short": p["short"], "km": p["km"],
+                       "dir": p["dir"], "own": p["own"]}
+    put("sensor.dads_army_places", pl["count"], "Dads Army places to go", "mdi:map-marker-radius", attrs={
+        "located": bool(pl["home"]), "active": pl["active"], "error": pl["error"],
+        "hazards": [{"key": h["key"], "what": h["what"], "emoji": h["emoji"], "active": h["active"],
+                     "advice": h["advice"], "avoiding": h["avoiding"], "places": [brief(p) for p in h["places"]]}
+                    for h in pl["hazards"]],
+        "help": [brief(p) for p in pl["help"]]}, measurement=False)
+    if pl["home"]:
+        uses = {}
+        for h in pl["hazards"]:
+            for p in h["places"]:
+                uses.setdefault((p["lat"], p["lon"]), []).append(h["what"])
+        points = [("home", {"name": "Home", "what": "Home", "icon": "mdi:home", "lat": pl["home"]["lat"],
+                            "lon": pl["home"]["lon"], "km": 0, "dir": "", "own": False})]
+        counts = {}
+        for p in pl["map"]:
+            base = "own" if p["own"] else p["kind"]
+            counts[base] = counts.get(base, 0) + 1
+            points.append(("%s_%d" % (base, counts[base]), p))
+        for slug, p in points:
+            put("geo_location.dads_army_" + slug, p["km"],
+                p["name"] if slug == "home" else "%s (%s)" % (p["name"], p["what"]), p["icon"], attrs={
+                    # Far-off places (a hospital, Gran's house) have their own source, so the map
+                    # can show them without zooming right out to fit them in.
+                    "latitude": p["lat"], "longitude": p["lon"],
+                    "source": "dads_army" if p["km"] <= MAP_NEAR_KM else "dads_army_far", "distance_km": p["km"],
+                    "direction": p["dir"], "what": p["what"], "for": uses.get((p["lat"], p["lon"]), [])},
+                measurement=False)
     # Only what needs doing now. Things not bought yet are the supply run's job (they'd keep
     # this on for weeks while the stores are built up), and a check that's never been done
     # isn't overdue.
@@ -2958,6 +3002,25 @@ DASH_RES_AREA = """{% set ar = (state_attr('sensor.dads_army_resilience', 'areas
 Dads Army isn't sending updates. Check the app is running.
 {%- endif %}"""
 
+# Under the map: where to go for each kind of emergency, with what's happening now first.
+DASH_PLACES = """{% set a = 'sensor.dads_army_places' -%}
+{% set hz = state_attr(a, 'hazards') or [] -%}
+{% if states(a) in ['unknown', 'unavailable'] -%}
+Dads Army isn't sending updates. Check the app is running.
+{%- elif not state_attr(a, 'located') -%}
+Dads Army doesn't know where home is. Set your home's location in Home Assistant, or in Dads Army's warnings settings.
+{%- else -%}
+{% for h in hz | selectattr('active') %}
+<ha-alert alert-type="warning" title="{{ h.emoji }} {{ h.what }}: now">{{ h.advice }}</ha-alert>
+{% endfor %}
+| | If it's… | Where you could go |
+|:-:|:--|:--|
+{% for h in hz -%}
+| {{ h.emoji }} | {% if h.active %}**{{ h.what }}**{% else %}{{ h.what }}{% endif %} | {% for p in h.places[:2] %}{% if p.own %}⭐ {% endif %}{{ p.name }} <small>· {{ p.what }}, {{ p.short }}</small>{% if not loop.last %}<br>{% endif %}{% else %}<small>{{ 'Stay indoors, away from the trouble. Add family or friends in Dads Army.' if h.key == 'unrest' else 'Nothing close by in the list' }}</small>{% endfor %} |
+{% endfor %}
+<small>Possibilities, not official refuges: councils say where rest centres open at the time. ⭐ your own places. Place data © OpenStreetMap contributors.</small>
+{%- endif %}"""
+
 DASH_CHECKS = """{% set c = state_attr('sensor.dads_army_checks_due', 'items') or [] -%}
 {% for i in c[:8] %}
 - **{{ i.name }}** · {{ i.text }}
@@ -3052,6 +3115,18 @@ def dashboard_config():
             dict({"type": "history-graph", "hours_to_show": 720, "entities": [
                 {"entity": "sensor.dads_army_food_days", "name": "Food"},
                 {"entity": "sensor.dads_army_water_days", "name": "Water"}]}, **full)]},
+        # Places to go: Home Assistant's own map, with home and the places near it.
+        {"type": "grid", "column_span": 2, "cards": [
+            heading("Places to go", "mdi:map-marker-radius"),
+            {"type": "map", "geo_location_sources": [
+                {"source": "dads_army", "label_mode": "icon"},
+                {"source": "dads_army_far", "label_mode": "icon", "focus": False}],
+             "default_zoom": 13, "theme_mode": "auto", "grid_options": {"columns": "full", "rows": 7}},
+            dict({"type": "markdown", "content": DASH_PLACES}, **full),
+            dict({"type": "tile", "entity": "sensor.dads_army_places", "name": "Add family, friends and meeting places",
+                  "icon": "mdi:map-marker-plus", "hide_state": True,
+                  "tap_action": {"action": "navigate", "navigation_path": app_panel()},
+                  "icon_tap_action": {"action": "navigate", "navigation_path": app_panel()}}, **full)]},
     ]
     return {"views": [{"title": "Home front", "path": "home-front", "type": "sections", "max_columns": 3,
                        "badges": [{"type": "entity", "entity": level, "name": "Alert level",
@@ -3152,6 +3227,7 @@ def ha_loop():
         HA_WAKE.wait(15 if failing else 30 if (todo_entity() or checks_entity()) else 60)
         HA_WAKE.clear()
         time.sleep(1)  # let a burst of changes settle
+        refresh_ha_home()   # where home is, for Places when warnings are off (once an hour at most)
         try:
             s = summary()
             now = stock_levels()
@@ -3178,6 +3254,17 @@ def ha_loop():
                         raise RuntimeError("Home Assistant answered %s" % status)
                     sent[eid] = payload
                     HA_LAST[eid] = body
+            # Map points that are no longer wanted (home moved, a place deleted): take them off.
+            geo_now = sorted(e for e in ents if e.startswith("geo_location.dads_army_"))
+            with LOCK:
+                geo_old = setting_raw("ha_geo_ids", []) or []
+            if geo_old != geo_now:
+                for eid in set(geo_old) - set(geo_now):
+                    ha_call("DELETE", "/states/" + eid)
+                    sent.pop(eid, None)
+                    HA_LAST.pop(eid, None)
+                with tx() as db:
+                    set_setting_raw(db, "ha_geo_ids", geo_now)
             if full:
                 last_full = time.monotonic()
             level_change(s["situation"])
@@ -3648,6 +3735,300 @@ def compass(lat1, lon1, lat2, lon2):
             "north-west"][int((deg + 22.5) // 45) % 8]
 
 
+# -- Places to go -----------------------------------------------------------------
+# Possible refuges and help points near home, for when staying put isn't safe. The UK list
+# ships with the app (built from OpenStreetMap, see places/README.md), so finding them needs
+# no internet and tells nobody where you live. Your own places (family, friends, meeting
+# places) are added in the app.
+PLACES_FILE = os.environ.get("DADSARMY_PLACES", os.path.join(APP_DIR, "places", "uk.tsv.gz"))
+PLACE_KINDS = [
+    # code in the file, kind, what it is, emoji, Home Assistant icon, how far to look (km)
+    ("c", "community", "Community centre or hall", "🏛️", "mdi:home-group", 10),
+    ("l", "leisure", "Leisure centre", "🏊", "mdi:pool", 15),
+    ("b", "library", "Library", "📚", "mdi:library", 15),
+    ("h", "hospital", "Hospital (emergency care)", "🏥", "mdi:hospital-building", 60),
+    ("f", "fire", "Fire station", "🚒", "mdi:fire-truck", 20),
+    ("p", "police", "Police station", "🚓", "mdi:police-badge", 20),
+    ("a", "assembly", "Emergency assembly point", "📍", "mdi:account-group", 5),
+    ("e", "high", "High ground", "⛰️", "mdi:image-filter-hdr", 15),
+    ("k", "park", "Park or open space", "🌳", "mdi:tree", 5),
+]
+KIND_BY_CODE = {k[0]: k for k in PLACE_KINDS}
+KIND = {k[1]: k for k in PLACE_KINDS}
+OWN_KINDS = {"family": ("Family or friends", "🏠", "mdi:home-heart"),
+             "meet": ("Meeting place", "🚩", "mdi:flag"),
+             "other": ("Your place", "📌", "mdi:map-marker-star")}
+# What could make you leave home, where to think about going, and the gist of what to do.
+PLACE_HAZARDS = [
+    ("flood", "Flooding", "🌊", ("high", "community", "leisure"),
+     "Move to higher ground, away from the water, and never walk or drive through flood water. If you have to leave, "
+     "councils open rest centres, often in leisure centres and community halls: check yours isn't in the flood area."),
+    ("storm", "Storms and high winds", "🌬️", ("community", "leisure", "library"),
+     "Stay indoors if your home is safe. If it isn't, go to a sturdy public building, keeping away from trees."),
+    ("fire", "A wildfire", "🔥", ("community", "leisure", "library"),
+     "Go away from the fire and the smoke, upwind if you can, to a built-up area. When there's a fire nearby, Dads "
+     "Army leaves out places nearer to it than you are."),
+    ("quake", "An earthquake", "🫨", ("park", "assembly"),
+     "While it shakes: drop, cover and hold on. Afterwards, go to open ground away from buildings, walls and power "
+     "lines."),
+    ("unrest", "Civil unrest", "🚧", (),
+     "Stay indoors, away from windows, and keep away from the trouble. If you have to leave, go to family or friends "
+     "outside the area."),
+    ("heat", "A heatwave", "🌡️", ("library", "leisure", "community"),
+     "Libraries, leisure centres and community centres are cool places for the hottest part of the day. Many "
+     "councils list cool spaces."),
+    ("cold", "Cold, or a long power cut", "🧣", ("library", "community", "leisure"),
+     "Libraries and community centres are warm places to go. Many councils list warm spaces in winter."),
+    ("leave", "Having to leave home", "🎒", ("leisure", "community"),
+     "Councils open rest centres when people have to leave, often in leisure centres, schools and community halls. "
+     "Local radio will say where. Or go to family or friends."),
+    ("medical", "A medical emergency", "🏥", ("hospital",),
+     "Call 999 in an emergency, or 111 if it isn't. A&E is for serious injuries and illnesses."),
+]
+HAZARD_KEYS = [h[0] for h in PLACE_HAZARDS]
+NEARBY_KM = 60
+MAP_NEAR_KM = 20   # the dashboard map zooms to fit places this close; further ones are there if you zoom out
+DIR_SHORT = {"north": "N", "north-east": "NE", "east": "E", "south-east": "SE", "south": "S", "south-west": "SW",
+             "west": "W", "north-west": "NW", "": ""}
+PLACES_CACHE = {"key": None, "rows": [], "error": "", "built": ""}
+MAX_OWN_PLACES = 40
+
+
+def load_places(home):
+    """The UK list's places within NEARBY_KM of home, nearest first. Read again only if home moves."""
+    key = (round(home["lat"], 3), round(home["lon"], 3))
+    if PLACES_CACHE["key"] == key:
+        return PLACES_CACHE["rows"]
+    rows, built, error = [], "", ""
+    dlat = NEARBY_KM / 111.0
+    dlon = NEARBY_KM / (111.0 * max(0.2, math.cos(math.radians(home["lat"]))))
+    try:
+        with gzip.open(PLACES_FILE, "rt", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("#"):
+                    m = re.search(r"Built (\d{4}-\d{2}-\d{2})", line)
+                    built = m.group(1) if m else built
+                    continue
+                p = line.rstrip("\n").split("\t")
+                if len(p) < 4 or p[2] not in KIND_BY_CODE:
+                    continue
+                lat, lon = float(p[0]), float(p[1])
+                if abs(lat - home["lat"]) > dlat or abs(lon - home["lon"]) > dlon:
+                    continue
+                d = km_between(home["lat"], home["lon"], lat, lon)
+                if d <= NEARBY_KM:
+                    rows.append((d, lat, lon, KIND_BY_CODE[p[2]][1], p[3], p[4] if len(p) > 4 else ""))
+    except (OSError, ValueError, EOFError) as e:
+        error = "The list of places couldn't be read (%s)" % str(e)[:80]
+    rows.sort()
+    PLACES_CACHE.update(key=key, rows=rows, error=error, built=built)
+    return rows
+
+
+COORD_PATTERNS = [
+    re.compile(r"mlat=(-?\d+(?:\.\d+)?)&mlon=(-?\d+(?:\.\d+)?)"),
+    re.compile(r"#map=\d+/(-?\d+(?:\.\d+)?)/(-?\d+(?:\.\d+)?)"),
+    re.compile(r"!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)"),
+    re.compile(r"@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)"),
+    re.compile(r"[?&](?:q|ll|query|daddr|destination)=(-?\d+(?:\.\d+)?)(?:,|%2C)\s*(-?\d+(?:\.\d+)?)"),
+    re.compile(r"^\s*(-?\d{1,2}(?:\.\d+)?)\s*[,\s]\s*(-?\d{1,3}(?:\.\d+)?)\s*$"),
+]
+
+
+def parse_where(text):
+    """Coordinates from "54.48, -0.62" or a link from Google, Apple or OpenStreetMap maps."""
+    t = (text or "").strip()
+    for rx in COORD_PATTERNS:
+        m = rx.search(t)
+        if m:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return round(lat, 5), round(lon, 5)
+    raise ApiError(400, "Couldn't find a location in that. Paste a map link, or type it like 54.48, -0.62 "
+                        "(long-press the place in your maps app to get it).")
+
+
+def clean_places(body):
+    rows = body.get("places")
+    if not isinstance(rows, list):
+        raise ApiError(400, "Places should be a list")
+    if len(rows) > MAX_OWN_PLACES:
+        raise ApiError(400, "That's too many places (%d at most)" % MAX_OWN_PLACES)
+    out, n = [], 0
+    for r in rows:
+        if not isinstance(r, dict):
+            raise ApiError(400, "Each place needs a name and where it is")
+        name = clean_text(r.get("name"), 80)
+        if not name:
+            raise ApiError(400, "Give each place a name")
+        if r.get("where"):
+            lat, lon = parse_where(clean_text(r.get("where"), 600))
+        else:
+            try:
+                lat, lon = float(r.get("lat")), float(r.get("lon"))
+            except (TypeError, ValueError):
+                raise ApiError(400, "Where is %s? Paste a map link or the coordinates." % name)
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                raise ApiError(400, "Those coordinates for %s aren't on the map" % name)
+        kind = r.get("kind") if r.get("kind") in OWN_KINDS else "other"
+        hz = [h for h in (r.get("hazards") or []) if h in HAZARD_KEYS]
+        n += 1
+        out.append({"id": n, "name": name, "lat": round(lat, 5), "lon": round(lon, 5), "kind": kind, "hazards": hz,
+                    "notes": clean_text(r.get("notes"), 300)})
+    return out
+
+
+def own_places():
+    raw = setting_raw("places", [])
+    try:
+        return clean_places({"places": raw if isinstance(raw, list) else []})
+    except ApiError:
+        return []
+
+
+def _km_words(d):
+    return ("%.1f km" % d) if d < 10 else ("%d km" % int(round(d)))
+
+
+def _place(home, kind, name, lat, lon, own=None, ele=""):
+    d = km_between(home["lat"], home["lon"], lat, lon)
+    if own:
+        what, emoji, icon = OWN_KINDS[own["kind"]]
+    else:
+        what, emoji, icon = KIND[kind][2], KIND[kind][3], KIND[kind][4]
+        if kind == "high" and ele:
+            what = "High ground, %s m" % ele
+    p = {"kind": own["kind"] if own else kind, "what": what, "emoji": emoji, "icon": icon, "name": name,
+         "lat": lat, "lon": lon, "km": round(d, 1), "dir": compass(home["lat"], home["lon"], lat, lon) if d >= 0.05 else "",
+         "own": bool(own), "map": "https://www.openstreetmap.org/?mlat=%s&mlon=%s#map=16/%s/%s" % (lat, lon, lat, lon)}
+    p["text"] = "%s · %s%s" % (what, _km_words(d), (" " + p["dir"]) if p["dir"] else "")
+    p["short"] = (_km_words(d) + " " + DIR_SHORT[p["dir"]]).strip()
+    if own:
+        p["id"] = own["id"]
+        p["hazards"] = own["hazards"]
+        p["notes"] = own["notes"]
+    return p
+
+
+def active_hazards(s, items):
+    """Which of the hazards are happening, from the warnings in force and the alert level's reasons."""
+    keys = set(r["key"] for r in s["situation"]["reasons"])
+    act = []
+    for w in items:
+        k, t = w.get("kind"), (w.get("title") or "").lower()
+        if k == "flood" and (w.get("severity") or 0) >= 2:
+            act.append("flood")
+        if k == "fire":
+            act.append("fire")
+        if k == "weather" and (w.get("severity") or 0) >= 2:
+            if "wind" in t or "storm" in t:
+                act.append("storm")
+            if "heat" in t:
+                act.append("heat")
+            if "snow" in t or "ice" in t or "cold" in t:
+                act.append("cold")
+    if keys & {"hot_indoor", "hot_out"}:
+        act.append("heat")
+    if keys & {"cold_indoor", "freezing_out", "power_cut", "power_cut_long", "battery_low"}:
+        act.append("cold")
+    if keys & {"severe_flood", "emergency_alert"}:
+        act.append("leave")
+    return [h for h in HAZARD_KEYS if h in act]
+
+
+def places_view(s):
+    """Where to go for each hazard, what to put on the map, and what Dads Army knows."""
+    cfg = warn_cfg()
+    home = home_location(cfg)
+    own = own_places()
+    out = {"home": home, "own": [], "hazards": [], "help": [], "map": [], "active": [], "error": "",
+           "built": PLACES_CACHE["built"], "count": 0}
+    if not home:
+        out["own"] = own
+        return out
+    rows = load_places(home)
+    out["error"], out["built"] = PLACES_CACHE["error"], PLACES_CACHE["built"]
+    items = warn_public()["items"]
+    active = active_hazards(s, items)
+    out["active"] = active
+    fires = [(w["lat"], w["lon"]) for w in items if w.get("kind") == "fire" and w.get("lat") is not None]
+    floods = [(w["lat"], w["lon"]) for w in items if w.get("kind") == "flood" and (w.get("severity") or 0) >= 2
+              and w.get("lat") is not None]
+    mine = [_place(home, None, o["name"], o["lat"], o["lon"], own=o) for o in own]
+    mine.sort(key=lambda p: p["km"])
+    out["own"] = mine
+
+    def away(lat, lon, threats):
+        """Further from every one of these than home is."""
+        return all(km_between(lat, lon, a, b) >= km_between(home["lat"], home["lon"], a, b) + 1.0
+                   for a, b in threats)
+
+    def nearest(kind, n, threats=()):
+        got = []
+        for d, lat, lon, k, name, ele in rows:
+            if k != kind or d > KIND[kind][5]:
+                continue
+            if threats and not away(lat, lon, threats):
+                continue
+            got.append(_place(home, kind, name, lat, lon, ele=ele))
+            if len(got) >= n:
+                break
+        return got
+
+    for key, what, emoji, kinds, advice in PLACE_HAZARDS:
+        threats = fires if key == "fire" else floods if key in ("flood", "leave") else ()
+        firsts, rest = [], []
+        for kind in kinds:
+            got = nearest(kind, 2, threats)
+            firsts += got[:1]
+            rest += got[1:]
+        picks = [p for p in mine if key in p["hazards"]] + (firsts + sorted(rest, key=lambda p: p["km"]))[:3]
+        out["hazards"].append({"key": key, "what": what, "emoji": emoji, "advice": advice, "active": key in active,
+                               "avoiding": ("the fire" if key == "fire" and fires else
+                                            "the flood" if key in ("flood", "leave") and floods else ""),
+                               "places": picks})
+    out["help"] = nearest("fire", 1) + nearest("police", 1) + nearest("hospital", 1)
+    # The map: home, your own places, what's suggested, and help nearby. No repeats.
+    seen, pts = set(), []
+    for p in mine + [p for h in out["hazards"] for p in h["places"]] + out["help"]:
+        k = (round(p["lat"], 4), round(p["lon"], 4))
+        if k not in seen:
+            seen.add(k)
+            pts.append(p)
+    out["map"] = pts[:30]
+    out["count"] = len(out["map"])
+    return out
+
+
+@route("PUT", "/api/places")
+def api_places(body, query):
+    """Your own places: family, friends, meeting places. Replaces the list."""
+    places = clean_places(body)
+    with tx() as db:
+        set_setting_raw(db, "places", places)
+        add_log("plan", "", "Places to go updated (%d of your own)" % len(places))
+    HA_WAKE.set()
+    return {"places": places}
+
+
+@route("POST", "/api/places/restore")
+def api_places_restore(body, query):
+    """Undo for places: put the list back as it was."""
+    return api_places(body, query)
+
+
+@route("POST", "/api/places/where")
+def api_places_where(body, query):
+    """Check a map link or coordinates as you type them in."""
+    lat, lon = parse_where(clean_text(body.get("where"), 600))
+    home = home_location(warn_cfg())
+    out = {"lat": lat, "lon": lon}
+    if home:
+        out["km"] = round(km_between(home["lat"], home["lon"], lat, lon), 1)
+        out["dir"] = compass(home["lat"], home["lon"], lat, lon)
+    return out
+
+
 def fire_cell(lat, lon):
     return "%.2f,%.2f" % (lat, lon)
 
@@ -3759,6 +4140,7 @@ def fetch_source(key, cfg, home, region, mem, now):
         d = km_between(home["lat"], home["lon"], centre[0], centre[1])
         if d <= cfg["flood_km"]:
             r["distance_km"] = int(round(d))
+            r["lat"], r["lon"] = round(centre[0], 4), round(centre[1], 4)   # so Places can steer away from it
             out.append(r)
     return out
 

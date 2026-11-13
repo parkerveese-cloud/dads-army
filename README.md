@@ -8,6 +8,7 @@ A stores tracker for food, water and emergency kit. It runs on a Raspberry Pi or
 - **Daily use:** say how many tablets, nappies or toilet rolls you get through a day, and Dads Army shows how long each will last and what runs out first.
 - **Supply run:** an automatic shopping list of everything below target, plus your own extras. **Got it** puts the shopping straight into the stores. Set prices to see what it'll cost and what the stores are worth.
 - **Resilience:** ten areas, of which food and water are two. Power and light, communications, warmth, health, safety and more each have a score, and there are about 65 recommendations (a UPS for the router, a battery or wind-up radio, numbers on paper, smoke and CO alarms…). Most come from the UK Government's Be Ready checklist, Ofcom and Fire Kills. Dads Army ticks off what it can see in your stores and plan, and you tick the rest.
+- **Places to go:** if staying at home isn't safe, where to go for each kind of emergency (flooding, storms, a wildfire, an earthquake, civil unrest, heat, cold, having to leave), from a list of about 58,000 UK places that comes with the app: high ground, leisure centres, community halls, libraries, hospitals. Add your own places too, like family and friends. Shown on a map on the Home front dashboard.
 - **Household alert level:** LOW to CRITICAL, using the UK's own threat-level names. It's worked out from warnings, your stores and your home's sensors (temperatures, power, gas, CO and smoke alarms, leaks and more), with plain, labelled advice on what to do. That advice comes from UK Government sources and the SAS Survival Handbook's PLAN priorities. Missing essentials keep it at MODERATE.
 - **Warnings (optional):** Met Office weather warnings, flood warnings near you, UK Emergency Alerts and major disasters near the UK. Optionally, possible fires near you seen by NASA satellites, and UK Health Security Agency and WHO news. Each comes with what to do, and the parts of your emergency plan that matter.
 - **Plan:**
@@ -16,7 +17,7 @@ A stores tracker for food, water and emergency kit. It runs on a Raspberry Pi or
 - **HQ:** household size, calorie and water needs, readiness target (3 days to a year), backups, a printed hard copy, a starter list of about 95 essentials, light/dark mode, and the activity log.
 - **Undo** on anything you use or delete. Several phones can use it at once.
 
-It needs no internet to run, and nothing about you leaves your network. The only time it uses the internet is if you switch on warnings, and then it just downloads the public warning feeds.
+It needs no internet to run, and nothing about you leaves your network. Place data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright) (see [dadsarmy/places](dadsarmy/places/README.md)). The only time it uses the internet is if you switch on warnings, and then it just downloads the public warning feeds.
 
 ---
 
@@ -50,9 +51,10 @@ You can then open it in two ways:
   - warnings in force
   - the household alert level
   - resilience, area by area
+  - places to go, for the map
 
   You can use them on dashboards, in automations and in Companion app widgets.
-- **Home front dashboard.** One tap in **HQ → Home Assistant** adds a ready-made dashboard to the Home Assistant sidebar, made of tiles. It covers the alert level, warnings, today's checklist, resilience, the stores and the supply run. A card for your own dashboards is on the app's **Documentation** tab.
+- **Home front dashboard.** One tap in **HQ → Home Assistant** adds a ready-made dashboard to the Home Assistant sidebar, made of tiles. It covers the alert level, warnings, today's checklist, resilience, the stores, the supply run and a map of places to go. A card for your own dashboards is on the app's **Documentation** tab.
 - **Today's checklist.** Routine checks that are due go on a Home Assistant to-do list. Tick them off there and Dads Army marks them done.
 - **Phone alerts.** Two blueprints in [blueprints/automation](blueprints/automation) send notifications to your phone:
   - new warnings for where you live
@@ -127,6 +129,7 @@ Home Assistant checks for updates on its own. To check straight away, use **Sett
 
 - `dadsarmy/server.py`: one Python file using only the standard library (`http.server` and `sqlite3`), so there's nothing to `pip install`.
 - `dadsarmy/static/`: the phone app, in plain HTML, CSS and JavaScript. There's no build step, and nothing is loaded from the internet.
+- `dadsarmy/places/uk.tsv.gz`: the list of UK places for **Places to go**. It's built from an OpenStreetMap extract by `tools/build_places.py`, which needs [pyosmium](https://osmcode.org/pyosmium/). The app itself only reads the finished file.
 - `dadsarmy/config.yaml` and `Dockerfile`: the Home Assistant app definition.
 - Your data lives in a single SQLite file, `dadsarmy.db`. On Raspberry Pi OS it's in `~/dadsarmy/data`; on Home Assistant it's in the app's own storage.
 

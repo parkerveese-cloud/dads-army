@@ -30,6 +30,8 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_warnings` | Official warnings in force for where you live (see **Warnings** below). 0 while warnings are switched off. | `items` (each has `title`, `level`, `severity` 1–3, `source`, `area`, `when`, `url` and `text`), `highest` (yellow, amber or red), `max_severity`, `enabled`, `checked_at`, `health_news` |
 | `sensor.dads_army_alert_level` | The household alert level: LOW, MODERATE, SUBSTANTIAL, SEVERE or CRITICAL (see below) | `level` (1–5), `meaning`, `reasons`, `guidance` (each with `label`, `source` and `text`), `scale`, `escalated`, `escalated_why`, `notes` |
 | `sensor.dads_army_resilience` | How resilient the household is, in %: the average of ten areas, from water and power to communications and safety (see **Resilience** below) | `areas` (each with `name`, `pct`, `dot`, `done`, `total`, `essentials_missing` and `next`), `next_steps`, `measures` (every recommendation, by area), `done`, `total` |
+| `sensor.dads_army_places` | How many places are on the map (see **Places to go** below) | `located`, `active` (emergencies happening now), `hazards` (each with `what`, `emoji`, `active`, `advice` and `places`), `help` |
+| `geo_location.dads_army_*` | Home and each place to go, for Home Assistant's map card. The state is the distance from home in km. | `latitude`, `longitude`, `source` (`dads_army`, or `dads_army_far` for places over 20 km away), `what`, `direction`, `for` |
 | `binary_sensor.dads_army_attention` | **On** when something needs doing now: stock past its best-before date, a check that's overdue, or a serious warning (amber or worse). Things you haven't bought yet don't count: they're on the supply run. | `reasons` |
 
 Each list holds up to 30 entries; `total` gives the full count. The numbers are recorded in Home Assistant's history, so you can chart how your readiness changes over time.
@@ -57,6 +59,7 @@ A **Home front** dashboard appears in the Home Assistant sidebar and in the Comp
 - **Resilience:** how ready you are in each of the ten areas, two to a row, with the next things to do. **All recommendations** (or the **Resilience** badge) opens a page with every recommendation, area by area, and what's done.
 - **Stores:** expired, expiring soon, out of stock, running low, kit stocked, what the stores are worth, and what to use first
 - **Supply run**, with your supply run list if you've linked one, and a button that opens Dads Army
+- **Places to go:** a map of home and the places near it, and where you could go for each kind of emergency, with what's happening now at the top (see below)
 - a graph of the days you could last, over the last month
 
 If you link a list afterwards, tap **Rebuild it** so the list shows on the dashboard. Rebuilding replaces any changes you've made to the dashboard. To customise it safely, copy cards from it into a dashboard of your own.
@@ -314,6 +317,36 @@ There are about 65 recommendations in all. Each one is marked **essential**, **r
 It shows on the Sitrep, under the alert level, with the next steps. Tap an area to see what's done and what's left. An area missing an essential keeps the household alert level at MODERATE or higher.
 
 Some recommendations only show when they apply. Baby supplies and school numbers show if you have children, pet food if you have pets, and the sensor ones only in Home Assistant.
+
+## Places to go
+
+If staying at home isn't safe, where could you go? Dads Army suggests places near home for each kind of emergency, and shows them on a map:
+
+| | If it's… | Dads Army suggests |
+|:-:|:--|:--|
+| 🌊 | Flooding | High ground, then community halls and leisure centres away from the flood |
+| 🌬️ | Storms and high winds | Sturdy public buildings: community halls, leisure centres, libraries |
+| 🔥 | A wildfire | Community halls, leisure centres and libraries further from the fire than you are |
+| 🫨 | An earthquake | Parks and open spaces, and emergency assembly points |
+| 🚧 | Civil unrest | Your own places: family or friends outside the area |
+| 🌡️ | A heatwave | Cool spaces: libraries, leisure centres and community centres |
+| 🧣 | Cold, or a long power cut | Warm spaces: libraries and community centres |
+| 🎒 | Having to leave home | Where rest centres usually open: leisure centres and community halls |
+| 🏥 | A medical emergency | The nearest hospitals with emergency care |
+
+Each comes with a line of advice. The nearest fire station, police station and hospital are listed too.
+
+**What's happening now comes first.** A flood warning, a wildfire nearby, an amber storm warning, a cold home or a power cut all put that kind of emergency at the top. The suggestions then appear in the alert level's **What to do now**. While there's a flood warning or a fire nearby, Dads Army leaves out places that are nearer to it than you are.
+
+**Your own places come first, too.** On the **Plan** tab, under **Places to go**, add family or friends you could stay with, and your meeting places, and say what each one is for. To say where a place is, paste a link from Google Maps, Apple Maps or OpenStreetMap, or type its coordinates (long-press the place in your maps app to get them).
+
+**Where the suggestions come from.** The app comes with a list of about 58,000 places across the UK, built from OpenStreetMap: community centres and halls, leisure centres, libraries, hospitals with emergency care, fire and police stations, emergency assembly points, named hills and parks. Dads Army picks the ones near home on your own machine, so nothing is looked up online and nobody is told where you live. The list is updated with new versions of the app. Place data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), under the Open Database Licence.
+
+They're possibilities, not official refuges. In an emergency, councils decide where rest centres open and announce it at the time, on local radio and their websites.
+
+**Where home is:** Dads Army uses the location in the warnings settings, or Home Assistant's home location if that's empty.
+
+**On the Home front dashboard**, the map is Home Assistant's own map card. The places on it are `geo_location` entities with the source `dads_army`. Ones more than 20 km away use `dads_army_far`, so the map doesn't zoom right out to fit them in. Home Assistant's map downloads its map images from the internet, unlike the rest of Dads Army. In the app, the Plan tab shows a simple sketch of home and the places around it, which needs no internet.
 
 ## Warnings
 

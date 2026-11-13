@@ -36,8 +36,9 @@ PYTHON="$(command -v python3)"
 say "Installing Dads Army to $DEST"
 mkdir -p "$DEST/data/backups"
 if [ "$SRC" != "$DEST" ]; then
-  rm -rf "$DEST/static"
+  rm -rf "$DEST/static" "$DEST/places"
   cp -R "$APP/static" "$DEST/static"
+  if [ -d "$APP/places" ]; then cp -R "$APP/places" "$DEST/places"; fi
   cp "$APP/server.py" "$DEST/server.py"
   for f in install.sh README.md; do
     if [ -f "$SRC/$f" ]; then cp "$SRC/$f" "$DEST/$f"; fi

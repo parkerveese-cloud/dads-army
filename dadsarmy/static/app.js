@@ -857,7 +857,7 @@
         '<div class="card-foot btn-row"><button class="btn" data-act="check-new">' + ICON.plus + ' Add a check</button>' +
         (missing.length ? '<button class="btn" data-act="checks-seed">Suggestions (' + missing.length + ')</button>' : '') + '</div>';
     }
-    el.innerHTML = warnCard(true) + html + '</section>' + planCard();
+    el.innerHTML = warnCard(true) + html + '</section>' + planCard() + placesCard();
   }
 
   function planEmpty(p) {
@@ -890,6 +890,105 @@
     });
     return html + '<div class="btn-row" style="margin-top:16px"><button class="btn" data-act="plan-edit">' + ICON.edit + ' Edit plan</button>' +
       '<button class="btn" data-act="print-plan">' + ICON.print + ' Print</button></div></section>';
+  }
+
+  // ------------------------------------------------------------------
+  // Places to go: possible refuges near home (worked out on the Pi from a UK list that
+  // ships with the app), plus your own places. Drawn here without any map service.
+  // ------------------------------------------------------------------
+  var OWN_KIND_OPTS = [['family', 'Family or friends', '🏠'], ['meet', 'Meeting place', '🚩'], ['other', 'Somewhere else', '📌']];
+  function PL() { return S.places || { home: null, own: [], hazards: [], help: [], map: [], active: [] }; }
+  function fmtKm(k) { return (k < 1 ? fq(k) : fq(Math.round(k))) + ' km'; }
+  function placesPlot(p) {
+    var home = p.home, pts = p.map.filter(function (x) { return x.km <= 20; });
+    var far = Math.max.apply(null, [0.5].concat(pts.map(function (x) { return x.km; })));
+    var R = [0.5, 1, 2, 3, 5, 7.5, 10, 15, 20].filter(function (r) { return r >= far; })[0] || 20;
+    var k = 128 / R, cos = Math.cos(home.lat * Math.PI / 180);
+    var svg = '<svg class="places-plot" viewBox="-150 -150 300 300" role="img" aria-label="Places near home, up to ' + fmtKm(R) + ' away">' +
+      '<circle r="128" class="pp-ring"/><circle r="64" class="pp-ring"/>' +
+      '<line x1="0" y1="-140" x2="0" y2="140" class="pp-axis"/><line x1="-140" y1="0" x2="140" y2="0" class="pp-axis"/>' +
+      '<text x="0" y="-141" class="pp-n">N</text>' +
+      '<text x="5" y="76" class="pp-km">' + fmtKm(R / 2) + '</text><text x="5" y="140" class="pp-km">' + fmtKm(R) + '</text>';
+    pts.forEach(function (x) {
+      var px = (x.lon - home.lon) * cos * 111.32 * k, py = -(x.lat - home.lat) * 110.57 * k;
+      svg += '<text x="' + px.toFixed(1) + '" y="' + py.toFixed(1) + '" class="pp-pt"><title>' + esc(x.name + ' · ' + x.text) + '</title>' + x.emoji + '</text>';
+    });
+    return svg + '<text x="0" y="0" class="pp-pt pp-home"><title>Home</title>🏠</text></svg>';
+  }
+  function placeRow(x) {
+    return '<div class="li place-row"><span class="li-ico">' + x.emoji + '</span><span class="li-main">' +
+      '<span class="li-title wrap">' + (x.own ? '⭐ ' : '') + esc(x.name) + '</span>' +
+      '<span class="li-sub">' + esc(x.text || '') + (x.notes ? ' · ' + esc(x.notes) : '') + '</span></span>' +
+      (x.map ? '<a class="btn small" href="' + esc(x.map) + '" target="_blank" rel="noopener noreferrer">Map</a>' : '') + '</div>';
+  }
+  function hazardRow(h) {
+    var top = h.places[0];
+    return '<details class="hz' + (h.active ? ' now' : '') + '"' + (h.active ? ' open' : '') + '><summary>' +
+      '<span class="hz-ico">' + h.emoji + '</span><span class="hz-main"><span class="hz-what">' + esc(h.what) +
+      (h.active ? ' <span class="badge warn">Now</span>' : '') + '</span>' +
+      '<span class="hz-top">' + (top ? (top.own ? '⭐ ' : '') + esc(top.name) + ' · ' + esc(top.short) : 'Stay indoors, or go to family or friends') + '</span></span>' +
+      ICON.chev + '</summary><p class="small">' + esc(h.advice) + '</p>' +
+      (h.avoiding ? '<p class="small muted">Leaving out places nearer ' + esc(h.avoiding) + ' than you are.</p>' : '') +
+      (h.places.length ? '<div class="list">' + h.places.map(placeRow).join('') + '</div>' : '') + '</details>';
+  }
+  function placesCard() {
+    var p = PL();
+    var html = '<section class="card places-card"><div class="card-head"><h2>Places to go</h2>' +
+      (p.home ? '<span class="small muted">if you have to leave home</span>' : '') + '</div>';
+    if (!p.home) {
+      return html + '<p class="small muted">Dads Army can suggest places near home to go in an emergency, such as high ground, leisure centres and community halls, ' +
+        'and keep your own places like family and friends. First it needs to know where home is.' +
+        (S.server.ha ? ' It uses Home Assistant\'s home location, or one you set in the warnings settings.' : '') + '</p>' +
+        '<button class="btn block" data-act="warn-set">Set where home is</button>' + ownPlacesList(p) + '</section>';
+    }
+    return html + placesPlot(p) +
+      '<p class="small muted center">Straight-line distances. Tap <b>Map</b> on a place for directions.</p>' +
+      '<h3>If it\'s…</h3><div class="hz-list">' + p.hazards.map(hazardRow).join('') + '</div>' +
+      (p.help.length ? '<h3>Help nearby</h3><div class="list">' + p.help.map(placeRow).join('') + '</div>' : '') +
+      ownPlacesList(p) +
+      '<p class="small muted" style="margin-top:12px">Suggestions come from a list of UK places that comes with Dads Army' + (p.built ? ' (' + esc(fmtDate(p.built)) + ')' : '') +
+      ', so nothing is looked up online. They\'re possibilities, not official refuges: councils say where rest centres open at the time. ' +
+      'Place data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap contributors</a>.' +
+      (p.error ? ' <span class="err">' + esc(p.error) + '</span>' : '') + '</p></section>';
+  }
+  function ownPlacesList(p) {
+    return '<h3>Your own places</h3>' + (p.own.length ? '<div class="list">' + p.own.map(function (x) {
+      var k = OWN_KIND_OPTS.filter(function (o) { return o[0] === x.kind; })[0] || OWN_KIND_OPTS[2];
+      var hz = (x.hazards || []).map(function (key) { var h = S.place_hazards.filter(function (y) { return y[0] === key; })[0]; return h ? h[2] : ''; }).join(' ');
+      return '<button class="li" data-act="place-edit" data-id="' + x.id + '"><span class="li-ico">' + k[2] + '</span><span class="li-main">' +
+        '<span class="li-title wrap">' + esc(x.name) + '</span><span class="li-sub">' + esc(x.text || k[1]) + (hz ? ' · for ' + hz : '') + '</span></span>' + ICON.chev + '</button>';
+    }).join('') + '</div>' : '<p class="small muted">Family and friends you could stay with, and your meeting places. They\'re shown first, and on the Home Assistant map.</p>') +
+      '<button class="btn block" style="margin-top:10px" data-act="place-new">' + ICON.plus + ' Add a place</button>';
+  }
+  function ownList() {
+    return PL().own.map(function (o) { return { name: o.name, lat: o.lat, lon: o.lon, kind: o.kind, hazards: o.hazards || [], notes: o.notes || '' }; });
+  }
+  function sheetPlace(s) {
+    var own = PL().own, x = s.id ? own.filter(function (o) { return o.id === s.id; })[0] : null;
+    if (s.id && !x) return null;
+    var v = x || { name: '', kind: 'family', hazards: ['leave', 'unrest'], notes: '' };
+    return sheetHead(x ? 'Edit place' : 'Add a place', 'Somewhere you could go in an emergency', '📌') +
+      '<form id="placeForm" data-id="' + (x ? x.id : '') + '" novalidate>' +
+      '<label class="field"><span>Name</span><input type="text" name="name" value="' + esc(v.name) + '" maxlength="80" placeholder="e.g. Gran\'s house" autocomplete="off"' + (x ? '' : ' data-autofocus') + '></label>' +
+      '<label class="field"><span>Where is it?</span><input type="text" name="where" value="' + (x ? esc(x.lat + ', ' + x.lon) : '') + '" maxlength="600" placeholder="Paste a map link, or 54.48, -0.62" autocomplete="off" inputmode="url">' +
+      '<div class="hint" id="whereHint">' + (x && x.text ? esc(x.text) + ' from home' : 'In Google Maps or Apple Maps, long-press the place, then copy the coordinates or share the link, and paste it here.') + '</div></label>' +
+      '<fieldset class="field"><legend>What is it?</legend><div class="opts">' + OWN_KIND_OPTS.map(function (o) {
+        return '<label class="opt"><input type="radio" name="kind" value="' + o[0] + '"' + (v.kind === o[0] ? ' checked' : '') + '><span>' + o[2] + ' ' + esc(o[1]) + '</span></label>';
+      }).join('') + '</div></fieldset>' +
+      '<fieldset class="field"><legend>Somewhere to go for…</legend><div class="opts">' + S.place_hazards.map(function (h) {
+        return '<label class="opt"><input type="checkbox" name="hz" value="' + h[0] + '"' + ((v.hazards || []).indexOf(h[0]) >= 0 ? ' checked' : '') + '><span>' + h[2] + ' ' + esc(h[1]) + '</span></label>';
+      }).join('') + '</div></fieldset>' +
+      '<label class="field"><span>Notes</span><input type="text" name="notes" value="' + esc(v.notes || '') + '" maxlength="300" placeholder="Optional, e.g. key under the pot"></label>' +
+      '<div class="sheet-actions"><button class="btn primary block" type="submit">' + (x ? 'Save' : 'Add the place') + '</button>' +
+      (x ? '<button class="btn danger block" type="button" data-act="place-del" data-id="' + x.id + '">' + ICON.trash + ' Delete</button>' : '') + '</div></form>';
+  }
+  function checkWhere(input) {
+    var hint = $('#whereHint');
+    if (!hint || !input.value.trim()) return;
+    api('POST', 'api/places/where', { where: input.value }).then(function (r) {
+      hint.className = 'hint';
+      hint.textContent = r.km != null ? 'Found it: ' + fmtKm(r.km) + ' ' + r.dir + ' of home.' : 'Found it: ' + r.lat + ', ' + r.lon + '.';
+    }, function (e) { hint.className = 'hint err'; hint.textContent = e.message; });
   }
 
   // ------------------------------------------------------------------
@@ -1298,6 +1397,10 @@
         ', so you\'d be less able to cope.</p>' : '') +
       (sit.notes.length ? '<p class="small muted">Also worth knowing: ' + esc(sit.notes.join(' · ')) + '</p>' : '') +
       '<h3>What to do now</h3>' + guidanceList(sit.guidance) +
+      PL().hazards.filter(function (h) { return h.active; }).map(function (h, i) {
+        return (i ? '' : '<h3>Where to go</h3>') + '<p class="small"><b>' + h.emoji + ' ' + esc(h.what) + ':</b> ' + esc(h.advice) + '</p>' +
+          (h.places.length ? '<div class="list">' + h.places.slice(0, 3).map(placeRow).join('') + '</div>' : '');
+      }).join('') +
       '<p class="small muted">UK Government advice is put into plain words, not quoted. SAS statements apply the SAS Survival Handbook\'s PLAN priorities to a home. ' +
       '<button type="button" class="link" data-act="level-help">More about the levels and sources</button></p>' +
       (h ? '<h3>Home sensors</h3>' + (readings || '<p class="small muted">No home sensors chosen yet. Temperatures, power, alarms and more can raise or lower the level.</p>') +
@@ -1382,9 +1485,10 @@
   function dashNote() {
     var ha = S.server.ha;
     if (!ha || !ha.dash_outdated) return '';
-    try { if (localStorage.getItem('da-dash-note') === 'layout4') return ''; } catch (e) { /* show it */ }
-    return '<div class="card tip-card"><p><b>New for the Home front dashboard:</b> resilience across ten areas, from water and power to communications and safety, ' +
-      'with every recommendation on its own page. Update the dashboard to get it.</p>' +
+    try { if (localStorage.getItem('da-dash-note') === 'layout5') return ''; } catch (e) { /* show it */ }
+    return '<div class="card tip-card"><p><b>New for the Home front dashboard:</b> a map of places to go near home, such as high ground, ' +
+      'leisure centres and your own places, and where to go for each kind of emergency. Resilience across ten areas too, if you haven\'t updated since. ' +
+      'Update the dashboard to get them.</p>' +
       '<div class="btn-row"><button class="btn small" data-act="ha-dash" data-again="1">Update the dashboard</button>' +
       '<button class="btn small" data-act="dash-note-hide">Not now</button></div></div>';
   }
@@ -1416,6 +1520,7 @@
       (ha ? row('📊', 'Put Dads Army on your Home Assistant dashboard', 'Tiles for warnings, today\'s checklist, resilience and the stores', 'dash-wizard') : '') +
       row('🛡️', 'What the household alert level means', 'LOW to CRITICAL, and how it\'s worked out', 'level-help') +
       row('🔋', 'Resilience: what to do next', 'Ten areas, from water and power to communications and safety', 'res-all') +
+      row('🗺️', 'Places to go', 'High ground, rest centres, warm spaces, and your own places, near home', 'help-go', ' data-view="plan"') +
       (ha ? row('🌡️', 'Choose home sensors', 'Temperatures, power, alarms and more can change the alert level', 'home-sensors') : '') +
       row('📢', 'Warnings for where you live', 'Met Office, floods, Emergency Alerts, fires', 'warn-set') +
       row('📋', 'Routine checks and your emergency plan', 'On the Plan tab', 'help-go', ' data-view="plan"') +
@@ -1791,7 +1896,8 @@
     var html = {
       item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText, halists: sheetHaLists,
       check: sheetCheck, plan: sheetPlan, warning: sheetWarning, warnset: sheetWarnSet, help: sheetHelp, dashwiz: sheetDashWiz,
-      level: sheetLevel, levelhelp: sheetLevelHelp, homesensors: sheetHomeSensors, area: sheetArea, resall: sheetResAll
+      level: sheetLevel, levelhelp: sheetLevelHelp, homesensors: sheetHomeSensors, area: sheetArea, resall: sheetResAll,
+      place: sheetPlace
     }[s.type](s);
     if (html === null) {   // the item was deleted elsewhere
       closeSheet();
@@ -2197,6 +2303,22 @@
         return checkWarnings(a);
       case 'help':
         return openSheet({ type: 'help' });
+      case 'place-new':
+        return openSheet({ type: 'place', id: null });
+      case 'place-edit':
+        return openSheet({ type: 'place', id: id });
+      case 'place-del': {
+        var prevPlaces = ownList(), gone = PL().own.filter(function (o) { return o.id === id; })[0];
+        var keepPlaces = prevPlaces.filter(function (o, i) { return PL().own[i].id !== id; });
+        return run(function () {
+          return api('PUT', 'api/places', { places: keepPlaces }).then(function () {
+            closeSheet();
+            return refresh().then(function () {
+              toast('Deleted ' + (gone ? gone.name : 'the place'), { undo: { places: prevPlaces }, undoPath: 'api/places/restore' });
+            });
+          });
+        }, a);
+      }
       case 'res-all':
         return openSheet({ type: 'resall' });
       case 'res-area':
@@ -2245,7 +2367,7 @@
         return toast('Suggestions ticked. Check them, then Save.');
       }
       case 'dash-note-hide':
-        try { localStorage.setItem('da-dash-note', 'layout4'); } catch (e) { /* fine */ }
+        try { localStorage.setItem('da-dash-note', 'layout5'); } catch (e) { /* fine */ }
         return render();
       case 'help-go': {
         var dest = a.dataset.view;
@@ -2503,6 +2625,22 @@
         });
       }, btn);
     }
+    if (f.id === 'placeForm') {
+      if (!d.name) { toast('Give the place a name', { error: true }); f.elements.name.focus(); return; }
+      if (!d.where) { toast('Where is it? Paste a map link or the coordinates', { error: true }); f.elements.where.focus(); return; }
+      var pid = f.dataset.id ? +f.dataset.id : null;
+      var entry = { name: d.name, where: d.where, kind: d.kind || 'other', notes: d.notes || '',
+        hazards: $$('input[name="hz"]:checked', f).map(function (i) { return i.value; }) };
+      var list = ownList();
+      if (pid) list = list.map(function (o, i) { return PL().own[i].id === pid ? entry : o; });
+      else list.push(entry);
+      return run(function () {
+        return api('PUT', 'api/places', { places: list }).then(function () {
+          closeSheet();
+          return refresh().then(function () { toast(pid ? 'Saved' : d.name + ' added to your places'); });
+        });
+      }, btn);
+    }
     if (f.id === 'homeSensorsForm') {
       var hsTop = stack[stack.length - 1];
       var picks = homeSensorsForm(f, hsTop.data.roles);
@@ -2594,6 +2732,11 @@
   document.addEventListener('submit', function (e) {
     e.preventDefault();
     submitForm(e.target);
+  });
+  // A place's map link or coordinates: check them as soon as they're pasted in.
+  document.addEventListener('change', function (e) {
+    var t = e.target;
+    if (t.name === 'where' && t.form && t.form.id === 'placeForm') checkWhere(t);
   });
 
   document.addEventListener('input', function (e) {

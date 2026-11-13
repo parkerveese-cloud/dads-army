@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.10.0
+
+- **Places to go.** If staying at home isn't safe, where could you go? Dads Army suggests places near home for each kind of emergency: flooding, storms, a wildfire, an earthquake, civil unrest, a heatwave, cold or a long power cut, having to leave home, and a medical emergency. Each comes with a line of advice.
+  - The suggestions are high ground, community halls, leisure centres, libraries, parks and assembly points, plus the nearest fire station, police station and hospital.
+  - What's happening now comes first. During a flood warning or a fire nearby, it leaves out places nearer to it than you are.
+  - **Your own places:** add family, friends and meeting places on the Plan tab, by pasting a map link or typing coordinates. Say what each one is for, and it comes first.
+- **A map on the Home front dashboard**, in Home Assistant's own map card, with home and the places around it. Underneath, where you could go for each kind of emergency. Dads Army offers to update the dashboard.
+- **In the app**, the Plan tab has a sketch of home and the places nearby, and the alert level's **What to do now** includes where to go.
+- **Nothing is looked up online.** The app comes with a list of about 58,000 places across the UK, built from OpenStreetMap, and picks the ones near home itself. They're possibilities, not official refuges: councils announce rest centres at the time. Place data © OpenStreetMap contributors (ODbL).
+- Flood warnings now remember where the flood area is.
+
 ## 1.9.0
 
 - **Resilience, in ten areas.** Being ready isn't just food and water. Dads Army now looks at:
