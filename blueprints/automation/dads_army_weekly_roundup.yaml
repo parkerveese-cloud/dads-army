@@ -4,7 +4,8 @@ blueprint:
     Once a week, a note on your phone from Dads Army: the household alert level,
     any warnings in force,
     what to use first (things expiring soon), anything out of date, routine
-    checks that are due, the supply run, and how long you could hold out.
+    checks that are due, the supply run, how long you could hold out, and how
+    resilient the household is, with the next things to do.
 
 
     Needs Dads Army 1.2.0 or later, and the Home Assistant Companion app on
@@ -137,6 +138,12 @@ actions:
         {%- endif -%}
         {%- set ns.out = ns.out + ['You could hold out for ' ~ states('sensor.dads_army_hold_out') ~ ' days (target '
               ~ state_attr('sensor.dads_army_hold_out', 'target_days') ~ ').'] -%}
+        {%- set res = states('sensor.dads_army_resilience') -%}
+        {%- if res not in ['unknown', 'unavailable'] -%}
+          {%- set nxt = (state_attr('sensor.dads_army_resilience', 'next_steps') or [])[:2] | map(attribute='title') | list -%}
+          {%- set ns.out = ns.out + ['Resilience: ' ~ res ~ '% ready'
+                ~ ('. Next: ' ~ (nxt | join(', ')) ~ '.' if nxt else '.')] -%}
+        {%- endif -%}
         {{ ns.out | join('\n') }}
       {%- endif -%}
     data:

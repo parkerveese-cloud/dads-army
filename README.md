@@ -7,7 +7,8 @@ A stores tracker for food, water and emergency kit. It runs on a Raspberry Pi or
 - **Batches and rotation:** the same item can have several batches with different best-before dates and locations. Using stock always takes the oldest first.
 - **Daily use:** say how many tablets, nappies or toilet rolls you get through a day, and Dads Army shows how long each will last and what runs out first.
 - **Supply run:** an automatic shopping list of everything below target, plus your own extras. **Got it** puts the shopping straight into the stores. Set prices to see what it'll cost and what the stores are worth.
-- **Household alert level:** LOW to CRITICAL, using the UK's own threat-level names. It's worked out from warnings, your stores and your home's sensors (temperatures, power, gas, CO and smoke alarms, leaks and more), with plain, labelled advice on what to do. That advice comes from UK Government sources and the SAS Survival Handbook's PLAN priorities.
+- **Resilience:** ten areas, of which food and water are two. Power and light, communications, warmth, health, safety and more each have a score, and there are about 65 recommendations (a UPS for the router, a battery or wind-up radio, numbers on paper, smoke and CO alarms…). Most come from the UK Government's Be Ready checklist, Ofcom and Fire Kills. Dads Army ticks off what it can see in your stores and plan, and you tick the rest.
+- **Household alert level:** LOW to CRITICAL, using the UK's own threat-level names. It's worked out from warnings, your stores and your home's sensors (temperatures, power, gas, CO and smoke alarms, leaks and more), with plain, labelled advice on what to do. That advice comes from UK Government sources and the SAS Survival Handbook's PLAN priorities. Missing essentials keep it at MODERATE.
 - **Warnings (optional):** Met Office weather warnings, flood warnings near you, UK Emergency Alerts and major disasters near the UK. Optionally, possible fires near you seen by NASA satellites, and UK Health Security Agency and WHO news. Each comes with what to do, and the parts of your emergency plan that matter.
 - **Plan:**
   - **Routine checks:** test the smoke alarms, charge the power banks, rotate the water. Dads Army tells you when each is due.
@@ -48,9 +49,10 @@ You can then open it in two ways:
   - what the stores are worth
   - warnings in force
   - the household alert level
+  - resilience, area by area
 
   You can use them on dashboards, in automations and in Companion app widgets.
-- **Home front dashboard.** One tap in **HQ → Home Assistant** adds a ready-made dashboard to the Home Assistant sidebar, made of tiles. It covers warnings, today's checklist, readiness, the stores and the supply run. A card for your own dashboards is on the app's **Documentation** tab.
+- **Home front dashboard.** One tap in **HQ → Home Assistant** adds a ready-made dashboard to the Home Assistant sidebar, made of tiles. It covers the alert level, warnings, today's checklist, resilience, the stores and the supply run. A card for your own dashboards is on the app's **Documentation** tab.
 - **Today's checklist.** Routine checks that are due go on a Home Assistant to-do list. Tick them off there and Dads Army marks them done.
 - **Phone alerts.** Two blueprints in [blueprints/automation](blueprints/automation) send notifications to your phone:
   - new warnings for where you live

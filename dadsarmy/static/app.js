@@ -355,7 +355,7 @@
       else if (view === 'hq') renderHQ(el);
       else renderSitrep(el);
     }
-    if (stack.length && stack[stack.length - 1].type === 'item') renderSheet();
+    if (stack.length && /^(item|area|resall)$/.test(stack[stack.length - 1].type)) renderSheet();
   }
 
   function updateBadge() {
@@ -407,9 +407,9 @@
   }
 
   function renderSitrep(el) {
-    if (!S.items.length) { el.innerHTML = levelCard() + warnCard(false) + emptyCard(); return; }
+    if (!S.items.length) { el.innerHTML = levelCard() + warnCard(false) + emptyCard() + resilienceCard(); return; }
     var st = S.settings, r = readiness(), target = st.target_days;
-    var html = levelCard() + dashNote() + warnCard(false);
+    var html = levelCard() + dashNote() + warnCard(false) + resilienceCard();
 
     // Hero: how long could we hold out?
     if (r.people === 0) {
@@ -437,7 +437,6 @@
         meter('🥫 Food', fmtDays(r.foodDays) + ' of ' + target + ' days', r.foodDays / target, foodNote) +
         meter('💧 Water', fmtDays(r.waterDays) + ' of ' + target + ' days', r.waterDays / target, waterNote) +
         (sup ? meter('⏳ Daily supplies', fmtDays(sup.days) + ' of ' + target + ' days', sup.days / target, supNote) : '') +
-        (r.kit ? meter('🧰 Kit', Math.round(r.kitPct * 100) + '% stocked', r.kitPct, 'Medical, power, hygiene, tools and the rest against their targets') : '') +
         '</div></section>';
     }
 
@@ -516,7 +515,7 @@
 
   var LOG_VERB = { added: 'Added', stocked: 'Stocked', used: 'Used', adjusted: 'Adjusted', edited: 'Edited', removed: 'Deleted',
     undo: 'Undone', starter: 'Starter list', restored: 'Restored', settings: 'Settings', supply: 'Supply run', checked: 'Checked',
-    plan: 'Emergency plan' };
+    plan: 'Emergency plan', resilience: 'Resilience' };
   function logHtml(entries) {
     return entries.map(function (l) {
       return '<div class="log-item"><span class="log-dot ' + esc(l.action) + '"></span><div class="log-text"><b>' +
@@ -1127,7 +1126,7 @@
     2: ['A yellow weather warning', 'A flood alert', 'A disaster near the UK', 'A possible fire nearby',
       'The coldest room under 16°C, or the warmest 27°C or more', '−5°C or colder, or 30°C or hotter, outside',
       'Humidity of 80% or more indoors', 'The internet down', 'PM2.5 of 35 µg/m³ or more',
-      'Food or water that wouldn\'t last 3 days', 'Kit under half stocked'],
+      'Food or water that wouldn\'t last 3 days', 'An area of resilience missing its essentials'],
     1: ['None of the above']
   };
 
@@ -1149,10 +1148,117 @@
       '<span class="level-meaning">' + esc(sit.meaning) + '</span></button>' +
       levelScale(sit) +
       '<p class="level-why">' + (why.length ? '<b>Why:</b> ' + esc(why.join(' · ')) + (more > 0 ? ' and ' + more + ' more' : '') +
-        (sit.escalated ? '. Raised to SEVERE because the stores wouldn\'t last 3 days.' : '')
+        (sit.escalated ? '. Raised to SEVERE because ' + esc(sit.escalated_why || 'the stores wouldn\'t last 3 days') + '.' : '')
         : 'Nothing is raising the level.') + '</p>' +
       '<button class="btn block" data-act="level-open">What to do now</button></section>';
   }
+  // ------------------------------------------------------------------
+  // Resilience: ten areas, of which food and water are two (worked out on the Pi)
+  // ------------------------------------------------------------------
+  function RS() { return S.resilience || { pct: 0, done: 0, total: 0, areas: [], next: [], items: [] }; }
+  function resById(id) { return RS().items.filter(function (m) { return m.id === id; })[0] || null; }
+  function areaById(id) { return RS().areas.filter(function (a) { return a.id === id; })[0] || null; }
+  var RES_MARK = { done: '✓', partly: '◐', todo: '○', na: '–' };
+
+  function resilienceCard() {
+    var r = RS();
+    if (!r.areas.length) return '';
+    var next = r.next.slice(0, 3).map(resById).filter(Boolean);
+    return '<section class="card res-card">' +
+      '<div class="level-top"><span class="eyebrow">Resilience</span>' +
+      '<button class="info-btn" data-act="res-all" aria-label="About resilience, and every recommendation">i</button></div>' +
+      '<div class="res-top"><span class="res-pct">' + r.pct + '<small>%</small></span>' +
+      '<span class="res-sub">ready across ' + r.areas.length + ' areas<br>' + r.done + ' of ' + r.total + ' recommendations done</span></div>' +
+      '<div class="res-grid">' + r.areas.map(areaButton).join('') + '</div>' +
+      (next.length ? '<h3 class="res-h">Next steps</h3><div class="list res-next">' + next.map(nextRow).join('') + '</div>'
+        : '<p class="small muted">Everything is done, or not for you. Well done.</p>') +
+      '<button class="btn block" data-act="res-all">All recommendations</button></section>';
+  }
+  function areaButton(a) {
+    var miss = a.essentials_missing.length;
+    return '<button class="res-area ' + a.state + '" data-act="res-area" data-area="' + a.id + '">' +
+      '<span class="ra-top"><span class="ra-ico">' + a.emoji + '</span><span class="ra-name">' + esc(a.name) + '</span>' +
+      '<span class="ra-pct">' + a.pct + '%</span></span>' +
+      '<span class="ra-bar"><i style="width:' + a.pct + '%"></i></span>' +
+      '<span class="ra-sub">' + (miss ? miss + ' essential' + (miss === 1 ? '' : 's') + ' to do' : a.done + ' of ' + a.total + ' done') + '</span></button>';
+  }
+  function nextRow(m) {
+    var a = areaById(m.area);
+    return '<button class="li" data-act="res-area" data-area="' + m.area + '"><span class="li-ico">' + (a ? a.emoji : '') + '</span>' +
+      '<span class="li-main"><span class="li-title wrap">' + esc(m.title) + '</span>' +
+      '<span class="li-sub"><span class="badge ' + (m.priority === 3 ? 'bad' : m.priority === 2 ? 'warn' : 'plain') + '">' + esc(m.priority_word) + '</span>' +
+      (m.detail ? '<span>' + esc(m.detail) + '</span>' : '') + '</span></span>' + ICON.chev + '</button>';
+  }
+  // One recommendation, with whatever would move it on.
+  function resItem(m) {
+    var act = m.act || {}, btns = [];
+    if (act.kind === 'add') btns.push('<button class="btn small primary" data-act="res-add" data-rid="' + m.id + '">' + ICON.plus + ' Add to stores</button>');
+    else if (act.kind === 'addcheck') btns.push('<button class="btn small primary" data-act="res-add" data-rid="' + m.id + '">' + ICON.plus + ' Add the check</button>');
+    else if (act.kind === 'open') btns.push('<button class="btn small" data-act="open" data-id="' + act.item + '">Open in stores</button>');
+    else if (act.kind === 'cat') btns.push('<button class="btn small" data-act="res-go" data-cat="' + act.cat + '">See the ' + esc(cat(act.cat).label.toLowerCase()) + ' stores</button>');
+    else if (act.kind === 'expired') btns.push('<button class="btn small" data-act="res-go" data-show="expired">See what\'s out of date</button>');
+    else if (act.kind === 'plan') btns.push('<button class="btn small" data-act="plan-edit">Fill in the plan</button>');
+    else if (act.kind === 'check') btns.push('<button class="btn small" data-act="check-done" data-id="' + act.check + '">' + ICON.check + ' Done today</button>');
+    else if (act.kind === 'sensors') btns.push('<button class="btn small" data-act="home-sensors">Choose home sensors</button>');
+    else if (act.kind === 'warnings') btns.push('<button class="btn small" data-act="warn-set">Switch on warnings</button>');
+    if (m.status === 'todo' || m.status === 'partly') {
+      btns.push('<button class="btn small' + (m.manual ? ' primary' : '') + '" data-act="res-answer" data-rid="' + m.id + '" data-status="yes">' +
+        ICON.check + (m.manual ? ' Done' : ' We have this') + '</button>');
+      btns.push('<button class="btn small quiet" data-act="res-answer" data-rid="' + m.id + '" data-status="na">Not for us</button>');
+    } else if (m.answer) {
+      btns.push('<span class="small muted">' + (m.answer === 'na' ? 'You said it\'s not for you.' : 'You ticked this off.') + '</span>' +
+        '<button class="link" data-act="res-answer" data-rid="' + m.id + '" data-status="">Undo</button>');
+    }
+    return '<div class="res-item ' + m.status + '"><span class="ri-mark" aria-hidden="true">' + RES_MARK[m.status] + '</span><div class="ri-main">' +
+      '<div class="ri-title">' + esc(m.title) + (m.priority === 3 && m.status !== 'done' && m.status !== 'na' ? ' <span class="badge bad">Essential</span>' : '') + '</div>' +
+      (m.why && m.status !== 'done' && m.status !== 'na' ? '<p class="ri-why">' + esc(m.why) + '</p>' : '') +
+      '<div class="ri-meta"><span class="src src-' + (SRC_CLASS[m.source] || 'tip') + '">' + esc(m.label) + '</span>' +
+      (m.detail && !m.answer ? '<span>' + esc(m.detail) + '</span>' : '') + '</div>' +
+      (btns.length ? '<div class="ri-acts">' + btns.join('') + '</div>' : '') + '</div></div>';
+  }
+  function sheetArea(s) {
+    var a = areaById(s.area);
+    if (!a) return null;
+    var ms = RS().items.filter(function (m) { return m.area === a.id; });
+    var rank = { todo: 0, partly: 0, done: 1, na: 2 };
+    ms.sort(function (x, y) { return rank[x.status] - rank[y.status] || y.priority - x.priority; });
+    var todo = ms.filter(function (m) { return rank[m.status] === 0; }),
+      done = ms.filter(function (m) { return m.status === 'done'; }), na = ms.filter(function (m) { return m.status === 'na'; });
+    return sheetHead(a.name, a.pct + '% ready · ' + a.done + ' of ' + a.total + ' done', a.emoji) +
+      '<div class="ra-bar big ' + a.state + '"><i style="width:' + a.pct + '%"></i></div>' +
+      (todo.length ? '<h3>To do</h3>' + todo.map(resItem).join('') : '<p class="small">All done here.</p>') +
+      (done.length ? '<h3>Done</h3>' + done.map(resItem).join('') : '') +
+      (na.length ? '<details class="res-na"><summary>Not for you (' + na.length + ')</summary>' + na.map(resItem).join('') + '</details>' : '') +
+      '<p class="small muted" style="margin-top:14px">Dads Army ticks off what it can see in your stores, plan, checks and home sensors. ' +
+      '<button type="button" class="link" data-act="res-all">How it works</button></p>';
+  }
+  function sheetResAll() {
+    var r = RS();
+    return sheetHead('Resilience', r.pct + '% ready across ' + r.areas.length + ' areas', '🛡️') +
+      '<p>Being ready isn\'t just food and water. Dads Army looks at ten areas, each with things to have, know or do. ' +
+      'Most come from the UK Government\'s <b>Be Ready</b> checklist, Ofcom and the Fire Kills campaign.</p>' +
+      '<div class="list">' + r.areas.map(function (a) {
+        return '<button class="li" data-act="res-area" data-area="' + a.id + '"><span class="li-ico">' + a.emoji + '</span>' +
+          '<span class="li-main"><span class="li-title">' + esc(a.name) + '</span>' +
+          '<span class="li-sub">' + a.done + ' of ' + a.total + ' done' + (a.essentials_missing.length ? ' · ' + a.essentials_missing.length + ' essential' +
+            (a.essentials_missing.length === 1 ? '' : 's') + ' to do' : '') + '</span>' +
+          '<span class="ra-bar ' + a.state + '"><i style="width:' + a.pct + '%"></i></span></span>' +
+          '<span class="cat-pct">' + a.pct + '%</span>' + ICON.chev + '</button>';
+      }).join('') + '</div>' +
+      '<h3>How it works</h3>' +
+      '<p class="small">Dads Army ticks off what it can see for itself: your stores, the emergency plan, routine checks, warnings and home sensors. ' +
+      'Tick the rest off yourself, or say they\'re not for you, like a gas tap if you have no gas.</p>' +
+      '<p class="small">Each area\'s score is how much of it is done. Essentials count three times as much as extras, and recommended things twice as much. ' +
+      'Something partly done counts in part, and anything not for you is left out. The overall figure is the average of the ten areas.</p>' +
+      '<p class="small">An area missing an essential keeps the household alert level at MODERATE or higher. In a power cut with no torches or power bank, ' +
+      'or a cold home with no blankets or warm clothes, SUBSTANTIAL goes up to SEVERE, because you\'d be less able to cope.</p>' +
+      '<h3>Where the recommendations come from</h3><ul class="guidance">' +
+      '<li><span class="src src-gov">UK Government</span>The Be Ready checklist (gov.uk), Ofcom on staying connected in a power cut, the Fire Kills campaign, and Emergency Alerts. Put into plain statements, not quoted word for word.</li>' +
+      '<li><span class="src src-fire">Fire &amp; rescue services</span>Free home fire safety visits.</li>' +
+      '<li><span class="src src-sas">SAS Survival Handbook</span>PLAN: Protection, applied to a home: keeping one room warm.</li>' +
+      '<li><span class="src src-tip">Dads Army tip</span>Practical extras, like a camping stove, water containers or walkie-talkies.</li></ul>';
+  }
+
   function guidanceList(items) {
     return '<ul class="guidance">' + items.map(function (g) {
       return '<li><span class="src src-' + (SRC_CLASS[g.source] || 'tip') + '">' + esc(g.label) + '</span>' + esc(g.text) + '</li>';
@@ -1188,7 +1294,8 @@
       '<h3>Why</h3>' + (sit.reasons.length ? '<ul class="why">' + sit.reasons.map(function (r) {
         return '<li><span class="ls-chip lv' + r.level + '">' + esc(r.name) + '</span>' + esc(r.title) + '</li>';
       }).join('') + '</ul>' : '<p class="small muted">Nothing is raising the level.</p>') +
-      (sit.escalated ? '<p class="small">Raised to SEVERE because the stores wouldn\'t last 3 days, so you\'d be less able to cope.</p>' : '') +
+      (sit.escalated ? '<p class="small">Raised to SEVERE because ' + esc(sit.escalated_why || 'the stores wouldn\'t last 3 days') +
+        ', so you\'d be less able to cope.</p>' : '') +
       (sit.notes.length ? '<p class="small muted">Also worth knowing: ' + esc(sit.notes.join(' · ')) + '</p>' : '') +
       '<h3>What to do now</h3>' + guidanceList(sit.guidance) +
       '<p class="small muted">UK Government advice is put into plain words, not quoted. SAS statements apply the SAS Survival Handbook\'s PLAN priorities to a home. ' +
@@ -1207,14 +1314,15 @@
         return '<div class="level-def"><span class="ls-chip lv' + x.level + '">' + esc(x.name) + '</span><p>' + esc(x.meaning) + '</p>' +
           '<p class="small muted"><b>Raised to ' + esc(x.name) + ' by:</b> ' + esc(LEVEL_RULES[x.level].join('; ')) + '.</p></div>';
       }).join('') + '</div>' +
-      '<p class="small">The level is the most serious of these. If it\'s SUBSTANTIAL and your food or water wouldn\'t last 3 days, ' +
-      'it goes up to SEVERE, because you\'d be less able to cope. Only real danger makes it CRITICAL. UKHSA advises heating the rooms you use to at least 18°C, so below that you get cold-weather advice even at LOW.</p>' +
+      '<p class="small">The level is the most serious of these. If it\'s SUBSTANTIAL and you\'d be less able to cope, it goes up to SEVERE: ' +
+      'when your food or water wouldn\'t last 3 days, when there\'s a power cut and you have no torches or power bank, ' +
+      'or when the home is cold and you have no blankets or warm clothes. Only real danger makes it CRITICAL. UKHSA advises heating the rooms you use to at least 18°C, so below that you get cold-weather advice even at LOW.</p>' +
       '<h3>The UK\'s own levels</h3>' +
       '<p class="small">The names are the UK\'s five national threat levels, the nearest British equivalent to America\'s DEFCON. They\'re set by MI5\'s Joint Terrorism Analysis Centre: ' +
       esc(scale.slice().reverse().map(function (x) { return x.name + ' (' + x.mi5 + ')'; }).join('; ')) + '. ' +
       'This is the household\'s own level, not the national one. <a href="https://www.mi5.gov.uk/threat-levels" target="_blank" rel="noopener noreferrer">See the national threat level</a>.</p>' +
       '<h3>Where the advice comes from</h3><ul class="guidance">' +
-      '<li><span class="src src-gov">UK Government</span>Prepare (gov.uk), the NHS, UKHSA, the Met Office, the Environment Agency, DEFRA, Ofgem, the Foreign Office and the Fire Kills campaign. Put into plain statements, not quoted word for word.</li>' +
+      '<li><span class="src src-gov">UK Government</span>Be Ready (gov.uk), Ofcom, the NHS, UKHSA, the Met Office, the Environment Agency, DEFRA, Ofgem, the Foreign Office and the Fire Kills campaign. Put into plain statements, not quoted word for word.</li>' +
       '<li><span class="src src-sas">SAS Survival Handbook</span>John “Lofty” Wiseman\'s PLAN priorities: Protection, Location, Acquisition (of water and food) and Navigation, applied to a household. Paraphrased, not quoted.</li>' +
       '<li><span class="src src-fire">Fire &amp; rescue services</span>Their standard advice on wildfires and smoke.</li>' +
       '<li><span class="src src-net">Electricity networks</span>The national power cut number, 105.</li>' +
@@ -1274,9 +1382,9 @@
   function dashNote() {
     var ha = S.server.ha;
     if (!ha || !ha.dash_outdated) return '';
-    try { if (localStorage.getItem('da-dash-note') === 'layout3') return ''; } catch (e) { /* show it */ }
-    return '<div class="card tip-card"><p><b>New for the Home front dashboard:</b> the household alert level, in a compact card that leaves room for everything else. ' +
-      'Why, and what to do now, opens on its own page. Update the dashboard to get it.</p>' +
+    try { if (localStorage.getItem('da-dash-note') === 'layout4') return ''; } catch (e) { /* show it */ }
+    return '<div class="card tip-card"><p><b>New for the Home front dashboard:</b> resilience across ten areas, from water and power to communications and safety, ' +
+      'with every recommendation on its own page. Update the dashboard to get it.</p>' +
       '<div class="btn-row"><button class="btn small" data-act="ha-dash" data-again="1">Update the dashboard</button>' +
       '<button class="btn small" data-act="dash-note-hide">Not now</button></div></div>';
   }
@@ -1305,8 +1413,9 @@
     }
     return sheetHead('Help', 'Getting the most from Dads Army', '❔') +
       '<div class="list help-list">' +
-      (ha ? row('📊', 'Put Dads Army on your Home Assistant dashboard', 'Tiles for warnings, today\'s checklist, readiness and the stores', 'dash-wizard') : '') +
+      (ha ? row('📊', 'Put Dads Army on your Home Assistant dashboard', 'Tiles for warnings, today\'s checklist, resilience and the stores', 'dash-wizard') : '') +
       row('🛡️', 'What the household alert level means', 'LOW to CRITICAL, and how it\'s worked out', 'level-help') +
+      row('🔋', 'Resilience: what to do next', 'Ten areas, from water and power to communications and safety', 'res-all') +
       (ha ? row('🌡️', 'Choose home sensors', 'Temperatures, power, alarms and more can change the alert level', 'home-sensors') : '') +
       row('📢', 'Warnings for where you live', 'Met Office, floods, Emergency Alerts, fires', 'warn-set') +
       row('📋', 'Routine checks and your emergency plan', 'On the Plan tab', 'help-go', ' data-view="plan"') +
@@ -1321,7 +1430,7 @@
   // What the dashboard will look like, with today's numbers.
   function dashPreview() {
     var r = readiness(), w = W(), due = checksDue(), short = shortList().length + S.shopping.filter(function (x) { return !x.done; }).length;
-    var pct = S.settings.target_days ? Math.min(100, Math.floor(100 * r.hold / S.settings.target_days)) : 0;
+    var pct = RS().pct;
     var soon = S.items.filter(function (it) { var i = info(it); return i.exp === 'bad' || i.exp === 'warn'; }).length;
     function t(icon, name, val, cls) {
       return '<div class="dp-tile' + (cls ? ' ' + cls : '') + '"><span class="dp-ico">' + icon + '</span><span class="dp-name">' + name + '</span><b>' + val + '</b></div>';
@@ -1329,7 +1438,7 @@
     return '<div class="dash-preview" aria-hidden="true"><div class="dp-bar">Home front</div><div class="dp-grid">' +
       t('⚠️', 'Warnings', w.on ? w.items.length + ' in force' : 'off', w.items.length ? 'red' : '') +
       t('📋', 'Today\'s checklist', due + ' due', due ? 'purple' : '') +
-      t('🛡️', 'Readiness', pct + '%', pct >= 100 ? 'green' : pct >= 50 ? 'amber' : 'red') +
+      t('🛡️', 'Resilience', pct + '%', pct >= 80 ? 'green' : pct >= 50 ? 'amber' : 'red') +
       t('⏳', 'Hold out', fmtDays(r.hold) + ' days', '') +
       t('📅', 'Use first', soon + (soon === 1 ? ' item' : ' items'), soon ? 'amber' : '') +
       t('🛒', 'Supply run', short + ' to get', '') +
@@ -1646,6 +1755,15 @@
     if (history.state && history.state.daSheet) history.back();
     else { stack.pop(); showSheet(true); }
   }
+  // Close every open sheet at once (each was a step in history), then carry on.
+  function closeAllSheets(then) {
+    var n = stack.length, hs = history.state && history.state.daSheet;
+    if (!n) return then && then();
+    stack.length = 0;
+    showSheet(true);
+    if (hs) { try { history.go(-Math.min(n, hs)); } catch (e) { /* fine */ } }
+    if (then) setTimeout(then, hs ? 150 : 0);
+  }
   window.addEventListener('popstate', function () {
     if (stack.length) { stack.pop(); showSheet(true); }
     else if (SEL) { endSelect(); renderStoreList(); }
@@ -1673,7 +1791,7 @@
     var html = {
       item: sheetItem, edit: sheetEdit, stock: sheetStock, use: sheetUse, batch: sheetBatch, text: sheetText, halists: sheetHaLists,
       check: sheetCheck, plan: sheetPlan, warning: sheetWarning, warnset: sheetWarnSet, help: sheetHelp, dashwiz: sheetDashWiz,
-      level: sheetLevel, levelhelp: sheetLevelHelp, homesensors: sheetHomeSensors
+      level: sheetLevel, levelhelp: sheetLevelHelp, homesensors: sheetHomeSensors, area: sheetArea, resall: sheetResAll
     }[s.type](s);
     if (html === null) {   // the item was deleted elsewhere
       closeSheet();
@@ -2079,6 +2197,35 @@
         return checkWarnings(a);
       case 'help':
         return openSheet({ type: 'help' });
+      case 'res-all':
+        return openSheet({ type: 'resall' });
+      case 'res-area':
+        return openSheet({ type: 'area', area: a.dataset.area });
+      case 'res-go': {
+        var to = a.dataset.cat ? { cat: a.dataset.cat } : { show: a.dataset.show };
+        return closeAllSheets(function () { goStores(to); });
+      }
+      case 'res-add':
+        return run(function () {
+          return api('POST', 'api/resilience/add', { id: a.dataset.rid }).then(function (res) {
+            return refresh().then(function () {
+              var bits = res.added.concat(res.checks);
+              toast((res.added.length ? 'On the supply run: ' : 'Added to your checks: ') + bits.join(', '),
+                res.undo ? { undo: res.undo, undoPath: 'api/items/delete' } : {});
+            });
+          });
+        }, a);
+      case 'res-answer': {
+        var rq = resById(a.dataset.rid), stt = a.dataset.status;
+        return run(function () {
+          return api('POST', 'api/resilience/answer', { id: a.dataset.rid, status: stt }).then(function (res) {
+            return refresh().then(function () {
+              toast((rq ? rq.brief + ': ' : '') + (stt === 'yes' ? 'ticked off' : stt === 'na' ? 'not for you' : 'back on the list'),
+                { undo: res.undo, undoPath: 'api/resilience/answer' });
+            });
+          });
+        }, a);
+      }
       case 'level-open':
         return openSheet({ type: 'level' });
       case 'level-help':
@@ -2098,7 +2245,7 @@
         return toast('Suggestions ticked. Check them, then Save.');
       }
       case 'dash-note-hide':
-        try { localStorage.setItem('da-dash-note', 'layout3'); } catch (e) { /* fine */ }
+        try { localStorage.setItem('da-dash-note', 'layout4'); } catch (e) { /* fine */ }
         return render();
       case 'help-go': {
         var dest = a.dataset.view;

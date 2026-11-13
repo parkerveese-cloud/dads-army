@@ -49,7 +49,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -591,6 +591,7 @@ def summary():
         extras = [r["text"] for r in DB.execute("SELECT text FROM shopping WHERE done = 0 ORDER BY id")]
         checks = [dict(r) for r in DB.execute("SELECT * FROM checks")]
         warnings = warn_brief()
+        plan = get_plan()
     warn = st["warn_days"]
     people = st["adults"] + st["children"]
     kcal_day = st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]
@@ -738,6 +739,9 @@ def summary():
         "next_check": next_check,
         # Warnings from the Met Office, floods, Emergency Alerts and GDACS (if switched on)
         "warnings": warnings,
+        # Ten areas of resilience, of which food and water are two.
+        "resilience": resilience(res_context(items, st, plan, checks, warnings["enabled"], food_days, water_days,
+                                             today)),
     }
     out["situation"] = assess(out, home_snapshot())
     return out
@@ -783,13 +787,14 @@ def api_health(body, query):
 
 @route("GET", "/api/state")
 def api_state(body, query):
-    situation = summary()["situation"]
+    sm = summary()
     home = home_snapshot() if HA_TOKEN else None
     with LOCK:
         if home is not None:
             home["config"] = home_cfg()
         return {
-            "situation": situation,
+            "situation": sm["situation"],
+            "resilience": sm["resilience"],
             "home": home,
             "items": all_items(),
             "shopping": [dict(r) for r in DB.execute("SELECT * FROM shopping ORDER BY done, id")],
@@ -1257,6 +1262,541 @@ def api_plan(body, query):
     return {"plan": plan}
 
 
+# -- Resilience ----------------------------------------------------------------------
+# Food and water are two areas of ten. Each area has recommendations: things to have, know
+# or do, mostly from the UK Government's Be Ready checklist, Ofcom and Fire Kills. Dads Army
+# ticks off what it can see for itself (the stores, the plan, the checks, Home Assistant);
+# you tick the rest, or say it's not for you.
+AREAS = [
+    # id, name, short name (for the dashboard), emoji
+    ("water", "Water", "Water", "💧"),
+    ("food", "Food & cooking", "Food", "🥫"),
+    ("power", "Power & light", "Power", "🔋"),
+    ("warmth", "Warmth", "Warmth", "🧣"),
+    ("comms", "Communications", "Comms", "📻"),
+    ("health", "Health & medicines", "Health", "🩹"),
+    ("hygiene", "Hygiene & sanitation", "Hygiene", "🧻"),
+    ("safety", "Fire & home safety", "Safety", "🧯"),
+    ("money", "Money & documents", "Money", "💷"),
+    ("plan", "Plan & getting out", "Getting out", "🎒"),
+]
+AREA = {a[0]: a for a in AREAS}
+ESSENTIAL, RECOMMENDED, EXTRA = 3, 2, 1
+PRIORITY_WORD = {3: "Essential", 2: "Recommended", 1: "Extra"}
+# Things a recommendation can add to the stores that aren't on the starter list.
+EXTRA_ITEMS = [
+    ("UPS for the router & Home Assistant", "power", "each", 0, 0, 1,
+     "An uninterruptible power supply. Plug in the broadband router and the Home Assistant box, and test it every "
+     "few months."),
+]
+RES_SOURCES = {"bready": ("UK Government", "Be Ready"), "ofcom": ("UK Government", "Ofcom"),
+               "firekills": ("UK Government", "Fire Kills"), "alerts": ("UK Government", "Emergency Alerts"),
+               "fire": ("Fire & rescue services", ""), "sas": ("SAS Survival Handbook", "PLAN: Protection"),
+               "tip": ("Dads Army tip", "")}
+
+
+def _rx(p):
+    return re.compile(p, re.I)
+
+
+def I(label, rx, add=None, cats=None, excl=None):
+    """Something in the stores: what it is, how to spot it by name, and what to add if it's missing."""
+    return {"label": label, "rx": _rx(rx), "add": add, "cats": cats, "excl": _rx(excl) if excl else None}
+
+
+def R(mid, area, pri, title, brief, why, src, test, when=None):
+    return {"id": mid, "area": area, "priority": pri, "title": title, "brief": brief, "why": why, "src": src,
+            "test": test, "when": when}
+
+
+MANUAL = ("manual",)
+RECOMMENDATIONS = [
+    # Water
+    R("water_3", "water", ESSENTIAL, "Drinking water for at least 3 days", "3 days of water",
+      "3 litres per person per day, just for drinking. You'd need more for cooking and washing.", "bready",
+      ("days", "water", 3)),
+    R("water_target", "water", RECOMMENDED, "Water for your whole {target}-day target", "Water for {target} days",
+      "Your readiness target, set in HQ. Rotate bottled water before its date.", "tip",
+      ("days", "water", "target"), when="target>3"),
+    R("water_safe", "water", RECOMMENDED, "A way to make water safe to drink: purification tablets or a filter",
+      "Water purification", "If the supply stops or isn't safe, you can treat other water. Boiling works too, if you "
+      "can heat it.", "tip",
+      ("items", [I("purification tablets or a filter", r"purif|filter|sterili[sz]", "Water purification tablets",
+                   cats=("water", "medical", "other"))])),
+    R("water_carrier", "water", EXTRA, "Containers to carry water", "Water containers",
+      "When the supply fails, water companies set up bottled water stations. You'll need something to carry it "
+      "home in.", "tip",
+      ("items", [I("a water carrier", r"carrier|jerry|container|water butt", "Collapsible water carrier (20L)",
+                   cats=("water", "other"))])),
+    R("water_stopcock", "water", ESSENTIAL, "Know where the stopcock is, and how to turn it off", "Find the stopcock",
+      "For a burst pipe or a flood. Write it in the emergency plan.", "bready", ("plan", ["water_off"])),
+    # Food & cooking
+    R("food_3", "food", ESSENTIAL, "Food for at least 3 days that needs no fridge", "3 days of food",
+      "Tins and dried food you'd usually eat, so nothing goes to waste.", "bready", ("days", "food", 3)),
+    R("food_target", "food", RECOMMENDED, "Food for your whole {target}-day target", "Food for {target} days",
+      "Your readiness target, set in HQ. Build it up over time.", "tip", ("days", "food", "target"), when="target>3"),
+    R("food_opener", "food", ESSENTIAL, "A manual tin opener", "Tin opener", "Most stored food comes in tins.", "tip",
+      ("items", [I("a tin opener", r"tin.?opener|can.?opener", "Manual tin opener")])),
+    R("food_cook", "food", RECOMMENDED, "A way to heat food without mains power: a camping stove and fuel",
+      "Camping stove and fuel", "Only ever use it outdoors or somewhere very well ventilated: stoves give off "
+      "carbon monoxide.", "tip",
+      ("items", [I("a camping stove", r"stove|cooker", "Camping stove", excl=r"gas|canister|fuel|cartridge"),
+                 I("fuel for it", r"canister|cartridge|stove fuel|gas bottle", "Stove gas canisters")])),
+    R("food_dates", "food", RECOMMENDED, "Nothing out of date", "Use up old stock",
+      "Use the oldest first, and check the dates every six months.", "bready", ("noexpired", ("food", "water"))),
+    R("food_pets", "food", ESSENTIAL, "Food and water for your pets", "Pet food",
+      "Enough for 3 days, and any medicines they need.", "bready", ("cat", "pets"), when="pets"),
+    R("food_baby", "food", RECOMMENDED, "For a baby: ready-to-feed formula, nappies and wipes", "Baby supplies",
+      "Ready-to-feed formula needs no clean water. Say it's not for you if you don't have a baby.", "bready",
+      ("any", [MANUAL, ("items", [I("formula or nappies", r"formula|napp(y|ies)", None)])]), when="children"),
+    # Power & light
+    R("power_torch", "power", ESSENTIAL, "A torch for everyone, and spare batteries", "Torches and batteries",
+      "Torches are safer than candles.", "bready",
+      ("items", [I("torches", r"torch|lantern", "LED torch", excl=r"solar.*charger"),
+                 I("spare batteries", r"batteries", "AA batteries")])),
+    R("power_bank", "power", ESSENTIAL, "A charged power bank", "Power bank",
+      "Keeps phones going through a power cut. Top it up every month.", "bready",
+      ("items", [I("a power bank", r"power.?bank|battery pack", "Power bank")])),
+    R("power_ups", "power", RECOMMENDED, "A UPS for the router and Home Assistant", "UPS for the router",
+      "Broadband, Wi-Fi calling and digital landlines stop in a power cut. An uninterruptible power supply keeps "
+      "them, Home Assistant and Dads Army running for a while.", "ofcom",
+      ("any", [("items", [I("a UPS", r"\bups\b|uninterruptible", "UPS for the router & Home Assistant")]),
+               ("sensors", ["battery"])])),
+    R("power_105", "power", RECOMMENDED, "105 written down for power cuts", "Note down 105",
+      "Free from any phone, to report or check a power cut. In Northern Ireland it's 03457 643643.", "bready",
+      ("phone", "105")),
+    R("power_fusebox", "power", ESSENTIAL, "Know where the fuse box and main switch are", "Find the fuse box",
+      "Write it in the emergency plan, with how to turn the electricity off.", "bready", ("plan", ["power_off"])),
+    R("power_psr", "power", RECOMMENDED, "On the Priority Services Register, if you can be",
+      "Priority Services Register", "It's free. Energy and water companies give extra help in a cut to households "
+      "with children under 5, older or disabled people, or anyone relying on powered medical equipment. Sign up with "
+      "each company. Say it's not for you if you can't join.", "bready", MANUAL),
+    R("power_kept", "power", RECOMMENDED, "Power banks charged and torches tested on schedule", "Charge and test",
+      "Kit only helps if it works when you need it.", "tip", ("checks", [r"power bank", r"torch"])),
+    R("power_backup", "power", EXTRA, "Longer-lasting power: a portable power station or solar charger",
+      "Solar charger or power station", "For cuts that last more than a day. Never run a generator indoors.", "tip",
+      ("items", [I("a solar charger or power station", r"power station|solar|generator", "Solar phone charger",
+                   excl=r"lantern|torch|light")])),
+    # Warmth
+    R("warm_bedding", "warmth", ESSENTIAL, "Blankets or sleeping bags for everyone", "Blankets or sleeping bags",
+      "Keeping warm comes first in a winter power cut.", "bready",
+      ("items", [I("blankets or sleeping bags", r"sleeping bag|duvet|blanket", "Sleeping bags",
+                   excl=r"foil|space|emergency|fire")])),
+    R("warm_clothes", "warmth", ESSENTIAL, "Warm clothes: layers, hats and gloves", "Warm layers",
+      "Several thin layers keep you warmer than one thick one.", "bready",
+      ("items", [I("hats and gloves", r"\bhats?\b|glove|scarf", "Warm hats & gloves", cats=("shelter", "other"),
+                   excl=r"work glove|disposable"),
+                 I("warm layers", r"thermal|base layer|fleece|jumper", "Thermal base layers")])),
+    R("warm_room", "warmth", RECOMMENDED, "Plan one room to keep warm", "A warm room",
+      "A small room you can close off. Draught-proof it, keep the curtains shut at night, and gather there.", "sas",
+      MANUAL),
+    R("warm_foil", "warmth", EXTRA, "Foil emergency blankets", "Foil blankets",
+      "Light and cheap, and they hold your body heat in.", "tip",
+      ("items", [I("foil blankets", r"foil|space blanket|emergency blanket", "Foil emergency blankets")])),
+    R("warm_sensor", "warmth", EXTRA, "A temperature sensor in the coldest room", "Room temperature sensor",
+      "Choose it in Home sensors: Dads Army raises the alert level if a room gets dangerously cold.", "tip",
+      ("sensors", ["indoor_temp"]), when="ha"),
+    # Communications
+    R("comms_radio", "comms", ESSENTIAL, "An FM radio that works without mains: battery, wind-up or solar", "Radio",
+      "For news and official advice when the internet and phones are down.", "bready",
+      ("items", [I("a radio", r"radio", "Wind-up or battery radio", excl=r"walkie|two.?way|pmr|\bcb\b")])),
+    R("comms_numbers", "comms", ESSENTIAL, "Important numbers written down on paper", "Numbers on paper",
+      "Family, neighbours, the GP, and your energy, water and broadband providers. Your phone may be flat or lost.",
+      "bready", ("any", [("contacts", 3), ("items", [I("a printed contact list", r"contact list", None)])])),
+    R("comms_station", "comms", RECOMMENDED, "Your local radio station and its frequency", "Local radio station",
+      "Written in the emergency plan, so you can find it fast.", "bready", ("plan", ["radio"])),
+    R("comms_touch", "comms", RECOMMENDED, "Agree how you'll keep in touch if the phones are down", "Keeping in touch",
+      "Who calls whom, a contact outside the area, and texting if calls won't connect.", "ofcom", MANUAL),
+    R("comms_alerts", "comms", RECOMMENDED, "Phones ready for Emergency Alerts", "Emergency Alerts",
+      "They reach phones on 4G and 5G: iPhones on iOS 14.5 or later, and Android 11 or later. Keep phones updated.",
+      "alerts", MANUAL),
+    R("comms_warnings", "comms", RECOMMENDED, "Warnings switched on in Dads Army", "Switch on warnings",
+      "Met Office, flood and Emergency Alert warnings for where you live, on the Sitrep and your phone.", "tip",
+      ("warnings",)),
+    R("comms_flood", "comms", RECOMMENDED, "Signed up for flood warnings", "Flood warnings",
+      "Free calls, texts or emails: from the Environment Agency in England, SEPA in Scotland, or Natural Resources "
+      "Wales. Say it's not for you if you're not near a river or the coast.", "bready", MANUAL),
+    R("comms_landline", "comms", EXTRA, "If you rely on a landline: a battery backup for it", "Landline backup",
+      "Digital landlines stop in a power cut. Tell your provider if you rely on yours: they must offer a free backup to "
+      "eligible customers, lasting at least an hour.", "ofcom", MANUAL),
+    R("comms_walkie", "comms", EXTRA, "Walkie-talkies for keeping in touch nearby", "Walkie-talkies",
+      "PMR446 radios need no licence in the UK. Handy for checking on neighbours without phones.", "tip",
+      ("items", [I("walkie-talkies", r"walkie|pmr|two.?way radio", "Walkie-talkies")])),
+    # Health & medicines
+    R("health_kit", "health", ESSENTIAL, "A first aid kit", "First aid kit", "Check it twice a year.", "bready",
+      ("items", [I("a first aid kit", r"first.?aid", "First aid kit")])),
+    R("health_meds", "health", ESSENTIAL, "Spare essential medicines", "Spare medicines",
+      "Order repeat prescriptions in good time: up to 5 working days before you need them. Say it's not for you if "
+      "nobody takes regular medicine.", "bready",
+      ("items", [I("spare medicines", r"prescription|medicine|medication", "Prescription medicines (spare)")])),
+    R("health_list", "health", RECOMMENDED, "A written list of medicines, doses and medical needs", "Medicines list",
+      "In the emergency plan, for whoever's helping.", "bready", ("plan", ["medical"])),
+    R("health_basics", "health", RECOMMENDED, "Painkillers, plasters and rehydration sachets", "Medicine cabinet",
+      "For the everyday things, when the chemist may be shut.", "tip",
+      ("items", [I("painkillers", r"paracetamol|ibuprofen|painkiller", "Paracetamol (16)"),
+                 I("plasters", r"plaster", "Plasters"),
+                 I("rehydration sachets", r"rehydrat", "Oral rehydration sachets")])),
+    R("health_ice", "health", RECOMMENDED, "Emergency contacts (ICE) or Medical ID on everyone's phone",
+      "ICE on phones", "Paramedics can see it even when the phone's locked.", "bready", MANUAL),
+    R("health_check", "health", RECOMMENDED, "First aid kit checked on schedule", "Check the first aid kit",
+      "Replace anything used up or out of date.", "tip", ("checks", [r"first aid"])),
+    R("health_skills", "health", EXTRA, "Someone at home knows basic first aid", "First aid skills",
+      "A short course, such as from the British Red Cross or St John Ambulance.", "tip", MANUAL),
+    # Hygiene & sanitation
+    R("hyg_basics", "hygiene", ESSENTIAL, "Hand sanitiser, wet wipes and toilet roll", "Sanitiser, wipes, loo roll",
+      "For keeping clean when the water's off.", "bready",
+      ("items", [I("hand sanitiser", r"saniti[sz]er", "Hand sanitiser"), I("wet wipes", r"wipes", "Wet wipes", cats=("hygiene", "other")),
+                 I("toilet roll", r"toilet (roll|paper|tissue)|loo roll", "Toilet roll")])),
+    R("hyg_toilet", "hygiene", RECOMMENDED, "An emergency toilet: a bucket with a lid, and strong bags",
+      "Emergency toilet", "If the water or the sewers stop working.", "tip",
+      ("items", [I("a bucket with a lid", r"bucket", "Bucket with lid"),
+                 I("strong bags", r"bin bag|refuse|rubbish bag", "Bin bags")])),
+    R("hyg_rest", "hygiene", RECOMMENDED, "Soap, toothpaste and sanitary products", "Bathroom basics",
+      "Everyday bathroom products, for a few days at least.", "bready",
+      ("items", [I("soap", r"soap", "Soap"), I("toothpaste", r"toothpaste", "Toothpaste"),
+                 I("sanitary products", r"sanitary|period|tampon", "Sanitary products")])),
+    R("hyg_bleach", "hygiene", EXTRA, "Unscented bleach, for cleaning and disinfecting", "Bleach", "", "tip",
+      ("items", [I("bleach", r"bleach|disinfect", "Bleach (unscented)")])),
+    # Fire & home safety
+    R("safe_smoke", "safety", ESSENTIAL, "A working smoke alarm on every floor", "Smoke alarms",
+      "They give you the time to get out. Test them every month.", "firekills",
+      ("any", [MANUAL, ("sensors", ["smoke_alarm"])])),
+    R("safe_co", "safety", ESSENTIAL, "A carbon monoxide alarm near the boiler, fire or stove", "CO alarm",
+      "You can't see, smell or taste carbon monoxide: an alarm is the only way to know. Say it's not for you if "
+      "nothing at home burns fuel.", "firekills", ("any", [MANUAL, ("sensors", ["gas_alarm"])])),
+    R("safe_gas", "safety", ESSENTIAL, "Know how to turn off the gas", "Find the gas tap",
+      "Usually a lever by the meter. If you smell gas, call 0800 111 999. Say it's not for you if you have no gas.",
+      "bready", ("plan", ["gas_off"])),
+    R("safe_tested", "safety", RECOMMENDED, "Smoke and CO alarms tested every month", "Test the alarms",
+      "Press the test button on each one.", "firekills", ("checks", [r"smoke|alarm"])),
+    R("safe_ext", "safety", RECOMMENDED, "A fire blanket or extinguisher", "Fire blanket or extinguisher",
+      "For a small fire only. If it's not small: get out, stay out and call 999.", "tip",
+      ("items", [I("a fire blanket or extinguisher", r"extinguisher|fire blanket", "Fire extinguisher")])),
+    R("safe_visit", "safety", EXTRA, "A free home fire safety visit", "Fire safety visit",
+      "Many fire and rescue services offer one, and fit smoke alarms if you need them.", "fire", MANUAL),
+    R("safe_sensors", "safety", EXTRA, "Smoke, carbon monoxide and leak sensors chosen in Home sensors",
+      "Alarm sensors", "Dads Army raises the alert level and says what to do when one goes off.", "tip",
+      ("sensors", ["smoke_alarm", "gas_alarm", "leak"]), when="ha"),
+    # Money & documents
+    R("money_cash", "money", ESSENTIAL, "Cash in coins and notes", "Emergency cash",
+      "Card machines and cash machines need power and the internet.", "bready",
+      ("items", [I("cash", r"cash", "Emergency cash (small notes)", cats=("docs", "other"))])),
+    R("money_copies", "money", ESSENTIAL, "Copies of ID and important documents", "Copies of documents",
+      "Passports, birth certificates, and instructions for any medical equipment.", "bready",
+      ("items", [I("copies of documents", r"cop(y|ies)|passport|\bid\b", "Copies of ID & passports",
+                   cats=("docs", "other"), excl=r"insurance|bank")])),
+    R("money_insurance", "money", RECOMMENDED, "Insurance and bank details to hand", "Insurance details",
+      "Policy numbers and claim lines, for after a flood or fire.", "bready",
+      ("items", [I("insurance details", r"insurance", "Insurance & bank details (copy)")])),
+    R("money_where", "money", RECOMMENDED, "Where the originals are kept, written in the plan", "Where documents are",
+      "So anyone can grab them in a hurry.", "tip", ("plan", ["documents"])),
+    R("money_keys", "money", EXTRA, "Spare house and car keys", "Spare keys", "", "tip",
+      ("items", [I("spare keys", r"\bkeys?\b", "Spare house & car keys")])),
+    R("money_scans", "money", EXTRA, "Scans of the documents, on a USB stick or secure cloud storage",
+      "Scanned documents", "", "tip", ("items", [I("scans", r"usb|scan", "USB stick with scanned documents")])),
+    # Plan & getting out
+    R("plan_made", "plan", ESSENTIAL, "A household emergency plan everyone knows", "Emergency plan",
+      "Who to call, where to meet, and how to turn things off. Keep a printed copy with your documents.", "bready",
+      ("planmade",)),
+    R("plan_meet", "plan", ESSENTIAL, "Two meeting places: one near home, one further away", "Meeting places",
+      "In case you can't get home, or the area has to be evacuated.", "bready", ("plan", ["meet_near", "meet_far"])),
+    R("plan_bag", "plan", RECOMMENDED, "A grab bag packed and ready", "Grab bag",
+      "If you have to leave in a hurry: water, snacks, a torch, a radio, medicines, copies of documents, cash and "
+      "chargers.", "bready", ("items", [I("a grab bag", r"grab.?bag|go.?bag|bug.?out", "Grab bag (packed & ready)")])),
+    R("plan_escape", "plan", RECOMMENDED, "Escape routes for a fire or a flood", "Escape routes",
+      "Two ways out of the house, and where you'd go.", "bready", MANUAL),
+    R("plan_neighbours", "plan", RECOMMENDED, "Know who nearby might need checking on", "Check on neighbours",
+      "Older or disabled neighbours, and anyone living alone. Agree a plan with them for a power cut.", "bready",
+      MANUAL),
+    R("plan_school", "plan", RECOMMENDED, "School or childcare has your up-to-date numbers", "School contacts", "",
+      "bready", MANUAL, when="children"),
+    R("plan_review", "plan", RECOMMENDED, "The plan gone through together in the last year", "Go through the plan",
+      "Everyone knows where to meet and who to call.", "tip", ("checks", [r"emergency plan"])),
+    R("plan_car", "plan", EXTRA, "A car kit for winter journeys", "Winter car kit",
+      "Warm layers, a blanket, a torch, water, snacks and a phone charger. Say it's not for you if you don't drive.",
+      "bready", MANUAL),
+    R("plan_map", "plan", EXTRA, "A paper map of the area", "Paper map", "For when phones and sat-navs don't work.",
+      "tip", ("items", [I("a paper map", r"\bmap\b|road atlas", "Paper map of the area")])),
+]
+RES = {r["id"]: r for r in RECOMMENDATIONS}
+# These two have their own rules in the alert level (stores for under 3 days).
+DAYS_IDS = ("water_3", "food_3")
+PLAN_CORE = ("meet_near", "water_off", "power_off", "medical", "documents")
+
+
+def and_list(words, most=3):
+    """["Power", "Warmth", "Safety"] -> "Power, Warmth and Safety"; longer lists end "and 2 more"."""
+    if len(words) > most:
+        return ", ".join(words[:most]) + " and %d more" % (len(words) - most)
+    return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def res_answers():
+    raw = setting_raw("resilience", {})
+    return {k: v for k, v in (raw if isinstance(raw, dict) else {}).items()
+            if k in RES and isinstance(v, dict) and v.get("status") in ("yes", "na")}
+
+
+def _have(it):
+    return sum(b["qty"] for b in it["batches"])
+
+
+def _found(items, spec):
+    return [it for it in items if spec["rx"].search(it["name"])
+            and not (spec["excl"] and spec["excl"].search(it["name"]))
+            and not (spec["cats"] and it["category"] not in spec["cats"])]
+
+
+def _items_frac(found):
+    """How much of these you have: against their targets, or simply any at all."""
+    if not found:
+        return 0.0
+    got = [it for it in found if _have(it) > 0]
+    if any((it["target_qty"] or 0) <= 0 for it in got):
+        return 1.0
+    tg = [it for it in found if (it["target_qty"] or 0) > 0]
+    need = sum(it["target_qty"] for it in tg)
+    return min(1.0, sum(min(_have(it), it["target_qty"]) for it in tg) / need) if need else 0.0
+
+
+def res_test(test, c):
+    """(fraction done, what Dads Army can see, what you could do about it)."""
+    kind = test[0]
+    if kind == "manual":
+        return 0.0, "", {"kind": "manual"}
+    if kind == "items":
+        parts, missing, none, short, first, addable = [], [], [], [], None, False
+        for spec in test[1]:
+            found = _found(c["items"], spec)
+            f = _items_frac(found)
+            parts.append(f)
+            if not found:
+                missing.append(spec["label"])
+                addable = addable or bool(spec["add"])
+            elif f < 1:
+                (short if f > 0 else none).append(spec["label"])
+                first = first or next((it["id"] for it in found if (it["target_qty"] or 0) > _have(it)), found[0]["id"])
+        frac = sum(parts) / len(parts)
+        if frac >= 1:
+            return 1.0, "In your stores", None
+        bits = []
+        if missing:
+            bits.append("Not in your stores yet: " + ", ".join(missing))
+        if none:
+            bits.append("None in stock yet: " + ", ".join(none))
+        if short:
+            bits.append("Below target: " + ", ".join(short))
+        act = {"kind": "add"} if addable else {"kind": "open", "item": first} if first else None
+        return frac, ". ".join(bits), act
+    if kind == "days":
+        days = c["food_days"] if test[1] == "food" else c["water_days"]
+        goal = c["target"] if test[2] == "target" else test[2]
+        frac = min(1.0, days / goal) if goal else 1.0
+        cat = test[1]
+        if frac >= 1:
+            return 1.0, "%s days stored" % fq(round(days, 1)), None
+        have = [it for it in c["items"] if it["category"] == cat
+                and ((it["kcal_per_unit"] or 0) > 0 if cat == "food" else (it["litres_per_unit"] or 0) > 0)]
+        act = ({"kind": "add"} if cat == "water" and not have else {"kind": "cat", "cat": cat})
+        return frac, "%s of %s days stored" % (fq(round(days, 1)), fq(goal)), act
+    if kind == "plan":
+        filled = [k for k in test[1] if c["plan"].get(k)]
+        frac = len(filled) / float(len(test[1]))
+        return frac, ("In your plan" if frac >= 1 else "Not in your plan yet" if not filled else "Partly in your plan"), \
+            (None if frac >= 1 else {"kind": "plan"})
+    if kind == "planmade":
+        n = len([k for k in PLAN_CORE if c["plan"].get(k)]) + (1 if c["plan"].get("contacts") else 0)
+        frac = min(1.0, n / 4.0)
+        return frac, ("Your plan has %d of the main parts" % n if frac < 1 else "Made"), \
+            (None if frac >= 1 else {"kind": "plan"})
+    if kind == "contacts":
+        n = len([x for x in c["plan"].get("contacts") or [] if x.get("phone")])
+        frac = min(1.0, n / float(test[1]))
+        return frac, "%d number%s in your plan" % (n, "" if n == 1 else "s"), (None if frac >= 1 else {"kind": "plan"})
+    if kind == "phone":
+        ok = any(re.sub(r"\D", "", x.get("phone") or "") == test[1] for x in c["plan"].get("contacts") or [])
+        return (1.0, "In your plan", None) if ok else (0.0, "Not in your plan yet", {"kind": "plan"})
+    if kind == "checks":
+        parts, todo = [], None
+        for rx in test[1]:
+            ck = next((x for x in c["checks"] if re.search(rx, x["name"], re.I)), None)
+            if not ck:
+                parts.append((0.0, "Not on your routine checks"))
+                todo = todo or {"kind": "addcheck"}
+                continue
+            due, d, text = check_status(ck, c["today"])
+            f = 1.0 if (d is not None and d > 0) else 0.5 if ck["last_done"] else 0.25
+            parts.append((f, "%s: %s" % (ck["name"], text.lower() if f < 1 else "done")))
+            if f < 1:
+                todo = todo or {"kind": "check", "check": ck["id"]}
+        frac = sum(p[0] for p in parts) / len(parts)
+        return frac, ". ".join(p[1] for p in parts if p[0] < 1) or "Up to date", (None if frac >= 1 else todo)
+    if kind == "sensors":
+        roles = test[1]
+        got = [r for r in roles if c["home"].get(r)]
+        frac = len(got) / float(len(roles))
+        return frac, ("Chosen in Home sensors" if frac >= 1 else "Not chosen in Home sensors yet" if not got else
+                      "%d of %d chosen in Home sensors" % (len(got), len(roles))), \
+            (None if frac >= 1 else {"kind": "sensors"})
+    if kind == "warnings":
+        return (1.0, "Switched on", None) if c["warnings_on"] else (0.0, "Switched off", {"kind": "warnings"})
+    if kind == "noexpired":
+        stocked = [b for it in c["items"] if it["category"] in test[1] for b in it["batches"] if b["qty"] > 0]
+        if not stocked:
+            return 0.0, "Nothing stored yet", {"kind": "cat", "cat": test[1][0]}
+        n = len([1 for b in stocked if b["expiry"] and b["expiry"] < c["today"].isoformat()])
+        return (1.0, "Nothing out of date", None) if not n else \
+            (0.0, "%d batch%s out of date" % (n, "" if n == 1 else "es"), {"kind": "expired"})
+    if kind == "cat":
+        its = [it for it in c["items"] if it["category"] == test[1]]
+        frac = _items_frac(its)
+        return frac, ("In your stores" if frac >= 1 else "Not in your stores yet" if not its else "Below target"), \
+            (None if frac >= 1 else {"kind": "cat", "cat": test[1]})
+    if kind == "any":
+        best = None
+        for t in test[1]:
+            if t[0] == "sensors" and not c["ha"]:
+                continue
+            r = res_test(t, c)
+            if best is None or r[0] > best[0] or (r[0] == best[0] and best[2] and best[2]["kind"] == "manual"):
+                best = r
+        return best
+    return 0.0, "", None
+
+
+def res_applies(r, c):
+    w = r["when"]
+    return (not w or (w == "ha" and c["ha"]) or (w == "children" and c["children"] > 0)
+            or (w == "pets" and c["pets"]) or (w == "target>3" and c["target"] > 3))
+
+
+def resilience(c):
+    """Every recommendation, how far along each one is, and a score for each area."""
+    answers = c["answers"]
+    out, by_area = [], {}
+    for r in RECOMMENDATIONS:
+        if not res_applies(r, c):
+            continue
+        frac, detail, act = res_test(r["test"], c)
+        ans = (answers.get(r["id"]) or {}).get("status")
+        if ans == "yes":
+            frac = 1.0
+        status = "na" if ans == "na" else "done" if frac >= 0.999 else "partly" if frac > 0 else "todo"
+        src, body = RES_SOURCES[r["src"]]
+        m = {"id": r["id"], "area": r["area"], "priority": r["priority"], "priority_word": PRIORITY_WORD[r["priority"]],
+             "title": r["title"].format(target=c["target"]), "brief": r["brief"].format(target=c["target"]),
+             "why": r["why"], "source": src, "label": src + (" · " + body if body else ""),
+             "frac": round(frac, 3), "status": status, "detail": detail, "answer": ans,
+             "act": None if status in ("done", "na") else act, "manual": r["test"] == MANUAL}
+        out.append(m)
+        by_area.setdefault(r["area"], []).append(m)
+    areas = []
+    for aid, name, short, emoji in AREAS:
+        ms = [m for m in by_area.get(aid, []) if m["status"] != "na"]
+        weight = sum(m["priority"] for m in ms)
+        pct = _round(100.0 * sum(m["priority"] * m["frac"] for m in ms) / weight) if weight else 100
+        missing = [m for m in ms if m["priority"] == ESSENTIAL and m["status"] != "done"]
+        todo = sorted([m for m in ms if m["status"] != "done"], key=lambda m: (-m["priority"], m["frac"]))
+        areas.append({"id": aid, "name": name, "short": short, "emoji": emoji, "pct": pct,
+                      "state": "good" if pct >= 80 else "fair" if pct >= 50 else "poor",
+                      "done": len([m for m in ms if m["status"] == "done"]), "total": len(ms),
+                      "essentials_missing": [m["id"] for m in missing],
+                      "next": todo[0]["brief"] if todo else ""})
+    rank = {a["id"]: (i, a["pct"]) for i, a in enumerate(areas)}
+    nxt = sorted([m for m in out if m["status"] not in ("done", "na")],
+                 key=lambda m: (-m["priority"], rank[m["area"]][1], rank[m["area"]][0]))
+    return {"pct": _round(sum(a["pct"] for a in areas) / float(len(areas))) if areas else 0,
+            "done": len([m for m in out if m["status"] == "done"]),
+            "total": len([m for m in out if m["status"] != "na"]),
+            "areas": areas, "next": [m["id"] for m in nxt[:8]], "items": out}
+
+
+def res_context(items, st, plan, checks, warnings_on, food_days, water_days, today):
+    with LOCK:
+        answers = res_answers()
+        home = home_cfg() if HA_TOKEN else {}
+    return {"items": items, "plan": plan, "checks": checks, "warnings_on": warnings_on, "home": home,
+            "ha": bool(HA_TOKEN), "answers": answers, "food_days": food_days, "water_days": water_days,
+            "target": st["target_days"], "children": st["children"], "today": today,
+            "pets": bool(plan.get("pets")) or any(it["category"] == "pets" for it in items)}
+
+
+@route("POST", "/api/resilience/answer")
+def api_res_answer(body, query):
+    """You've done it ("yes"), it's not for you ("na"), or take your answer back ("")."""
+    mid = clean_text(body.get("id"), 40)
+    if mid not in RES:
+        raise ApiError(404, "That recommendation doesn't exist")
+    status = clean_text(body.get("status"), 10)
+    if status not in ("yes", "na", ""):
+        raise ApiError(400, "Say yes, na, or nothing")
+    title = RES[mid]["brief"].format(target=get_settings()["target_days"])
+    with tx() as db:
+        answers = res_answers()
+        before = (answers.get(mid) or {}).get("status") or ""
+        if status:
+            answers[mid] = {"status": status, "at": now_iso()}
+        else:
+            answers.pop(mid, None)
+        set_setting_raw(db, "resilience", answers)
+        if status != before:
+            add_log("resilience", title, {"yes": "Marked as done", "na": "Not for us", "": "Answer cleared"}[status])
+    return {"undo": {"id": mid, "status": before}}
+
+
+@route("POST", "/api/resilience/add")
+def api_res_add(body, query):
+    """Put what a recommendation needs into the stores (at zero, so it's on the supply run), or add its check."""
+    mid = clean_text(body.get("id"), 40)
+    r = RES.get(mid)
+    if not r:
+        raise ApiError(404, "That recommendation doesn't exist")
+    tests = r["test"][1] if r["test"][0] == "any" else [r["test"]]
+    specs = [s for t in tests if t[0] == "items" for s in t[1]]
+    rxs = [x for t in tests if t[0] == "checks" for x in t[1]]
+    if mid == "water_3" or (r["test"][0] == "days" and r["test"][1] == "water"):
+        specs = [I("drinking water", r"bottled water|water \(", "Bottled water (5L)", cats=("water",))]
+    added, ids, checks = [], [], []
+    rows = {row[0]: row for row in STARTER + EXTRA_ITEMS}
+    with tx() as db:
+        st = get_settings()
+        people = max(1, st["adults"] + st["children"])
+        days = st["target_days"]
+        ctx = {"people": people, "days": days,
+               "kcal": max(1, st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]) * days,
+               "litres": people * st["water_per_person"] * days}
+        items = all_items()
+        names = set(it["name"].lower() for it in items)
+        ts = now_iso()
+        for spec in specs:
+            if _found(items, spec) or not spec["add"] or spec["add"].lower() in names:
+                continue
+            name, cat, unit, kcal, litres, target, notes = rows[spec["add"]]
+            per_day = round(people * target[1], 3) if isinstance(target, tuple) and target[0] == "perday" else 0
+            ids.append(insert_item(db, {"name": name, "category": cat, "unit": unit, "kcal_per_unit": kcal,
+                                        "litres_per_unit": litres, "target_qty": resolve_target(target, kcal, litres, ctx),
+                                        "per_day": per_day, "price": 0, "notes": notes}, ts, ts))
+            added.append(name)
+            names.add(name.lower())
+        have = [row[0] for row in db.execute("SELECT name FROM checks")]
+        for rx in rxs:
+            if any(re.search(rx, n, re.I) for n in have):
+                continue
+            sug = next((s for s in CHECK_SUGGESTIONS if re.search(rx, s[0], re.I)), None)
+            if sug:
+                db.execute("INSERT INTO checks(name, every_days, last_done, notes, created_at) VALUES (?, ?, NULL, ?, ?)",
+                           (sug[0], sug[1], sug[2], ts))
+                checks.append(sug[0])
+                have.append(sug[0])
+        if added:
+            add_log("added", ", ".join(added), "From the resilience recommendations: on the supply run")
+        if checks:
+            add_log("added", ", ".join(checks), "New routine check, from the resilience recommendations")
+    if not added and not checks:
+        raise ApiError(409, "Nothing to add: it's already in your stores or checks")
+    return {"added": added, "checks": checks, "undo": {"ids": ids} if ids else None}
+
+
 @route("PUT", "/api/settings")
 def api_settings(body, query):
     changed = []
@@ -1350,6 +1890,7 @@ def api_backup(body, query):
             "shopping": [dict(r) for r in DB.execute("SELECT * FROM shopping ORDER BY id")],
             "checks": all_checks(),
             "plan": get_plan(),
+            "resilience": res_answers(),
         }
     data = json.dumps(payload, indent=1, ensure_ascii=False).encode("utf-8")
     return Raw(data, "application/json; charset=utf-8", "dadsarmy-backup-%s.json" % dt.date.today().isoformat())
@@ -1388,6 +1929,12 @@ def api_restore(body, query):
     if isinstance(body.get("plan"), dict):
         plan = clean_plan(body["plan"])
         plan["updated_at"] = clean_text(body["plan"].get("updated_at"), 30) or None
+    # Your resilience answers arrived in 1.9.0.
+    answers = None
+    if isinstance(body.get("resilience"), dict):
+        answers = dict((k, {"status": v["status"], "at": clean_text(v.get("at"), 30) or now_iso()})
+                       for k, v in body["resilience"].items()
+                       if k in RES and isinstance(v, dict) and v.get("status") in ("yes", "na"))
     make_backup("pre-restore")
     ts = now_iso()
     with tx() as db:
@@ -1415,6 +1962,8 @@ def api_restore(body, query):
                            (c["name"], c["every_days"], c["last_done"], c["notes"], created))
         if plan is not None:
             set_setting_raw(db, "plan", plan)
+        if answers is not None:
+            set_setting_raw(db, "resilience", answers)
         add_log("restored", "", "Restored %d items from backup" % len(clean_items))
     HA_REBASE.set()  # a restore isn't things running out
     return {"items": len(clean_items)}
@@ -1484,7 +2033,7 @@ CHECKS_LIST_NAME = "Dads Army checks"
 CHECKS_STATUS = {"ok": None, "error": "", "synced_at": None, "name": ""}
 HA_WS = os.environ.get("DADSARMY_HA_WS", "ws://supervisor/core/websocket")
 DASH_URL = "dads-army"
-DASH_LAYOUT = 3   # bump when the dashboard changes, so the app offers to rebuild it
+DASH_LAYOUT = 4   # bump when the dashboard changes, so the app offers to rebuild it
 
 
 class HAError(Exception):
@@ -1589,12 +2138,25 @@ def ha_entities(s):
     sit = s["situation"]
     put("sensor.dads_army_alert_level", sit["name"], "Dads Army alert level", LEVEL_ICONS[sit["level"] - 1],
         attrs={"level": sit["level"], "colour": sit["colour"], "emoji": sit["emoji"], "meaning": sit["meaning"],
-               "action": sit["action"],
+               "action": sit["action"], "escalated_why": sit["escalated_why"],
                "escalated": sit["escalated"], "reasons": sit["reasons"][:LIST_LIMIT], "notes": sit["notes"],
                "guidance": [{"label": g["label"], "source": g["source"], "text": g["text"]} for g in sit["guidance"]],
                "scale": [{"level": x["level"], "name": x["name"], "emoji": x["emoji"], "meaning": x["meaning"],
                           "action": x["action"]} for x in sit["scale"]]},
         measurement=False)
+    res = s["resilience"]
+    dots = {"good": "🟢", "fair": "🟡", "poor": "🔴"}
+    by_id = dict((m["id"], m) for m in res["items"])
+    put("sensor.dads_army_resilience", res["pct"], "Dads Army resilience", "mdi:shield-half-full", "%", {
+        "done": res["done"], "total": res["total"],
+        "areas": [{"id": a["id"], "name": a["name"], "short": a["short"], "emoji": a["emoji"], "pct": a["pct"],
+                   "state": a["state"], "dot": dots[a["state"]], "done": a["done"], "total": a["total"],
+                   "essentials_missing": len(a["essentials_missing"]), "next": a["next"]} for a in res["areas"]],
+        "next_steps": [{"area": by_id[i]["area"], "emoji": AREA[by_id[i]["area"]][3], "title": by_id[i]["brief"],
+                        "priority": by_id[i]["priority_word"]} for i in res["next"][:5]],
+        # Short keys: every recommendation, by area, for the dashboard's Resilience page.
+        "measures": dict((a[0], [{"t": m["title"], "s": m["status"], "p": m["priority"], "l": m["label"]}
+                                 for m in res["items"] if m["area"] == a[0]]) for a in AREAS)})
     # Only what needs doing now. Things not bought yet are the supply run's job (they'd keep
     # this on for weeks while the stores are built up), and a check that's never been done
     # isn't overdue.
@@ -2294,7 +2856,7 @@ DASH_WHY = """{% set a = 'sensor.dads_army_alert_level' -%}
 - {{ scale[i.level - 1].emoji if scale else '' }} {{ i.title }} ({{ i.name | lower }})
 {%- endfor %}
 {%- if state_attr(a, 'escalated') %}
-- ⬆️ Raised to SEVERE because the stores wouldn't last 3 days, so you'd be less able to cope
+- ⬆️ Raised to SEVERE because {{ state_attr(a, 'escalated_why') or "the stores wouldn't last 3 days" }}, so you'd be less able to cope
 {%- endif %}
 {%- if not r %}
 Nothing is raising the level.
@@ -2325,14 +2887,14 @@ Dads Army works out a household alert level from the warnings in force where you
 
 ### How Dads Army decides
 
-The level is the most serious of these. If it's SUBSTANTIAL and your food or water wouldn't last 3 days, it goes up to SEVERE, because you'd be less able to cope. Only real danger makes it CRITICAL.
+The level is the most serious of these. If it's SUBSTANTIAL and you'd be less able to cope, it goes up to SEVERE: when your food or water wouldn't last 3 days, when there's a power cut and you have no torches or power bank, or when the home is cold and you have no blankets or warm clothes. Only real danger makes it CRITICAL.
 
 | Level | Warnings | At home (your sensors) | Stores |
 |:--|:--|:--|:--|
 | CRITICAL | Emergency Alert; severe flood warning | Gas, carbon monoxide or smoke alarm | |
 | SEVERE | Red weather warning; flood warning | Power cut over 12 hours, or with the backup battery under 20%; coldest room under 9°C; warmest room 33°C or more; PM2.5 75 µg/m³ or more | |
 | SUBSTANTIAL | Amber weather warning; a possible fire within 3 km | Power cut; water leak; coldest room under 12°C; warmest room 30°C or more; −10°C or colder, or 35°C or hotter, outside; PM2.5 55 or more | |
-| MODERATE | Yellow weather warning; flood alert; a disaster near the UK; a possible fire nearby | Coldest room under 16°C; warmest room 27°C or more; −5°C or colder, or 30°C or hotter, outside; humidity 80% or more; internet down; PM2.5 35 or more | Food or water for under 3 days; kit under half stocked |
+| MODERATE | Yellow weather warning; flood alert; a disaster near the UK; a possible fire nearby | Coldest room under 16°C; warmest room 27°C or more; −5°C or colder, or 30°C or hotter, outside; humidity 80% or more; internet down; PM2.5 35 or more | Food or water for under 3 days; an area of resilience missing its essentials |
 | LOW | None of the above | | |
 
 UKHSA advises heating the rooms you use to at least 18°C. Below that, Dads Army adds cold-weather advice even at LOW.
@@ -2343,12 +2905,58 @@ The national threat level, set by MI5's Joint Terrorism Analysis Centre, uses th
 
 ### Where the advice comes from
 
-- **UK Government:** advice from Prepare (gov.uk), the NHS, UKHSA, the Met Office, the Environment Agency, DEFRA, Ofgem, the Foreign Office and the Fire Kills campaign. It's put into plain statements, not quoted word for word.
+- **UK Government:** advice from Be Ready (gov.uk), Ofcom, the NHS, UKHSA, the Met Office, the Environment Agency, DEFRA, Ofgem, the Foreign Office and the Fire Kills campaign. It's put into plain statements, not quoted word for word.
 - **SAS Survival Handbook:** John "Lofty" Wiseman's PLAN priorities (Protection, Location, Acquisition, Navigation), applied to a household. These are paraphrased, not quoted.
 - **Fire & rescue services** and **Electricity networks (105):** their standard public advice.
 - **Dads Army tip:** practical hints from the app itself.
 
 Always follow official advice and the emergency services. In an emergency, call 999."""
+
+# Resilience on the Home front: the ten areas two to a row, and what to do next.
+DASH_RESILIENCE = """{% set a = 'sensor.dads_army_resilience' -%}
+{% set ar = state_attr(a, 'areas') or [] -%}
+{% set nx = state_attr(a, 'next_steps') or [] -%}
+{% if not ar -%}
+Dads Army isn't sending updates. Check the app is running.
+{%- else -%}
+## {{ states(a) }}% ready
+<small>{{ state_attr(a, 'done') }} of {{ state_attr(a, 'total') }} recommendations done, across {{ ar | count }} areas</small>
+
+| | Area | Ready | | Area | Ready |
+|:-:|:--|--:|:-:|:--|--:|
+{% for i in range(0, ar | count, 2) -%}
+{%- set x = ar[i] -%}
+{%- set y = ar[i + 1] if i + 1 < ar | count else none -%}
+| {{ x.emoji }} | {{ x.short }} | {{ x.dot }} {{ x.pct }}% | {% if y %}{{ y.emoji }} | {{ y.short }} | {{ y.dot }} {{ y.pct }}%{% else %} | | {% endif %} |
+{% endfor %}
+{%- if nx %}
+
+**Next:** {% for n in nx[:3] %}{{ n.emoji }} {{ n.title }}{% if not loop.last %} · {% endif %}{% endfor %}
+{%- endif %}
+{%- endif %}"""
+
+DASH_RES_INTRO = """{% set a = 'sensor.dads_army_resilience' -%}
+{% if state_attr(a, 'areas') -%}
+## {{ states(a) }}% ready
+{{ state_attr(a, 'done') }} of {{ state_attr(a, 'total') }} recommendations done.
+{%- endif %}
+
+Being ready isn't just food and water. Each area has things to have, know or do, mostly from the UK Government's **Be Ready** checklist, Ofcom and Fire Kills.
+
+✅ done · 🔶 partly · ⬜ not yet · ➖ not for you
+
+Dads Army ticks off what it can see in your stores, plan, checks and Home Assistant. Tick the rest off in Dads Army, or say they're not for you."""
+
+DASH_RES_AREA = """{% set ar = (state_attr('sensor.dads_army_resilience', 'areas') or []) | selectattr('id', 'eq', 'AREA_ID') | list -%}
+{% set ms = (state_attr('sensor.dads_army_resilience', 'measures') or {}).get('AREA_ID', []) -%}
+{% if ar -%}
+**{{ ar[0].dot }} {{ ar[0].pct }}% ready** · {{ ar[0].done }} of {{ ar[0].total }} done
+{% for m in ms %}
+- {{ {'done': '✅', 'partly': '🔶', 'na': '➖'}.get(m.s, '⬜') }} {% if m.s == 'na' %}~~{{ m.t }}~~{% else %}{{ m.t }}{% endif %}{% if m.p == 3 and m.s not in ('done', 'na') %} · **essential**{% endif %} <small>({{ m.l }})</small>
+{%- endfor %}
+{%- else -%}
+Dads Army isn't sending updates. Check the app is running.
+{%- endif %}"""
 
 DASH_CHECKS = """{% set c = state_attr('sensor.dads_army_checks_due', 'items') or [] -%}
 {% for i in c[:8] %}
@@ -2379,8 +2987,10 @@ def dashboard_config():
             c["icon"] = icon
         return c
 
-    def heading(text, icon, badges=None):
-        h = {"type": "heading", "heading": text, "icon": icon}
+    def heading(text, icon=None, badges=None):
+        h = {"type": "heading", "heading": text}
+        if icon:
+            h["icon"] = icon
         if badges:
             h["badges"] = badges
         return h
@@ -2390,6 +3000,7 @@ def dashboard_config():
     level = "sensor.dads_army_alert_level"
     go_why = {"action": "navigate", "navigation_path": "/%s/alert-level" % DASH_URL}
     go_levels = {"action": "navigate", "navigation_path": "/%s/alert-levels" % DASH_URL}
+    go_res = {"action": "navigate", "navigation_path": "/%s/resilience" % DASH_URL}
     info = [{"type": "entity", "entity": level, "icon": "mdi:information-outline", "show_icon": True,
              "show_state": False, "tap_action": go_levels}]
 
@@ -2413,14 +3024,15 @@ def dashboard_config():
         {"type": "grid", "cards": [
             heading("Today's checklist", "mdi:clipboard-check-outline"),
             dict(tile("sensor.dads_army_checks_due", "Checks due", "purple"), **full)] + checklist},
+        # Ten areas, not just food and water.
         {"type": "grid", "cards": [
-            heading("Readiness", "mdi:shield-home"),
-            dict({"type": "gauge", "entity": "sensor.dads_army_readiness", "name": "Readiness", "min": 0, "max": 100,
-                  "needle": True, "severity": {"green": 100, "yellow": 50, "red": 0}}, **full),
+            heading("Resilience", "mdi:shield-half-full"),
+            dict({"type": "markdown", "content": DASH_RESILIENCE}, **full),
             tile("sensor.dads_army_hold_out", "Hold out", None, "mdi:shield-home"),
             tile("sensor.dads_army_supplies", "Daily supplies"),
-            tile("sensor.dads_army_food_days", "Food"),
-            tile("sensor.dads_army_water_days", "Water")]},
+            dict({"type": "tile", "entity": "sensor.dads_army_resilience", "name": "All recommendations",
+                  "icon": "mdi:format-list-checks", "hide_state": True, "tap_action": go_res,
+                  "icon_tap_action": go_res}, **full)]},
         {"type": "grid", "cards": [
             heading("Stores", "mdi:package-variant"),
             tile("sensor.dads_army_expired", "Expired", "red"),
@@ -2444,8 +3056,8 @@ def dashboard_config():
     return {"views": [{"title": "Home front", "path": "home-front", "type": "sections", "max_columns": 3,
                        "badges": [{"type": "entity", "entity": level, "name": "Alert level",
                                    "show_name": True, "tap_action": go_why},
-                                  {"type": "entity", "entity": "sensor.dads_army_readiness", "name": "Readiness",
-                                   "show_name": True},
+                                  {"type": "entity", "entity": "sensor.dads_army_resilience", "name": "Resilience",
+                                   "show_name": True, "tap_action": go_res},
                                   {"type": "entity", "entity": "sensor.dads_army_hold_out", "name": "Hold out",
                                    "show_name": True},
                                   {"type": "entity", "entity": "binary_sensor.dads_army_attention",
@@ -2463,7 +3075,19 @@ def dashboard_config():
                                dict({"type": "markdown", "content": DASH_WHY}, **full)]}]},
                       # No back_path: back goes to whichever page opened it.
                       {"title": "What the levels mean", "path": "alert-levels", "subview": True, "type": "panel",
-                       "cards": [{"type": "markdown", "content": DASH_LEVELS_PAGE}]}]}
+                       "cards": [{"type": "markdown", "content": DASH_LEVELS_PAGE}]},
+                      {"title": "Resilience", "path": "resilience", "subview": True, "type": "sections",
+                       "max_columns": 3, "back_path": "/%s/home-front" % DASH_URL,
+                       "sections": [{"type": "grid", "cards": [
+                           heading("Resilience", "mdi:shield-half-full"),
+                           dict({"type": "markdown", "content": DASH_RES_INTRO}, **full),
+                           dict({"type": "button", "name": "Tick things off in Dads Army", "icon": "mdi:open-in-app",
+                                 "show_state": False, "tap_action": {"action": "navigate",
+                                                                     "navigation_path": app_panel()}}, **full)]}] + [
+                           {"type": "grid", "cards": [
+                               heading("%s %s" % (emoji, name)),
+                               dict({"type": "markdown", "content": DASH_RES_AREA.replace("AREA_ID", aid)}, **full)]}
+                           for aid, name, _, emoji in AREAS]}]}
 
 
 def ha_dashboard():
@@ -3416,19 +4040,19 @@ def say(source, body, text):
 # to a household. Neither is quoted word for word.
 GUIDE = {
     "level1": [
-        say(GOV, "Prepare", "Keep an emergency kit at home and build it up over time: water, food, a torch, a battery "
-                            "or wind-up radio, spare batteries and a first aid kit."),
+        say(GOV, "Be Ready", "Keep an emergency kit at home and build it up over time: water, food, a torch, a battery "
+                             "or wind-up radio, spare batteries and a first aid kit."),
         say(SAS, "PLAN", "Work through PLAN before you need it: how you'd protect the household, how people would know "
                          "where you are, how you'd get water and food, and where you'd go."),
     ],
     "level2": [
-        say(GOV, "Prepare", "Keep up with the forecast and local news, and keep phones and power banks charged."),
+        say(GOV, "Be Ready", "Keep up with the forecast and local news, and keep phones and power banks charged."),
         say(SAS, "PLAN: Protection", "Protection comes first: think through what would keep everyone warm, dry and "
                                      "safe if things got worse."),
     ],
     "level3": [
-        say(GOV, "Prepare", "Have enough drinking water for at least 3 days: 3 litres per person per day."),
-        say(GOV, "Prepare", "Check on neighbours and relatives who may need help, especially older people."),
+        say(GOV, "Be Ready", "Have enough drinking water for at least 3 days: 3 litres per person per day."),
+        say(GOV, "Be Ready", "Check on neighbours and relatives who may need help, especially older people."),
         say(SAS, "PLAN: Location", "Let people know your situation: tell your out-of-area contact what's happening and "
                                    "where you are."),
         say(SAS, "PLAN: Acquisition", "Get water and food in hand while you still can, and use what spoils first."),
@@ -3489,8 +4113,8 @@ GUIDE = {
                         "condition."),
     ],
     "wx_wind": [
-        say(GOV, "Prepare", "Bring in or tie down anything that could blow about, and keep torches handy in case the "
-                            "power goes."),
+        say(GOV, "Met Office", "Bring in or tie down anything that could blow about, and keep torches handy in case "
+                               "the power goes."),
         say(NETWORKS, "105", "To report or check a power cut, call 105. It's free from any phone."),
     ],
     "wx_rain": [
@@ -3515,7 +4139,7 @@ GUIDE = {
         say(GOV, "Fire Kills", "If there's a fire: get out, stay out, and call 999. Close doors behind you as you go."),
     ],
     "leak": [
-        say(GOV, "Prepare", "Turn the water off at the stopcock, and keep away from any electrics near the water."),
+        say(GOV, "Be Ready", "Turn the water off at the stopcock, and keep away from any electrics near the water."),
     ],
     "power_cut": [
         say(NETWORKS, "105", "To report or check a power cut, call 105. It's free from any phone."),
@@ -3554,19 +4178,20 @@ GUIDE = {
         say(FIRE, "", "If the smoke is from a fire nearby, keep windows and doors closed."),
     ],
     "internet_down": [
-        say(GOV, "Prepare", "Without the internet, use a battery or wind-up radio for local news and emergency "
-                            "information."),
+        say(GOV, "Be Ready", "Without the internet, use a battery or wind-up radio for local news and emergency "
+                             "information."),
         say(TIP, "", "Warnings can't update without the internet, so the ones shown may be out of date."),
     ],
     "food_low": [
-        say(GOV, "Prepare", "Aim for enough food to last at least 3 days, and build it up over time."),
+        say(GOV, "Be Ready", "Aim for enough food to last at least 3 days, and build it up over time."),
     ],
     "water_low": [
-        say(GOV, "Prepare", "Store at least 3 litres of drinking water per person per day, for at least 3 days."),
+        say(GOV, "Be Ready", "Store at least 3 litres of drinking water per person per day, for at least 3 days."),
     ],
-    "kit_low": [
-        say(GOV, "Prepare", "The basics: a torch, a battery or wind-up radio, spare batteries, a power bank and a first "
-                            "aid kit."),
+    "essentials": [
+        say(GOV, "Be Ready", "Build your kit up over time: you don't need to buy everything at once. Start with a "
+                             "torch, a battery or wind-up radio, a power bank and a first aid kit."),
+        say(TIP, "", "Work through the essentials first. They're marked in each area under Resilience on the Sitrep."),
     ],
 }
 for _k in ("cool_indoor",):
@@ -3812,16 +4437,26 @@ def assess(s, home):
                 break
 
     # The stores.
-    weak = False
+    weak = []
     if s["people"]:
         if s["food_days"] < 3:
             add(2, "food_low", "Food would last %s day%s" % (_f(s["food_days"]), "" if s["food_days"] == 1 else "s"))
-            weak = True
         if s["water_days"] < 3:
             add(2, "water_low", "Water would last %s day%s" % (_f(s["water_days"]), "" if s["water_days"] == 1 else "s"))
-            weak = True
-    if s.get("kit_items") and s["kit_stocked_pct"] < 50:
-        add(2, "kit_low", "Kit %d%% stocked" % s["kit_stocked_pct"])
+        if s["food_days"] < 3 or s["water_days"] < 3:
+            weak.append("the stores wouldn't last 3 days")
+    # Resilience: an area without its essentials (food and water have their own rule above).
+    gaps = [a for a in (s.get("resilience") or {}).get("areas", [])
+            if [m for m in a["essentials_missing"] if m not in DAYS_IDS]]
+    if gaps:
+        add(2, "essentials", "Essentials missing: " + and_list([a["name"] for a in gaps]))
+    # In a power cut or a cold home, missing kit for it makes things worse.
+    missing = set(m for a in gaps for m in a["essentials_missing"])
+    serious = set(f["key"] for f in factors if f["level"] >= 3)
+    if serious & {"power_cut", "power_cut_long", "battery_low"} and missing & {"power_torch", "power_bank"}:
+        weak.append("there's little backup power or light")
+    if serious & {"cold_indoor", "freezing_out"} and missing & {"warm_bedding", "warm_clothes"}:
+        weak.append("there's little to keep warm with")
 
     level = max([f["level"] for f in factors] + [1])
     escalated = False
@@ -3850,6 +4485,8 @@ def assess(s, home):
     name, colour, emoji, meaning, _ = LEVELS[level - 1]
     return {"level": level, "name": name, "colour": colour, "emoji": emoji, "meaning": meaning,
             "escalated": escalated,
+            # Why it went up to SEVERE: "the stores wouldn't last 3 days", "there's little backup power or light"...
+            "escalated_why": " and ".join(weak) if escalated else "",
             "reasons": [{"level": f["level"], "name": LEVELS[f["level"] - 1][0], "title": f["title"], "key": f["key"]}
                         for f in reasons],
             "notes": [f["title"] for f in factors if f["level"] < 2],

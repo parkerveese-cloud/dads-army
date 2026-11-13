@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.9.0
+
+- **Resilience, in ten areas.** Being ready isn't just food and water. Dads Army now looks at:
+  - water
+  - food and cooking
+  - power and light
+  - warmth
+  - communications
+  - health
+  - hygiene
+  - fire and home safety
+  - money and documents
+  - your plan for getting out
+
+  Each area has a score, and the Sitrep shows them all just under the alert level.
+- **About 65 recommendations**, each marked essential, recommended or extra, and labelled with its source: mostly the UK Government's **Be Ready** checklist, **Ofcom** and **Fire Kills**. They include:
+  - a UPS for the router and Home Assistant
+  - a battery or wind-up radio
+  - a battery backup for a digital landline
+  - walkie-talkies
+  - power banks and spare batteries
+  - smoke and carbon monoxide alarms
+  - the Priority Services Register
+- **Ticked off for you** where Dads Army can see it, in your stores, plan, checks, warnings and home sensors. Tick the rest off yourself, or say they're not for you.
+  - **Add to stores** puts anything missing on the supply run.
+  - **Next steps** shows what to do first.
+- **The alert level** now takes resilience into account. An area missing an essential keeps it at MODERATE or higher, in place of the old "kit under half stocked" rule. In a power cut with no torches or power bank, or a cold home with no blankets or warm clothes, SUBSTANTIAL goes up to SEVERE.
+- **Home Assistant.**
+  - New `sensor.dads_army_resilience`.
+  - The Home front dashboard has a **Resilience** section, in place of the food-and-water gauge, and an **All recommendations** page. Dads Army offers to update the dashboard.
+  - The weekly round-up ends with your resilience and what to do next. Re-import the blueprint.
+- The UK Government's Prepare campaign is now called **Be Ready**, and the advice is labelled to match.
+
 ## 1.8.1
 
 - **A smaller alert level on the Home front dashboard**, so everything else fits on a tablet without scrolling far.

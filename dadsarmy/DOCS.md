@@ -28,7 +28,8 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_checks_due` | Routine checks that are due, overdue or not done yet | `items` (each has `name`, `due`, `days`, `every` and `text`), `due_today`, `due_soon` (within a week), `next_check`, `checks_total` |
 | `sensor.dads_army_stores_value` | What the stores are worth, in £, from the prices you've set | `supply_run_cost`, `priced_items`, `items_total` |
 | `sensor.dads_army_warnings` | Official warnings in force for where you live (see **Warnings** below). 0 while warnings are switched off. | `items` (each has `title`, `level`, `severity` 1–3, `source`, `area`, `when`, `url` and `text`), `highest` (yellow, amber or red), `max_severity`, `enabled`, `checked_at`, `health_news` |
-| `sensor.dads_army_alert_level` | The household alert level: LOW, MODERATE, SUBSTANTIAL, SEVERE or CRITICAL (see below) | `level` (1–5), `meaning`, `reasons`, `guidance` (each with `label`, `source` and `text`), `scale`, `escalated`, `notes` |
+| `sensor.dads_army_alert_level` | The household alert level: LOW, MODERATE, SUBSTANTIAL, SEVERE or CRITICAL (see below) | `level` (1–5), `meaning`, `reasons`, `guidance` (each with `label`, `source` and `text`), `scale`, `escalated`, `escalated_why`, `notes` |
+| `sensor.dads_army_resilience` | How resilient the household is, in %: the average of ten areas, from water and power to communications and safety (see **Resilience** below) | `areas` (each with `name`, `pct`, `dot`, `done`, `total`, `essentials_missing` and `next`), `next_steps`, `measures` (every recommendation, by area), `done`, `total` |
 | `binary_sensor.dads_army_attention` | **On** when something needs doing now: stock past its best-before date, a check that's overdue, or a serious warning (amber or worse). Things you haven't bought yet don't count: they're on the supply run. | `reasons` |
 
 Each list holds up to 30 entries; `total` gives the full count. The numbers are recorded in Home Assistant's history, so you can chart how your readiness changes over time.
@@ -53,7 +54,7 @@ A **Home front** dashboard appears in the Home Assistant sidebar and in the Comp
   - Home Assistant has no pop-ups of its own, so these open as pages with a back arrow.
 - **Warnings** in force for where you live
 - **Today's checklist:** the routine checks that are due, ready to tick off (see below)
-- **Readiness:** the gauge, plus how long you could hold out, food, water and daily supplies
+- **Resilience:** how ready you are in each of the ten areas, two to a row, with the next things to do. **All recommendations** (or the **Resilience** badge) opens a page with every recommendation, area by area, and what's done.
 - **Stores:** expired, expiring soon, out of stock, running low, kit stocked, what the stores are worth, and what to use first
 - **Supply run**, with your supply run list if you've linked one, and a button that opens Dads Army
 - a graph of the days you could last, over the last month
@@ -196,7 +197,7 @@ Two ready-made automations (blueprints) send Dads Army news to your phone. You n
 | Blueprint | What it sends |
 |---|---|
 | **Dads Army: phone alerts** | When the household alert level goes up (to SUBSTANTIAL or higher unless you choose otherwise). Straight away when a new warning comes in (amber and worse unless you choose otherwise), and when something runs out. Every morning (8:30 unless you change it), anything that went out of date overnight, anything on its last day, and any routine check that falls due that day. |
-| **Dads Army: weekly round-up** | Once a week (Sunday 6pm unless you change it): any warnings in force, what to use first, anything out of date, checks that are due, the supply run, what runs out first, and how long you could hold out. |
+| **Dads Army: weekly round-up** | Once a week (Sunday 6pm unless you change it): any warnings in force, what to use first, anything out of date, checks that are due, the supply run, what runs out first, how long you could hold out, and how resilient you are, with the next things to do. |
 
 **Already set these up before Dads Army 1.6.0?** Re-import them to get warnings, checks and daily supplies: go to **Settings → Automations & scenes → Blueprints**, open the **⋮** menu next to each Dads Army blueprint, and choose **Re-import blueprint**. Your automations keep their settings.
 
@@ -248,13 +249,15 @@ It's worked out from three things:
 
 - **Warnings in force**, if you've switched them on.
 - **Your home's own sensors**, if you've chosen them (see below).
-- **Your stores:** food or water for under 3 days, or kit under half stocked, makes it at least MODERATE. If it's SUBSTANTIAL and the food or water wouldn't last 3 days, it goes up to SEVERE. Only real danger makes it CRITICAL.
+- **Your stores and resilience:** food or water for under 3 days, or any area of resilience missing an essential, makes it at least MODERATE.
+
+If it's SUBSTANTIAL and you'd be less able to cope, it goes up to SEVERE: when the food or water wouldn't last 3 days, when there's a power cut and you have no torches or power bank, or when the home is cold and you have no blankets or warm clothes. Only real danger makes it CRITICAL.
 
 The exact rules are on the dashboard's **What the levels mean** page, and behind the **i** next to the level in the app.
 
 Each level comes with **what to do now**, worst problem first. Each piece of advice is labelled with where it comes from:
 
-- **UK Government:** advice from Prepare (gov.uk), the NHS, UKHSA, the Met Office, the Environment Agency, DEFRA, Ofgem, the Foreign Office and the Fire Kills campaign. It's put into plain statements, not quoted word for word.
+- **UK Government:** advice from Be Ready (gov.uk), Ofcom, the NHS, UKHSA, the Met Office, the Environment Agency, DEFRA, Ofgem, the Foreign Office and the Fire Kills campaign. It's put into plain statements, not quoted word for word.
 - **SAS Survival Handbook:** John "Lofty" Wiseman's PLAN priorities (Protection, Location, Acquisition of water and food, Navigation), applied to a household. These are paraphrased, not quoted.
 - **Fire & rescue services**, **Electricity networks (105)** and **Dads Army tip** for the rest.
 
@@ -276,6 +279,41 @@ In Dads Army, open **HQ → Home sensors** (or tap **?**, then **Choose home sen
 | Outdoor air quality (PM2.5) | 35 µg/m³ or more (MODERATE), 55 (SUBSTANTIAL) or 75 (SEVERE) |
 
 For **mains electricity**, choose something that only changes in a power cut, such as a UPS status, a mains voltage sensor or a power-cut sensor. Without a UPS, Home Assistant itself stops in a power cut. Power cuts and their length are noted in Dads Army's activity log.
+
+## Resilience
+
+Being ready isn't just food and water. Dads Army looks at ten areas, and food and water are two of them:
+
+| | Area | For example |
+|:-:|:--|:--|
+| 💧 | Water | 3 days of drinking water, a way to make water safe, knowing where the stopcock is |
+| 🥫 | Food & cooking | 3 days of food that needs no fridge, a tin opener, a camping stove and fuel |
+| 🔋 | Power & light | Torches and batteries, a charged power bank, a UPS for the router and Home Assistant, the Priority Services Register |
+| 🧣 | Warmth | Blankets or sleeping bags, warm layers, a room you can keep warm |
+| 📻 | Communications | A battery or wind-up radio, numbers on paper, Emergency Alerts, a battery backup for a digital landline, walkie-talkies |
+| 🩹 | Health & medicines | A first aid kit, spare medicines, a written list of medicines, ICE contacts on phones |
+| 🧻 | Hygiene & sanitation | Sanitiser, wipes and toilet roll, an emergency toilet |
+| 🧯 | Fire & home safety | Smoke and carbon monoxide alarms, knowing how to turn off the gas, a fire blanket |
+| 💷 | Money & documents | Cash in coins and notes, copies of documents, insurance details |
+| 🎒 | Plan & getting out | A household plan, two meeting places, a grab bag, escape routes, neighbours who need checking on |
+
+There are about 65 recommendations in all. Each one is marked **essential**, **recommended** or **extra**, and labelled with where it comes from: mostly the UK Government's **Be Ready** checklist, **Ofcom** (staying connected in a power cut) and the **Fire Kills** campaign, plus a few Dads Army tips.
+
+**Dads Army ticks off what it can see for itself:**
+
+- **Your stores:** a radio, torches, a power bank, a first aid kit and so on, against their targets.
+- **The emergency plan:** where the stopcock is, meeting places, numbers on paper.
+- **Routine checks**, if they're up to date.
+- **Warnings**, if they're switched on.
+- **Home sensors:** a UPS battery, smoke and carbon monoxide alarms.
+
+**You tick the rest off yourself.** Or tap **Not for us**, for example for a gas tap if you have no gas. **Add to stores** puts anything missing into the stores at zero, so it's on the supply run.
+
+**How it's scored:** each area's score is how much of it is done. Essentials count three times as much as extras, and recommended things twice as much. Partly done counts in part, and anything not for you is left out. The overall figure is the average of the ten areas.
+
+It shows on the Sitrep, under the alert level, with the next steps. Tap an area to see what's done and what's left. An area missing an essential keeps the household alert level at MODERATE or higher.
+
+Some recommendations only show when they apply. Baby supplies and school numbers show if you have children, pet food if you have pets, and the sensor ones only in Home Assistant.
 
 ## Warnings
 
