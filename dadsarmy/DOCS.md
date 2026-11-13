@@ -7,6 +7,43 @@ A stores tracker for food, water and emergency kit, built to be used from your p
 - **In Home Assistant:** click **Dads Army** in the sidebar. This also works in the Home Assistant Companion app, including away from home if you use Home Assistant Cloud.
 - **Straight from the phone's browser:** open `http://<your-home-assistant-address>:8080` while on the home Wi-Fi, then use **Add to Home Screen** to give it its own app icon.
 
+## Household and targets
+
+Set these in **HQ**:
+
+- **Household:** adults and children (at least one person), how much they eat and drink, and any **pets**. Give pets the calories a day you want counted (if their food is stored under **Food**) and the water they drink. Pets are included in food days, water days and hold-out. With 0 pets, nothing changes.
+- **Targets from the starter list keep up with you.** Starter targets that depend on the household (food, water, toilet roll and so on) are worked out again when you change the household, the pets or the readiness target. In an item's details the target says *scales with household*. Set a target yourself and that item keeps your number from then on. Starter items from an older version that still have their original target scale too.
+- **Expiry warnings:** stock is flagged this many days before its best-before date. Under **Different warning for a category** you can give a category its own warning, for example 90 days for Medical. Leave a box empty to use the main setting.
+- **Expired stock doesn't count towards a target.** If 2 of your 6 tins are out of date, the supply run asks for the 2 again and says so, for example *Get 2 tins · have 4 of 6 · 2 expired*.
+- **Undo** follows **Use**, **Add stock**, **Got it**, removing a batch and deleting. It's only offered until the next change, and if the item has been changed since (on another phone, say), Dads Army says so rather than undoing over the top of it.
+
+## Live alerts
+
+HQ → **Live alerts** checks official UK feeds and shows them on a map on the Sitrep, with a colour-coded summary for each source underneath. Tap a summary for its details, or anything on the map for the official page.
+
+| Source | What | Refresh |
+|---|---|---|
+| Environment Agency | Flood alerts and warnings, all of England (outlines for ones near you) | 15 min |
+| Met Office | Yellow, amber and red warnings, every UK region | 15 min |
+| UK Power Networks + National Grid (NGED) | Live power cuts: London, South East, East of England, Midlands, South West and Wales | 10 min |
+| NASA FIRMS | Satellite heat detections in the last 24 hours (UK and Ireland, offshore flares left out) | 30 min |
+| Environment Agency river gauges | River levels against each gauge's normal range: the gauges near you, and any running high elsewhere in England | 30 min |
+| European Central Bank (via frankfurter.dev) | The pound against seven major currencies, daily reference rates | 6 hours |
+| Yahoo Finance chart data (unofficial) | Nine stock indices, Brent crude, wheat and gold | 3 hours |
+| National Gas | Great Britain's gas in storage: % full, the week's change, days at the current rate | 6 hours |
+| Elexon | National grid warnings (margin notices, demand control) | 30 min |
+| DEFRA UK-AIR | Air pollution index for your region | 60 min |
+| NOAA | Geomagnetic storms (off by default) | 60 min |
+
+**Near you or elsewhere.** Your county, Met Office region, postcode districts and "near you" distance decide what's yours. Only those raise the alert level and the Home Assistant sensors. Everything else in the UK is drawn smaller and fainter for context; switch it off with *Across the UK*.
+
+**Privacy.** Every feed is a national list, filtered on the Pi, so none of them is told where you live. The map is centred on a postcode you choose (looked up once at postcodes.io when you save it) or Home Assistant's home. Its background tiles come from OpenStreetMap, which can see the area you're viewing; switch the map off if you'd rather it didn't.
+
+Home Assistant gets `sensor.dads_army_live_alerts` (how many near you, the list in `alerts`, and `elsewhere_in_uk`) and `sensor.dads_army_live_alert_level` (`none`, `info`, `minor`, `moderate` or `severe`).
+
+These feeds help you get ready. They don't replace official warnings, and the Environment Agency says its API isn't for safety-critical use. Heat detections can be controlled burns or industrial sites. In an emergency, call 999.
+Data: Environment Agency and DEFRA (Open Government Licence v3.0), Met Office (Crown copyright), UK Power Networks (CC BY 4.0), National Grid Electricity Distribution, National Gas Transmission, NASA FIRMS, Elexon BMRS, NOAA SWPC, postcodes.io (ONS, OGL). Map: Leaflet, © OpenStreetMap contributors.
+
 ## Dashboard sensors
 
 While Dads Army is running, it keeps these sensors up to date in Home Assistant. They change within a few seconds of any update in the app.
@@ -19,9 +56,9 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_water_days` | Days of water | |
 | `sensor.dads_army_kit_stocked` | Kit and supplies against their targets, in % | |
 | `sensor.dads_army_out_of_stock` | Items with a target but none in stock | `items` (each has `name`, `get`, `unit` and `text`), `total` |
-| `sensor.dads_army_low_stock` | Items with some stock, but below target | `items`, `total`, `below_target_total` |
-| `sensor.dads_army_expired` | Items with stock past its best-before date | `items` (each has `name`, `qty`, `expiry`, `days`, `location` and `text`), `total`, `newly_expired` (went out of date overnight) |
-| `sensor.dads_army_expiring_soon` | Items reaching their best-before date within your warning window (HQ) | `items`, `total`, `warn_days`, `expires_today` (on their last day) |
+| `sensor.dads_army_low_stock` | Items with some stock, but below target | `items` (each also has `have`, `target` and `expired`: how much is out of date), `total`, `below_target_total` |
+| `sensor.dads_army_expired` | Items with stock past its best-before date | `items` (each has `name`, `qty`, `expiry`, `days`, `location` and `text`), `total`, `newly_expired` (any batch that went out of date overnight) |
+| `sensor.dads_army_expiring_soon` | Items reaching their best-before date within your warning window (HQ, including any warning for its category) | `items`, `total`, `warn_days`, `expires_today` (any batch on its last day) |
 | `sensor.dads_army_next_expiry` | Date of the next thing to expire | `name`, `qty`, `location`, `days` |
 | `sensor.dads_army_supply_run` | Number of things on the shopping list | `items`, `extras`, `cost` (from the prices you've set, in £) |
 | `sensor.dads_army_supplies` | Days until the first thing with a daily use runs out (such as tablets or toilet roll). Unknown if nothing has a daily use set. | `items` (each has `name`, `days`, `have`, `per_day` and `text`), `runs_out_first`, `target_days` |
@@ -32,7 +69,7 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_resilience` | How resilient the household is, in %: the average of ten areas, from water and power to communications and safety (see **Resilience** below) | `areas` (each with `name`, `pct`, `dot`, `done`, `total`, `essentials_missing` and `next`), `next_steps`, `measures` (every recommendation, by area), `done`, `total` |
 | `binary_sensor.dads_army_attention` | **On** when something needs doing now: stock past its best-before date, a check that's overdue, or a serious warning (amber or worse). Things you haven't bought yet don't count: they're on the supply run. | `reasons` |
 
-Each list holds up to 30 entries; `total` gives the full count. The numbers are recorded in Home Assistant's history, so you can chart how your readiness changes over time.
+Out of stock, running low, kit stocked and the supply run count in-date stock only. Each list holds up to 30 entries; `total` gives the full count. The numbers are recorded in Home Assistant's history, so you can chart how your readiness changes over time.
 
 Home Assistant doesn't keep these sensors after it restarts, so Dads Army sends them again within a minute. While Dads Army is stopped, they show as unavailable.
 
@@ -226,7 +263,8 @@ How it works:
 - **Below-target items** appear as, for example, *Bottled water (5L): 16 bottles*. They update as your stores change and come off the list once you're back up to target.
 - **Ticking off** a below-target item in Home Assistant marks it on the supply run in Dads Army. Tap **Got it** there to put it away with its best-before date.
 - **Deleting** a below-target item in Home Assistant keeps it off the list until the amount you need changes.
-- **Extras** (the "Also get" list) are shared both ways. Add, tick, rename or delete them on either side.
+- **Below-target items that change** are unticked again in Home Assistant: if you ticked off *Tape: 3 rolls* and then used another roll, it comes back as *Tape: 4 rolls*, still to get.
+- **Extras** (the "Also get" list) are shared both ways. Add, tick, rename or delete them on either side. In Dads Army, tap the pencil to change one, or **Got it** to add it to the stores as a new item (it then comes off the list).
 - Anything added to the list in Home Assistant, including by voice, becomes an extra on the supply run.
 
 Changes show up on the other side within about half a minute.
@@ -366,7 +404,9 @@ When you edit an item, **Used a day** says how many your household gets through 
 
 Your data is kept in the app's own storage. It survives restarts and updates, and it's included in your Home Assistant backups. On top of that:
 
-- Dads Army saves a copy of its database every day and keeps the last 14.
+- Dads Army saves a copy of its database every day and keeps the last 14. HQ → **Restore an automatic copy…** lists them with their date and number of items. Pick one, confirm, and it replaces what's in the stores.
+- Before any restore, Dads Army saves a copy of what's there now, and keeps these for at least 14 days. They're in the same list, marked *saved before a restore*, so a restore can be undone.
+- A backup with no items in it would empty the stores, so Dads Army asks you to confirm that first.
 - HQ → **Download backup** saves a copy to your phone.
 - HQ → **Print full inventory** gives you a paper copy to keep with the stores, and **Print emergency plan & checks** gives you the plan.
 

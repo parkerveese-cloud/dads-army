@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Dads Army</title>
 <meta name="description" content="Home front stores tracker">
-<meta name="theme-color" content="#4b5320">
+<meta name="theme-color" content="#24492c" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#14301f" media="(prefers-color-scheme: dark)">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -14,6 +15,10 @@
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="charts.css">
+<link rel="stylesheet" href="screen-sitrep.css">
+<link rel="stylesheet" href="screen-stores.css">
+<link rel="stylesheet" href="screen-hq.css">
 <script src="theme.js"></script>
 </head>
 <body data-view="sitrep">
@@ -26,6 +31,28 @@
       <div class="brand-sub">Home front stores</div>
     </div>
   </div>
+  <nav class="tabs" aria-label="Sections">
+    <button class="tab" data-tab="sitrep">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 17a8.5 8.5 0 1 1 17 0"/><path d="M12 17l4.5-5.5"/><circle cx="12" cy="17" r="1.3"/></svg>
+      <span>Sitrep</span>
+    </button>
+    <button class="tab" data-tab="stores">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="8" width="18" height="12" rx="1.5"/><path d="M3 12h18M10 15.5h4M6.5 8L8 4h8l1.5 4"/></svg>
+      <span>Stores</span>
+    </button>
+    <button class="tab" data-tab="supply">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.5 6H20M10.5 12H20M10.5 18H20"/><path d="M3.5 6l1.6 1.6L8 4.7M3.5 12l1.6 1.6L8 10.7M3.5 18l1.6 1.6L8 16.7"/></svg>
+      <span>Supply run</span><b class="tab-badge" id="supplyBadge" hidden></b>
+    </button>
+    <button class="tab" data-tab="plan">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="4.5" width="14" height="16.5" rx="2"/><path d="M9 4.5V3h6v1.5"/><path d="M8.7 13.2l2.2 2.2 4.4-4.6"/></svg>
+      <span>Plan</span><b class="tab-badge" id="planBadge" hidden></b>
+    </button>
+    <button class="tab" data-tab="hq">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 21V3.5"/><path d="M5.5 4.5h12.5l-2.6 4.25L18 13H5.5"/></svg>
+      <span>HQ</span>
+    </button>
+  </nav>
   <div class="top-actions">
     <div class="conn" id="conn" role="status"><span class="dot"></span><span class="conn-label">HQ</span></div>
     <button class="hdr-help" data-act="help" aria-label="Help">?</button>
@@ -35,35 +62,12 @@
   </div>
 </header>
 
-<div class="offline" id="offline" hidden>
-  Can't reach HQ. Is the Pi switched on, and is this phone on the home Wi-Fi?
+<div class="offline" id="offline" role="status" hidden>
+  Can't reach Dads Army. Check Home Assistant is running and you're connected.
   <button class="link" data-act="retry">Try again</button>
 </div>
 
-<main id="view" aria-live="polite"><div class="loading">Mustering the troops…</div></main>
-
-<nav class="tabs" aria-label="Sections">
-  <button class="tab" data-tab="sitrep">
-    <svg viewBox="0 0 24 24"><path d="M3.5 17a8.5 8.5 0 1 1 17 0"/><path d="M12 17l4.5-5.5"/><circle cx="12" cy="17" r="1.3"/></svg>
-    <span>Sitrep</span>
-  </button>
-  <button class="tab" data-tab="stores">
-    <svg viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="1.5"/><path d="M3 12h18M10 15.5h4M6.5 8L8 4h8l1.5 4"/></svg>
-    <span>Stores</span>
-  </button>
-  <button class="tab" data-tab="supply">
-    <svg viewBox="0 0 24 24"><path d="M10.5 6H20M10.5 12H20M10.5 18H20"/><path d="M3.5 6l1.6 1.6L8 4.7M3.5 12l1.6 1.6L8 10.7M3.5 18l1.6 1.6L8 16.7"/></svg>
-    <span>Supply run</span><b class="tab-badge" id="supplyBadge" hidden></b>
-  </button>
-  <button class="tab" data-tab="plan">
-    <svg viewBox="0 0 24 24"><rect x="5" y="4.5" width="14" height="16.5" rx="2"/><path d="M9 4.5V3h6v1.5"/><path d="M8.7 13.2l2.2 2.2 4.4-4.6"/></svg>
-    <span>Plan</span><b class="tab-badge" id="planBadge" hidden></b>
-  </button>
-  <button class="tab" data-tab="hq">
-    <svg viewBox="0 0 24 24"><path d="M5.5 21V3.5"/><path d="M5.5 4.5h12.5l-2.6 4.25L18 13H5.5"/></svg>
-    <span>HQ</span>
-  </button>
-</nav>
+<main id="view"><div class="loading">Mustering the troops…</div></main>
 
 <div id="sheet-root" hidden>
   <div class="backdrop" data-act="close-sheet"></div>
@@ -80,6 +84,7 @@
 <datalist id="dl-locations"></datalist>
 <input type="file" id="restoreFile" accept=".json,application/json" hidden>
 
+<script src="charts.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

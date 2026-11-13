@@ -22,6 +22,7 @@ Running as a Home Assistant app, it also:
     the home's own sensors, with guidance, as sensor.dads_army_alert_level
   - fires a dads_army_ran_out event when something runs out, and dads_army_warning
     for new Met Office, flood, Emergency Alert or GDACS warnings, for phone alerts
+  - fires a dads_army_alert event for each new live alert or worrying trend
   - can keep the supply run, and the routine checks that are due, in step with
     Home Assistant to-do lists, and build a ready-made dashboard (HQ screen)
 GET /api/summary returns the same figures as JSON for anything else.
@@ -49,7 +50,9 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.9.0"
+import intel
+
+VERSION = "2.0.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -71,6 +74,10 @@ DEFAULT_SETTINGS = {
     "water_per_person": 3,
     "target_days": 30,
     "warn_days": 30,
+    "pets": 0,
+    "kcal_per_pet": 0,
+    "water_per_pet": 0,
+    "category_warn_days": {},   # optional {category: days}, overriding warn_days
 }
 # (min, max, integer?)
 SETTING_RULES = {
@@ -81,7 +88,13 @@ SETTING_RULES = {
     "water_per_person": (0.5, 20, False),
     "target_days": (1, 3650, True),
     "warn_days": (1, 365, True),
+    "pets": (0, 50, True),
+    "kcal_per_pet": (0, 5000, True),
+    "water_per_pet": (0, 20, False),
 }
+# Changing any of these changes what the starter list's targets should be (see rescale_targets).
+HOUSEHOLD_KEYS = ("adults", "children", "kcal_adult", "kcal_child", "water_per_person", "target_days",
+                  "pets", "kcal_per_pet", "water_per_pet")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -96,7 +109,8 @@ CREATE TABLE IF NOT EXISTS items (
     price           REAL    NOT NULL DEFAULT 0,
     notes           TEXT    NOT NULL DEFAULT '',
     created_at      TEXT    NOT NULL,
-    updated_at      TEXT    NOT NULL
+    updated_at      TEXT    NOT NULL,
+    target_rule     TEXT    NOT NULL DEFAULT ''   -- starter list: how the target scales ('' = fixed)
 );
 CREATE TABLE IF NOT EXISTS batches (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,6 +146,30 @@ CREATE TABLE IF NOT EXISTS ha_todo (
     summary TEXT    NOT NULL DEFAULT '',
     done    INTEGER NOT NULL DEFAULT 0
 );
+-- 2.0: one row per local date, for the trend charts (see record_history). written_at isn't sent to the app.
+CREATE TABLE IF NOT EXISTS history (
+    date          TEXT PRIMARY KEY,
+    readiness_pct INTEGER NOT NULL DEFAULT 0,
+    hold_out_days REAL    NOT NULL DEFAULT 0,
+    food_days     REAL    NOT NULL DEFAULT 0,
+    water_days    REAL    NOT NULL DEFAULT 0,
+    kit_pct       INTEGER NOT NULL DEFAULT 0,
+    items         INTEGER NOT NULL DEFAULT 0,
+    in_stock      INTEGER NOT NULL DEFAULT 0,
+    expired       INTEGER NOT NULL DEFAULT 0,
+    expiring      INTEGER NOT NULL DEFAULT 0,
+    below_target  INTEGER NOT NULL DEFAULT 0,
+    alert_level   TEXT    NOT NULL DEFAULT 'none',
+    written_at    TEXT    NOT NULL DEFAULT ''
+);
+-- 2.0: stock leaving through use (Use, and the - stepper), for "about 2 a week" and forecasts.
+CREATE TABLE IF NOT EXISTS usage (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    ts      TEXT    NOT NULL,
+    qty     REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_item ON usage(item_id, ts);
 -- Routine checks: test the alarms, charge the power banks, rotate the water...
 CREATE TABLE IF NOT EXISTS checks (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -316,7 +354,21 @@ class tx(object):
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            DB.execute("COMMIT" if exc_type is None else "ROLLBACK")
+            if exc_type is None:
+                try:
+                    DB.execute("COMMIT")
+                except Exception:
+                    # Don't leave the connection stuck inside a transaction.
+                    try:
+                        DB.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+            else:
+                try:
+                    DB.execute("ROLLBACK")
+                except Exception:
+                    traceback.print_exc()
         finally:
             LOCK.release()
         return False
@@ -334,14 +386,36 @@ def init_db():
     for col, decl in ITEM_UPGRADES:
         if col not in have:
             DB.execute("ALTER TABLE items ADD COLUMN %s %s" % (col, decl))
+    migrate(DB)
     for key, value in DEFAULT_SETTINGS.items():
         DB.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(value)))
+
+
+def migrate(db):
+    """Bring a database made by an older version up to date. Only ever adds things."""
+    cols = set(r[1] for r in db.execute("PRAGMA table_info(items)"))
+    if "target_rule" not in cols:   # 2.0.0: starter targets that scale with the household
+        db.execute("ALTER TABLE items ADD COLUMN target_rule TEXT NOT NULL DEFAULT ''")
+        # Starter items whose target is still exactly what the starter list gives scale from now on.
+        # Any target that was changed by hand won't match, so it stays as it is.
+        ctx = target_ctx(get_settings())
+        rules = dict((name.lower(), (target, kcal, litres)) for name, _, _, kcal, litres, target, _ in STARTER
+                     if not isinstance(target, (int, float)))
+        for r in db.execute("SELECT id, name, kcal_per_unit, litres_per_unit, target_qty FROM items").fetchall():
+            spec = rules.get(r[1].lower())
+            if spec and (r[2], r[3]) == (spec[1], spec[2]) and resolve_target(spec[0], spec[1], spec[2], ctx) == r[4]:
+                db.execute("UPDATE items SET target_rule = ? WHERE id = ?", (clean_rule(list(spec[0])), r[0]))
 
 
 # --------------------------------------------------------------------------
 # Validation helpers
 # --------------------------------------------------------------------------
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
+
+# Plain ASCII numbers only: float() and int() would also take other scripts' digits, "inf" and "1_000".
+NUM_RE = re.compile(r"^\s*[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?\s*$")
+ID_RE = re.compile(r"^[0-9]{1,18}$")
 
 
 def clean_text(value, maxlen, default=""):
@@ -356,6 +430,8 @@ def clean_num(value, default=0.0, lo=0.0, hi=1e7, field="Value"):
     if value is None or value == "":
         return default
     if isinstance(value, bool):
+        raise ApiError(400, "%s must be a number" % field)
+    if isinstance(value, str) and not NUM_RE.match(value):
         raise ApiError(400, "%s must be a number" % field)
     try:
         f = float(value)
@@ -401,8 +477,9 @@ def clean_item(body, partial=False):
 
 
 def insert_item(db, data, created, updated, item_id=None):
-    cols = (("id",) if item_id is not None else ()) + ITEM_FIELDS + ("created_at", "updated_at")
-    vals = ([item_id] if item_id is not None else []) + [data[k] for k in ITEM_FIELDS] + [created, updated]
+    cols = (("id",) if item_id is not None else ()) + ITEM_FIELDS + ("target_rule", "created_at", "updated_at")
+    vals = (([item_id] if item_id is not None else []) + [data[k] for k in ITEM_FIELDS]
+            + [data.get("target_rule", ""), created, updated])
     return db.execute("INSERT INTO items(%s) VALUES (%s)" % (", ".join(cols), ", ".join("?" * len(cols))),
                       vals).lastrowid
 
@@ -459,10 +536,15 @@ def expiry_words(days):
 
 
 def as_int_id(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
+    if isinstance(value, bool):
         raise ApiError(400, "Bad id")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and ID_RE.match(value):
+        return int(value)
+    raise ApiError(400, "Bad id")
 
 
 # --------------------------------------------------------------------------
@@ -482,7 +564,50 @@ def get_settings():
                 out[row["key"]] = json.loads(row["value"])
             except ValueError:
                 pass
+    out["category_warn_days"] = clean_cat_warn(out.get("category_warn_days"), strict=False)
+    if out["adults"] + out["children"] < 1:
+        out["adults"] = 1   # stored by an older version: there's always someone to feed
     return out
+
+
+def clean_cat_warn(value, strict=True, base=None):
+    """Per-category expiry warnings: {category: days}. None, "" or 0 for a category means use warn_days.
+
+    With base, the changes are applied on top of it (so the app can send one category at a time)."""
+    out = dict(base or {})
+    if value is None:
+        return out
+    if not isinstance(value, dict):
+        if strict:
+            raise ApiError(400, "Expiry warnings by category must be a list of categories and days")
+        return out
+    for cat, days in value.items():
+        if cat not in CATEGORIES:
+            if strict:
+                raise ApiError(400, "There's no category called %s" % str(cat)[:20])
+            continue
+        if days in (None, "", 0):
+            out.pop(cat, None)
+            continue
+        try:
+            out[cat] = int(round(clean_num(days, 0, 1, 365, "Warning days")))
+        except ApiError:
+            if strict:
+                raise
+    return out
+
+
+def warn_for(st, cat):
+    """Days before best-before to flag stock in this category."""
+    return st["category_warn_days"].get(cat) or st["warn_days"]
+
+
+def household_needs(st):
+    """(kcal a day, litres a day) for everyone, pets included."""
+    kcal = (st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]
+            + st["pets"] * st["kcal_per_pet"])
+    litres = (st["adults"] + st["children"]) * st["water_per_person"] + st["pets"] * st["water_per_pet"]
+    return kcal, litres
 
 
 def setting_raw(key, default=None):
@@ -594,29 +719,31 @@ def summary():
         plan = get_plan()
     warn = st["warn_days"]
     people = st["adults"] + st["children"]
-    kcal_day = st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]
-    water_day = people * st["water_per_person"]
+    kcal_day, water_day = household_needs(st)
     kcal = litres = 0.0
     kit_n, kit_sum = 0, 0.0
+    in_stock = 0
     value = cost = 0.0
     priced = 0
     low, out, expired, soon, upcoming, supplies = [], [], [], [], [], []
+    newly, today_rows, week_rows = [], [], []
 
     for it in items:
         unit, cat = it["unit"] or "", it["category"]
-        total = sum(b["qty"] for b in it["batches"])
         target = it["target_qty"] or 0
         price = it.get("price") or 0
         per_day = it.get("per_day") or 0
         food = cat == "food" and (it["kcal_per_unit"] or 0) > 0
         water = cat == "water" and (it["litres_per_unit"] or 0) > 0
         dated = []
-        in_date = 0.0
+        total = old = 0.0   # in-date stock, and stock past its best-before
         for b in it["batches"]:
             d = _days_until(b["expiry"], today) if b["expiry"] else None
             fresh = d is None or d >= 0
             if fresh:
-                in_date += b["qty"]
+                total += b["qty"]
+            else:
+                old += b["qty"]
             if food and fresh:
                 kcal += b["qty"] * it["kcal_per_unit"]
             if water and fresh:
@@ -626,33 +753,49 @@ def summary():
                 if d >= 0:
                     upcoming.append((d, it, b))
 
+        if total > 0:
+            in_stock += 1
         if price > 0:
             priced += 1
-            value += total * price
+            value += (total + old) * price
         if per_day > 0:
             # Out-of-date stock doesn't count, just as for food and water.
-            lasts = in_date / per_day
-            text = "%s · %s left, %s a day" % (lasts_words(lasts), qu(in_date, unit), fq(per_day))
-            if total - in_date > 0:
-                text += " (+%s out of date)" % fq(total - in_date)
+            lasts = total / per_day
+            text = "%s · %s left, %s a day" % (lasts_words(lasts), qu(total, unit), fq(per_day))
+            if old > 0:
+                text += " (+%s out of date)" % fq(old)
             supplies.append((lasts, {"id": it["id"], "name": it["name"], "category": cat, "unit": unit,
-                                     "have": _num(in_date), "per_day": _num(per_day), "days": _days(lasts),
+                                     "have": _num(total), "per_day": _num(per_day), "days": _days(lasts),
                                      "text": text}))
+        # Targets count in-date stock only: expired tins need replacing too.
         if target > 0 and cat not in ("food", "water"):
             kit_n += 1
             kit_sum += min(1.0, total / target)
         if target > 0 and total < target:
             get = round(target - total, 3)
             cost += get * price
+            text = "Get %s" % qu(get, unit) + (" · have %s of %s" % (fq(total), fq(target)) if total > 0 else "")
+            if old > 0:
+                text += " · %s expired" % fq(old)
             entry = {"id": it["id"], "name": it["name"], "category": cat, "have": _num(total), "target": _num(target),
-                     "unit": unit, "get": _num(get),
-                     "text": "Get %s" % qu(get, unit) + (" · have %s of %s" % (fq(total), fq(target))
-                                                          if total > 0 else "")}
+                     "unit": unit, "get": _num(get), "expired": _num(old), "text": text}
             if price > 0:
                 entry["cost"] = round(get * price, 2)
             (out if total <= 0 else low).append((total / target, entry))
 
+        # Any batch that went out of date at midnight, or is on its last day (not just the soonest).
+        for day, bucket in ((-1, newly), (0, today_rows), (7, week_rows)):
+            rows = [b for d, b in dated if d == day]
+            if rows:
+                b0 = min(rows, key=lambda b: b["id"])
+                qty = sum(b["qty"] for b in rows)
+                bits = [qu(qty, unit), expiry_words(day)] + ([b0["location"]] if b0["location"] else [])
+                bucket.append((day, {"name": it["name"], "category": cat, "qty": _num(qty), "unit": unit,
+                                     "expiry": b0["expiry"], "days": day, "location": b0["location"] or "",
+                                     "text": " · ".join(bits)}))
+
         # Like the app, an item's expiry state comes from its soonest-dated batch.
+        warn = warn_for(st, cat)
         if dated:
             d0, b0 = min(dated, key=lambda x: (x[0], x[1]["id"]))
             if d0 < 0:
@@ -706,8 +849,9 @@ def summary():
         "version": VERSION,
         "date": today.isoformat(),
         "people": people,
+        "pets": st["pets"],
         "target_days": target_days,
-        "warn_days": warn,
+        "warn_days": st["warn_days"],
         # Hold-out against the readiness target; 100 means the target is met.
         "readiness_pct": min(100, int(math.floor(100.0 * hold / target_days))) if target_days > 0 else 0,
         "hold_out_days": _days(hold),
@@ -717,13 +861,15 @@ def summary():
         "kit_stocked_pct": _round(100.0 * kit_sum / kit_n) if kit_n else 0,
         "kit_items": kit_n,
         "items_total": len(items),
+        "items_in_stock": in_stock,   # items with some in-date stock
         "out_of_stock": ordered(out),
         "low_stock": ordered(low),
         "expired": ordered(expired),
         "expiring_soon": ordered(soon),
         # Best-before was yesterday, so it went out of date at midnight / it's the last day.
-        "newly_expired": ordered([r for r in expired if r[0] == -1]),
-        "expires_today": ordered([r for r in soon if r[0] == 0]),
+        "newly_expired": ordered(newly),
+        "expires_today": ordered(today_rows),
+        "expires_in_7_days": ordered(week_rows),
         "next_expiry": nxt,
         "supply_run": {"below_target": ordered(out) + ordered(low), "extras": extras, "cost": round(cost, 2)},
         # Things with a daily use: how long each lasts, shortest first.
@@ -747,6 +893,134 @@ def summary():
     return out
 
 
+# --------------------------------------------------------------------------
+# History (one row a day, for trends) and usage (for "about 2 a week")
+# --------------------------------------------------------------------------
+HISTORY_FIELDS = ("readiness_pct", "hold_out_days", "food_days", "water_days", "kit_pct", "items", "in_stock",
+                  "expired", "expiring", "below_target", "alert_level")
+HISTORY_DAYS = 120        # sent with /api/state
+HISTORY_MAX_DAYS = 730    # most /api/history will send
+HISTORY_SETTLE = 2.0      # seconds to let a burst of edits settle before writing
+USAGE_KEEP_DAYS = 400
+USAGE_WINDOW = 90         # days the rate of use is worked out over
+USAGE_MIN_WINDOW = 14     # so one use yesterday doesn't predict disaster
+HIST_WAKE = threading.Event()
+HIST_LOCK = threading.Lock()
+TS_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}( [0-9]{2}:[0-9]{2}:[0-9]{2})?$")
+
+
+def alert_level(snap=None):
+    """The live-alerts level for history: 'none' unless live alerts are switched on."""
+    if snap is None:
+        snap = INTEL.snapshot() if INTEL else None
+    if snap and snap.get("enabled") and snap.get("level") in intel.LEVEL_RANK:
+        return snap["level"]
+    return "none"
+
+
+def history_entry(s, level):
+    """Today's history entry, straight from a summary()."""
+    return {"date": s["date"], "readiness_pct": s["readiness_pct"], "hold_out_days": s["hold_out_days"],
+            "food_days": s["food_days"], "water_days": s["water_days"], "kit_pct": s["kit_stocked_pct"],
+            "items": s["items_total"], "in_stock": s["items_in_stock"], "expired": len(s["expired"]),
+            "expiring": len(s["expiring_soon"]), "below_target": len(s["supply_run"]["below_target"]),
+            "alert_level": level}
+
+
+def history_row(r):
+    out = {"date": r["date"]}
+    for k in HISTORY_FIELDS:
+        out[k] = r[k] if k == "alert_level" else _num(r[k] or 0)
+    return out
+
+
+def history_list(days, live):
+    """Stored days in the last `days` (oldest first), with today's live entry last. Missing days are missing."""
+    today = dt.date.fromisoformat(live["date"])
+    start = (today - dt.timedelta(days=days - 1)).isoformat()
+    with LOCK:
+        rows = DB.execute("SELECT * FROM history WHERE date >= ? AND date < ? ORDER BY date",
+                          (start, live["date"])).fetchall()
+    return [history_row(r) for r in rows] + [live]
+
+
+def write_history(db, entry, written_at):
+    db.execute("INSERT OR REPLACE INTO history(date, %s, written_at) VALUES (?, %s, ?)"
+               % (", ".join(HISTORY_FIELDS), ", ".join("?" * len(HISTORY_FIELDS))),
+               [entry["date"]] + [entry[k] for k in HISTORY_FIELDS] + [written_at])
+
+
+def record_history():
+    """Upsert today's row, unless it already says exactly this. Returns True if it wrote."""
+    with HIST_LOCK:   # one at a time, so an older reading never lands after a newer one
+        entry = history_entry(summary(), alert_level())
+        with LOCK:
+            row = DB.execute("SELECT * FROM history WHERE date = ?", (entry["date"],)).fetchone()
+        if row is not None and history_row(row) == entry:
+            return False
+        with tx() as db:
+            write_history(db, entry, now_iso())
+        return True
+
+
+def prune_usage():
+    cutoff = (dt.date.today() - dt.timedelta(days=USAGE_KEEP_DAYS)).isoformat()
+    with tx() as db:
+        db.execute("DELETE FROM usage WHERE ts < ?", (cutoff,))
+
+
+def history_loop():
+    """Write today's history row shortly after things change (HIST_WAKE), once per burst of edits."""
+    while True:
+        HIST_WAKE.wait()
+        time.sleep(HISTORY_SETTLE)
+        HIST_WAKE.clear()
+        try:
+            record_history()
+        except Exception:
+            traceback.print_exc()
+
+
+def record_usage(db, item_id, qty):
+    """Stock leaving through use. Returns the row id (for undo)."""
+    return db.execute("INSERT INTO usage(item_id, ts, qty) VALUES (?, ?, ?)",
+                      (item_id, now_iso(), round(qty, 3))).lastrowid
+
+
+def in_date_stock(it, today):
+    iso = today.isoformat()
+    return sum(b["qty"] for b in it["batches"] if not b["expiry"] or b["expiry"] >= iso)
+
+
+def usage_stats(items, today):
+    """Give each item usage: {used_30d, used_90d, per_week, runs_out_in_days}, all None with no usage recorded.
+    Whole local days only, so the figures only change when something happens or the date does."""
+    d30 = (today - dt.timedelta(days=29)).isoformat()
+    d90 = (today - dt.timedelta(days=USAGE_WINDOW - 1)).isoformat()
+    with LOCK:
+        rows = DB.execute("SELECT item_id, MIN(ts) AS first, SUM(CASE WHEN ts >= ? THEN qty ELSE 0 END) AS u30,"
+                          " SUM(CASE WHEN ts >= ? THEN qty ELSE 0 END) AS u90 FROM usage GROUP BY item_id",
+                          (d30, d90)).fetchall()
+    stats = {r["item_id"]: r for r in rows}
+    for it in items:
+        r = stats.get(it["id"])
+        usage = {"used_30d": None, "used_90d": None, "per_week": None, "runs_out_in_days": None}
+        if r is not None:
+            first = _days_until(r["first"][:10], today)
+            since = 1 - first if first is not None else USAGE_WINDOW   # days since the first use, today counted
+            window = min(USAGE_WINDOW, max(USAGE_MIN_WINDOW, since))
+            u30, u90 = round(r["u30"] or 0, 3), round(r["u90"] or 0, 3)
+            per_day = u90 / float(window)
+            stock = round(in_date_stock(it, today), 3)
+            usage["used_30d"] = _num(u30)
+            usage["used_90d"] = _num(u90)
+            usage["per_week"] = _num(round(per_day * 7, 2))
+            if per_day > 0 and stock > 0:
+                usage["runs_out_in_days"] = int(min(99999, math.floor(round(stock / per_day, 6))))
+        it["usage"] = usage
+    return items
+
+
 def get_item(db, item_id):
     row = db.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
     if not row:
@@ -761,8 +1035,37 @@ def snapshot(db, item_id):
     return {"item": item, "batches": batches}
 
 
+def next_stamp(db, item_id):
+    """A new updated_at for an item, always later than its last one, so undo can tell changes apart."""
+    ts = now_iso()
+    row = db.execute("SELECT updated_at FROM items WHERE id = ?", (item_id,)).fetchone()
+    if row and row["updated_at"] and ts <= row["updated_at"]:
+        try:
+            last = dt.datetime.strptime(row["updated_at"][:19], "%Y-%m-%d %H:%M:%S")
+            ts = (last + dt.timedelta(seconds=1)).isoformat(sep=" ")
+        except ValueError:
+            pass
+    return ts
+
+
 def touch(db, item_id):
-    db.execute("UPDATE items SET updated_at = ? WHERE id = ?", (now_iso(), item_id))
+    ts = next_stamp(db, item_id)
+    db.execute("UPDATE items SET updated_at = ? WHERE id = ?", (ts, item_id))
+    return ts
+
+
+def with_usage(db, snap):
+    """For deleting an item: its usage goes with it (ON DELETE CASCADE), and comes back with an undo."""
+    snap["usage"] = [[r["ts"], r["qty"]] for r in db.execute(
+        "SELECT ts, qty FROM usage WHERE item_id = ? ORDER BY id", (snap["item"]["id"],))]
+    return snap
+
+
+def undo_of(snap, updated_at):
+    """An undo snapshot, plus the item's updated_at straight after the change (None: the item was deleted).
+    Undo is refused if the item has changed again since."""
+    snap["updated_at"] = updated_at
+    return snap
 
 
 # --------------------------------------------------------------------------
@@ -772,7 +1075,7 @@ ROUTES = []
 
 
 def route(method, pattern):
-    rx = re.compile("^" + pattern + "$")
+    rx = re.compile("^" + pattern + "$", re.ASCII)   # \d means 0-9 only
 
     def deco(fn):
         ROUTES.append((method, rx, fn))
@@ -782,21 +1085,27 @@ def route(method, pattern):
 
 @route("GET", "/api/health")
 def api_health(body, query):
+    try:
+        with LOCK:
+            DB.execute("SELECT 1").fetchone()   # so the watchdog notices a broken database
+    except Exception as e:
+        raise ApiError(503, "The database isn't answering (%s)" % e)
     return {"ok": True, "version": VERSION}
 
 
 @route("GET", "/api/state")
 def api_state(body, query):
+    today = dt.date.today()
     sm = summary()
     home = home_snapshot() if HA_TOKEN else None
     with LOCK:
         if home is not None:
             home["config"] = home_cfg()
-        return {
+        out = {
             "situation": sm["situation"],
             "resilience": sm["resilience"],
             "home": home,
-            "items": all_items(),
+            "items": usage_stats(all_items(), today),
             "shopping": [dict(r) for r in DB.execute("SELECT * FROM shopping ORDER BY done, id")],
             "checks": all_checks(),
             "check_suggestions": [c[0] for c in CHECK_SUGGESTIONS],
@@ -807,6 +1116,143 @@ def api_state(body, query):
             "server": {"version": VERSION, "time": now_iso(), "last_backup": LAST_BACKUP["at"],
                        "backup_dir": BACKUP_DIR, "ha": ha_status()},
         }
+    out["intel"] = INTEL.snapshot() if INTEL else None   # outside LOCK: it reads settings itself
+    out["history"] = history_list(HISTORY_DAYS, history_entry(summary(), alert_level(out["intel"])))
+    return out
+
+
+@route("GET", "/api/history")
+def api_history(body, query):
+    raw = (query.get("days") or [""])[0]
+    days = HISTORY_DAYS if raw == "" else int(round(clean_num(raw, HISTORY_DAYS, 1, HISTORY_MAX_DAYS, "days")))
+    return {"days": history_list(days, history_entry(summary(), alert_level()))}
+
+
+# -- Live alerts (see intel.py) ---------------------------------------------
+# Kept with the other app-only settings (setting_raw), so they're not in stock backups.
+INTEL = None
+
+
+def intel_settings():
+    with LOCK:
+        return {k: setting_raw(k, v) for k, v in intel.DEFAULTS.items()}
+
+
+HOME = {"at": 0, "where": None}
+
+
+def intel_home():
+    """Home's (lat, lon) from Home Assistant's own config, checked hourly. DADSARMY_HOME="lat,lon" overrides."""
+    env = os.environ.get("DADSARMY_HOME", "")
+    if env:
+        try:
+            lat, lon = (float(x) for x in env.split(","))
+            return (lat, lon)
+        except ValueError:
+            return None
+    if not HA_TOKEN:
+        return None
+    if time.time() - HOME["at"] > 3600 or (HOME["where"] is None and time.time() - HOME["at"] > 120):
+        HOME["at"] = time.time()
+        try:
+            status, cfg = ha_request("GET", "/config", timeout=8)
+            if status == 200 and isinstance(cfg, dict) and cfg.get("latitude") is not None:
+                HOME["where"] = (float(cfg["latitude"]), float(cfg["longitude"]))
+        except Exception:
+            pass
+    return HOME["where"]
+
+
+def postcode_where(pc):
+    """[lat, lon] for a full postcode, from postcodes.io (ONS data, Open Government Licence). Sent once, when saved."""
+    try:
+        req = urllib.request.Request("https://api.postcodes.io/postcodes/" + urllib.parse.quote(pc),
+                                     headers={"User-Agent": intel.USER_AGENT})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            res = json.loads(r.read().decode("utf-8")).get("result") or {}
+        return [round(float(res["latitude"]), 5), round(float(res["longitude"]), 5)]
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise ApiError(400, "That postcode wasn't found")
+        raise ApiError(502, "Couldn't look the postcode up just now (%s)" % e.code)
+    except (urllib.error.URLError, OSError, KeyError, TypeError, ValueError) as e:
+        raise ApiError(502, "Couldn't look the postcode up just now (%s)" % str(getattr(e, "reason", e))[:60])
+
+
+@route("GET", "/api/intel")
+def api_intel(body, query):
+    if not INTEL:
+        raise ApiError(503, "Live alerts haven't started yet")
+    return INTEL.snapshot()
+
+
+@route("PUT", "/api/intel")
+def api_intel_set(body, query):
+    new = {}
+    for key, default in intel.DEFAULTS.items():
+        if key not in body:
+            continue
+        v = body[key]
+        if key == "intel_radius_km":
+            new[key] = int(round(clean_num(v, default, intel.RADIUS_LIMITS[0], intel.RADIUS_LIMITS[1], "Distance")))
+        elif isinstance(default, int):
+            if v not in (True, False, 0, 1):
+                raise ApiError(400, "%s must be on or off" % key)
+            new[key] = 1 if v else 0
+        elif key == "intel_met_region":
+            v = clean_text(v, 4).lower()
+            if v and v not in intel.MET_REGIONS:
+                raise ApiError(400, "That isn't a Met Office region")
+            new[key] = v
+        elif key == "intel_air_region":
+            v = clean_text(v, 60)
+            match = [r for r in intel.AIR_REGIONS if r.lower() == v.lower()]
+            if v and not match:
+                raise ApiError(400, "That isn't a UK-AIR region")
+            new[key] = match[0] if match else ""
+        elif key == "intel_postcodes":
+            v = clean_text(v, 200)
+            districts = intel._postcode_districts(v)
+            if v and not districts:
+                raise ApiError(400, "Use postcode districts like AB12 or AB3 1")
+            new[key] = " ".join(districts)
+        elif key == "intel_map_where":
+            continue   # set from intel_map_postcode below, never directly
+        elif key == "intel_map_postcode":
+            v = re.sub(r"\s+", "", clean_text(v, 12).upper())
+            if v and not re.match(r"^[A-Z]{1,2}[0-9][0-9A-Z]?[0-9][A-Z]{2}$", v):
+                raise ApiError(400, "Use a full postcode like SW1A 1AA")
+            new[key] = (v[:-3] + " " + v[-3:]) if v else ""
+            new["intel_map_where"] = postcode_where(v) if v else ""
+        elif key == "intel_county":
+            v = clean_text(v, 60)
+            if v and not re.match(r"^[A-Za-z][A-Za-z ,.'&-]*$", v):
+                raise ApiError(400, "Use a county name like Cambridgeshire")
+            new[key] = v
+    if not new:
+        raise ApiError(400, "Nothing to change")
+    with tx() as db:
+        for k, v in new.items():
+            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (k, json.dumps(v)))
+        add_log("settings", "", "Live alerts settings updated")
+    if INTEL:
+        INTEL.kick()
+    return {"changed": sorted(new)}
+
+
+@route("POST", "/api/intel/refresh")
+def api_intel_refresh(body, query):
+    if not INTEL:
+        raise ApiError(503, "Live alerts haven't started yet")
+
+    def go():
+        try:
+            if INTEL.refresh(force=True):
+                intel_changed()
+        except Exception:
+            traceback.print_exc()
+    threading.Thread(target=go, name="intel-refresh", daemon=True).start()
+    return {"ok": True}
 
 
 @route("GET", "/api/summary")
@@ -837,10 +1283,14 @@ def api_item_update(body, query, item_id):
     if not data:
         raise ApiError(400, "Nothing to change")
     with tx() as db:
-        get_item(db, item_id)
+        old = get_item(db, item_id)
+        if "target_qty" in data and old["target_rule"] and round(data["target_qty"], 3) != round(old["target_qty"], 3):
+            data["target_rule"] = ""   # set by hand: stops scaling with the household
         cols = ", ".join("%s = ?" % k for k in data)
         db.execute("UPDATE items SET %s, updated_at = ? WHERE id = ?" % cols,
-                   list(data.values()) + [now_iso(), item_id])
+                   list(data.values()) + [next_stamp(db, item_id), item_id])
+        if data.get("target_rule", old["target_rule"]):
+            rescale_targets(db, [item_id])   # calories or litres per unit may have changed
         add_log("edited", get_item(db, item_id)["name"], "Details updated")
     return {"ok": True}
 
@@ -849,10 +1299,10 @@ def api_item_update(body, query, item_id):
 def api_item_delete(body, query, item_id):
     item_id = as_int_id(item_id)
     with tx() as db:
-        snap = snapshot(db, item_id)
+        snap = with_usage(db, snapshot(db, item_id))
         db.execute("DELETE FROM items WHERE id = ?", (item_id,))
         add_log("removed", snap["item"]["name"], "Item deleted")
-    return {"undo": snap}
+    return {"undo": undo_of(snap, None)}
 
 
 def name_list(names, limit=8):
@@ -881,7 +1331,7 @@ def api_items_delete(body, query):
         for item_id in wanted:
             if not db.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone():
                 continue   # already gone (deleted on another phone)
-            snaps.append(snapshot(db, item_id))
+            snaps.append(undo_of(with_usage(db, snapshot(db, item_id)), None))
             db.execute("DELETE FROM items WHERE id = ?", (item_id,))
         if not snaps:
             raise ApiError(404, "Those items no longer exist")
@@ -902,7 +1352,8 @@ def api_stock_add(body, query, item_id):
     expiry = clean_date(body.get("expiry"))
     location = clean_text(body.get("location"), 80)
     with tx() as db:
-        item = get_item(db, item_id)
+        snap = snapshot(db, item_id)
+        item = snap["item"]
         same = db.execute(
             "SELECT id FROM batches WHERE item_id = ? AND IFNULL(expiry, '') = ? AND location = ? COLLATE NOCASE",
             (item_id, expiry or "", location)).fetchone()
@@ -911,12 +1362,12 @@ def api_stock_add(body, query, item_id):
         else:
             db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
                        (item_id, qty, expiry, location, now_iso()))
-        touch(db, item_id)
+        stamp = touch(db, item_id)
         detail = "+%s %s" % (fq(qty), item["unit"])
         if expiry:
             detail += ", best before %s" % expiry
         add_log("stocked", item["name"], detail.strip())
-    return {"ok": True}
+    return {"ok": True, "undo": undo_of(snap, stamp)}
 
 
 @route("POST", r"/api/items/(\d+)/use")
@@ -945,9 +1396,10 @@ def api_use(body, query, item_id):
         used = round(qty - remaining, 3)
         if used <= 0:
             raise ApiError(409, "There's none of that left to use")
-        touch(db, item_id)
+        snap["usage_ids"] = [record_usage(db, item_id, used)]   # undo takes it back off
+        stamp = touch(db, item_id)
         add_log("used", item["name"], ("-%s %s" % (fq(used), item["unit"])).strip())
-    return {"used": used, "undo": snap}
+    return {"used": used, "undo": undo_of(snap, stamp)}
 
 
 @route("PUT", r"/api/batches/(\d+)")
@@ -962,6 +1414,9 @@ def api_batch_update(body, query, batch_id):
         qty = b["qty"]
         if "delta" in body:
             qty = round(qty + clean_num(body.get("delta"), 0, -1e7, 1e7, "Change"), 3)
+            taken = round(b["qty"] - max(0.0, qty), 3)
+            if taken > 0:   # the - stepper: stock used (editing the quantity in the form isn't)
+                snap["usage_ids"] = [record_usage(db, b["item_id"], taken)]
         elif "qty" in body:
             qty = clean_num(body.get("qty"), 0, 0, 1e7, "Quantity")
         expiry = clean_date(body.get("expiry")) if "expiry" in body else b["expiry"]
@@ -976,8 +1431,8 @@ def api_batch_update(body, query, batch_id):
                 add_log("adjusted", b["name"], ("%s → %s %s" % (fq(b["qty"]), fq(qty), b["unit"])).strip())
             else:
                 add_log("adjusted", b["name"], "Batch details updated")
-        touch(db, b["item_id"])
-    return {"undo": snap, "removed": qty <= 0}
+        stamp = touch(db, b["item_id"])
+    return {"undo": undo_of(snap, stamp), "removed": qty <= 0}
 
 
 @route("DELETE", r"/api/batches/(\d+)")
@@ -990,9 +1445,9 @@ def api_batch_delete(body, query, batch_id):
             raise ApiError(404, "That batch no longer exists")
         snap = snapshot(db, b["item_id"])
         db.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
-        touch(db, b["item_id"])
+        stamp = touch(db, b["item_id"])
         add_log("adjusted", b["name"], ("Batch removed (%s %s)" % (fq(b["qty"]), b["unit"])))
-    return {"undo": snap}
+    return {"undo": undo_of(snap, stamp)}
 
 
 @route("POST", "/api/restore-item")
@@ -1022,14 +1477,31 @@ def restore_snapshot(db, snap):
     batches = snap["batches"]
     item_id = as_int_id(item.get("id"))
     data = clean_item(item)
+    data["target_rule"] = clean_rule(item.get("target_rule"))
     created = clean_text(item.get("created_at"), 30) or now_iso()
-    exists = db.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone()
+    exists = db.execute("SELECT updated_at FROM items WHERE id = ?", (item_id,)).fetchone()
+    if "updated_at" in snap:   # snapshots from 2.0.0 on: don't wipe out a later change
+        expected = snap["updated_at"]
+        if expected is None and exists:
+            raise ApiError(409, "%s is already back in the stores, so there's nothing to undo." % data["name"])
+        if expected is not None and (not exists or exists["updated_at"] != expected):
+            raise ApiError(409, "Can't undo: %s has been changed since%s. Check it and put it right by hand."
+                           % (data["name"], "" if exists else " (it was deleted)"))
     if exists:
         cols = ", ".join("%s = ?" % k for k in data)
         db.execute("UPDATE items SET %s, updated_at = ? WHERE id = ?" % cols,
-                   list(data.values()) + [now_iso(), item_id])
+                   list(data.values()) + [next_stamp(db, item_id), item_id])
     else:
         insert_item(db, data, created, now_iso(), item_id)
+    ids = snap.get("usage_ids")
+    if isinstance(ids, list) and ids:   # undoing a use: it wasn't used after all
+        ids = [as_int_id(i) for i in ids[:100]]
+        db.execute("DELETE FROM usage WHERE item_id = ? AND id IN (%s)" % ",".join("?" * len(ids)),
+                   [item_id] + ids)
+    if not exists and isinstance(snap.get("usage"), list):   # undoing a delete: its usage comes back
+        db.executemany("INSERT INTO usage(item_id, ts, qty) VALUES (?, ?, ?)",
+                       clean_usage_rows([{"item_id": item_id, "ts": u[0], "qty": u[1]}
+                                         for u in snap["usage"] if isinstance(u, list) and len(u) == 2]))
     db.execute("DELETE FROM batches WHERE item_id = ?", (item_id,))
     for b in batches:
         if not isinstance(b, dict):
@@ -1057,7 +1529,10 @@ def api_shop_update(body, query, sid):
     sid = as_int_id(sid)
     with tx() as db:
         if "done" in body:
-            db.execute("UPDATE shopping SET done = ? WHERE id = ?", (1 if body.get("done") else 0, sid))
+            done = body.get("done")
+            if not (isinstance(done, bool) or (isinstance(done, (int, float)) and done in (0, 1))):
+                raise ApiError(400, "done must be true or false")
+            db.execute("UPDATE shopping SET done = ? WHERE id = ?", (1 if done else 0, sid))
         if "text" in body:
             text = clean_text(body.get("text"), 200)
             if text:
@@ -1801,16 +2276,69 @@ def api_res_add(body, query):
 def api_settings(body, query):
     changed = []
     with tx() as db:
+        st = get_settings()
+        new = {}
         for key, (lo, hi, integer) in SETTING_RULES.items():
             if key in body:
                 v = clean_num(body.get(key), DEFAULT_SETTINGS[key], lo, hi, key)
-                if integer:
-                    v = int(round(v))
-                db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(v)))
-                changed.append(key)
+                new[key] = int(round(v)) if integer else v
+        if new.get("adults", st["adults"]) + new.get("children", st["children"]) < 1:
+            raise ApiError(400, "The household needs at least one person in it")
+        if "category_warn_days" in body:
+            new["category_warn_days"] = clean_cat_warn(body.get("category_warn_days"),
+                                                       base=st["category_warn_days"])
+        for key, v in new.items():
+            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(v)))
+            changed.append(key)
+        rescaled = rescale_targets(db) if any(k in HOUSEHOLD_KEYS for k in changed) else 0
         if changed:
-            add_log("settings", "", "Household settings updated")
-    return {"changed": changed}
+            add_log("settings", "", "Household settings updated" +
+                    (" · %d starter target%s rescaled" % (rescaled, "" if rescaled == 1 else "s") if rescaled else ""))
+    return {"changed": changed, "rescaled": rescaled}
+
+
+# -- Starter targets that scale with the household ---------------------------
+RULE_KINDS = ("kcal", "water", "people", "perday")
+
+
+def clean_rule(value):
+    """A stored target rule, as JSON like '["kcal", 0.14]', or '' (a fixed target)."""
+    if not value:
+        return ""
+    try:
+        kind, v = json.loads(value) if isinstance(value, str) else value
+        v = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if kind not in RULE_KINDS or isinstance(v, bool) or not (0 < v < 1e6):
+        return ""
+    return json.dumps([kind, v])
+
+
+def target_ctx(st):
+    people = max(1, st["adults"] + st["children"])
+    days = st["target_days"]
+    kcal_day, water_day = household_needs(st)
+    return {"people": people, "days": days, "kcal": max(1, kcal_day) * days, "litres": water_day * days}
+
+
+def rescale_targets(db, ids=None):
+    """Work out the starter list's targets again for the household as it is now.
+    Targets set by hand have no rule, so they're left alone. Returns how many changed."""
+    ctx = target_ctx(get_settings())
+    n = 0
+    for r in db.execute("SELECT id, kcal_per_unit, litres_per_unit, target_qty, target_rule FROM items"
+                        " WHERE target_rule != ''").fetchall():
+        if ids is not None and r["id"] not in ids:
+            continue
+        rule = clean_rule(r["target_rule"])
+        if not rule:
+            continue
+        want = resolve_target(tuple(json.loads(rule)), r["kcal_per_unit"], r["litres_per_unit"], ctx)
+        if round(want, 3) != round(r["target_qty"], 3):
+            db.execute("UPDATE items SET target_qty = ? WHERE id = ?", (want, r["id"]))
+            n += 1
+    return n
 
 
 def resolve_target(spec, kcal, litres, ctx):
@@ -1832,15 +2360,7 @@ def resolve_target(spec, kcal, litres, ctx):
 def api_seed(body, query):
     """Add the suggested starter list (at zero stock), skipping names that already exist."""
     with tx() as db:
-        st = get_settings()
-        people = max(1, st["adults"] + st["children"])
-        days = st["target_days"]
-        ctx = {
-            "people": people,
-            "days": days,
-            "kcal": max(1, st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]) * days,
-            "litres": people * st["water_per_person"] * days,
-        }
+        ctx = target_ctx(get_settings())
         existing = set(r[0].lower() for r in db.execute("SELECT name FROM items"))
         ts = now_iso()
         added = 0
@@ -1848,14 +2368,22 @@ def api_seed(body, query):
             if name.lower() in existing:
                 continue
             # Things used every day also say how long they'll last.
-            per_day = round(people * target[1], 3) if isinstance(target, tuple) and target[0] == "perday" else 0
+            per_day = (round(ctx["people"] * target[1], 3)
+                       if isinstance(target, tuple) and target[0] == "perday" else 0)
+            rule = "" if isinstance(target, (int, float)) else clean_rule(list(target))
             insert_item(db, {"name": name, "category": cat, "unit": unit, "kcal_per_unit": kcal,
                              "litres_per_unit": litres, "target_qty": resolve_target(target, kcal, litres, ctx),
-                             "per_day": per_day, "price": 0, "notes": notes}, ts, ts)
+                             "per_day": per_day, "price": 0, "notes": notes, "target_rule": rule}, ts, ts)
             added += 1
         if added:
             add_log("starter", "", "Loaded %d suggested items" % added)
     return {"added": added}
+
+
+def csv_cell(v):
+    """Stop a spreadsheet treating text like '=HYPERLINK(...)' as a formula."""
+    v = "" if v is None else str(v)
+    return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
 
 
 @route("GET", r"/api/export\.csv")
@@ -1870,10 +2398,11 @@ def api_export_csv(body, query):
                                            i["name"].lower())):
         rows = it["batches"] or [{"qty": 0, "expiry": "", "location": ""}]
         for b in rows:
-            w.writerow([it["category"], it["name"], fq(b["qty"]), it["unit"], b["expiry"] or "", b["location"],
-                        fq(it["target_qty"]), fq(it["kcal_per_unit"]), fq(it["litres_per_unit"]),
-                        fq(it["per_day"]) if it["per_day"] else "", "%.2f" % it["price"] if it["price"] else "",
-                        it["notes"]])
+            w.writerow([csv_cell(v) for v in (
+                it["category"], it["name"], fq(b["qty"]), it["unit"], b["expiry"] or "", b["location"],
+                fq(it["target_qty"]), fq(it["kcal_per_unit"]), fq(it["litres_per_unit"]),
+                fq(it["per_day"]) if it["per_day"] else "", "%.2f" % it["price"] if it["price"] else "",
+                it["notes"])])
     data = ("﻿" + buf.getvalue()).encode("utf-8")  # BOM so Excel opens it as UTF-8
     return Raw(data, "text/csv; charset=utf-8", "dadsarmy-stores-%s.csv" % dt.date.today().isoformat())
 
@@ -1888,6 +2417,8 @@ def api_backup(body, query):
             "settings": get_settings(),
             "items": all_items(),
             "shopping": [dict(r) for r in DB.execute("SELECT * FROM shopping ORDER BY id")],
+            "history": [history_row(r) for r in DB.execute("SELECT * FROM history ORDER BY date")],
+            "usage": [dict(r) for r in DB.execute("SELECT item_id, ts, qty FROM usage ORDER BY id")],
             "checks": all_checks(),
             "plan": get_plan(),
             "resilience": res_answers(),
@@ -1898,17 +2429,65 @@ def api_backup(body, query):
 
 @route("POST", "/api/restore")
 def api_restore(body, query):
+    return restore_payload(body, body.get("confirm_empty") is True)
+
+
+def clean_usage_rows(rows):
+    """(item_id, ts, qty) for each good usage row in a backup or an undo; the rest are skipped."""
+    out = []
+    for u in rows:
+        ts = u.get("ts")
+        if not isinstance(ts, str) or not TS_RE.match(ts):
+            continue
+        try:
+            q = clean_num(u.get("qty"), 0, 0, 1e7)
+        except ApiError:
+            continue
+        if q > 0:
+            out.append((u["item_id"], ts, q))
+    return out
+
+
+def clean_history_rows(rows):
+    out = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            entry = {"date": clean_date(r.get("date"))}
+            if entry["date"] is None:
+                continue
+            for k in HISTORY_FIELDS:
+                if k == "alert_level":
+                    entry[k] = r.get(k) if r.get(k) in intel.LEVEL_RANK else "none"
+                elif k in ("hold_out_days", "food_days", "water_days"):
+                    entry[k] = _num(clean_num(r.get(k), 0, 0, 1e6))
+                else:
+                    entry[k] = int(round(clean_num(r.get(k), 0, 0, 1e7)))
+        except ApiError:
+            continue
+        out[entry["date"]] = entry
+    return [out[d] for d in sorted(out)]
+
+
+def restore_payload(body, confirm_empty=False, source="backup"):
+    """Replace everything with a backup (a downloaded file, or one of the automatic copies)."""
     if body.get("app") != "dadsarmy" or not isinstance(body.get("items"), list):
         raise ApiError(400, "That doesn't look like a Dads Army backup file")
     items = body["items"]
+    if not items and not confirm_empty:
+        raise ApiError(400, "That backup has no items in it, so restoring it would empty the stores. "
+                            "Send confirm_empty if that's really what you want.")
     shopping = body.get("shopping") if isinstance(body.get("shopping"), list) else []
     settings = body.get("settings") if isinstance(body.get("settings"), dict) else {}
     # Validate everything before touching the database.
     clean_items = []
+    old_ids = []   # the backup's item ids, to match its usage up with the items as restored
     for it in items:
         if not isinstance(it, dict):
             raise ApiError(400, "Backup file is damaged")
         data = clean_item(it)
+        data["target_rule"] = clean_rule(it.get("target_rule"))
         bl = []
         for b in it.get("batches") or []:
             if isinstance(b, dict):
@@ -1917,6 +2496,13 @@ def api_restore(body, query):
                     bl.append((q, clean_date(b.get("expiry")), clean_text(b.get("location"), 80),
                                clean_text(b.get("added_at"), 30) or now_iso()))
         clean_items.append((data, clean_text(it.get("created_at"), 30) or now_iso(), bl))
+        try:
+            old_ids.append(as_int_id(it.get("id")))
+        except ApiError:
+            old_ids.append(None)
+    # History and usage came in with 2.0: older backups don't have them, and a damaged row is skipped.
+    history = clean_history_rows(body["history"]) if isinstance(body.get("history"), list) else None
+    usage = [u for u in body["usage"] if isinstance(u, dict)] if isinstance(body.get("usage"), list) else []
     # Checks and the plan arrived in 1.5.0: an older backup leaves the ones you have alone.
     checks = None
     if isinstance(body.get("checks"), list):
@@ -1941,11 +2527,27 @@ def api_restore(body, query):
         db.execute("DELETE FROM batches")
         db.execute("DELETE FROM items")
         db.execute("DELETE FROM shopping")
-        for data, created, bl in clean_items:
+        db.execute("DELETE FROM usage")   # goes with the items anyway; this doesn't rely on that
+        new_ids = {}
+        for (data, created, bl), old_id in zip(clean_items, old_ids):
             new_id = insert_item(db, data, created, ts)
             for q, exp, loc, added in bl:
                 db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
                            (new_id, q, exp, loc, added))
+            if old_id is not None:
+                new_ids[old_id] = new_id
+        mapped = []
+        for u in usage:
+            try:
+                mapped.append(dict(u, item_id=new_ids.get(as_int_id(u.get("item_id")))))
+            except ApiError:
+                pass
+        db.executemany("INSERT INTO usage(item_id, ts, qty) VALUES (?, ?, ?)",
+                       clean_usage_rows([u for u in mapped if u["item_id"] is not None]))
+        if history is not None:
+            db.execute("DELETE FROM history")
+            for entry in history:
+                write_history(db, entry, ts)
         for s in shopping:
             if isinstance(s, dict) and clean_text(s.get("text"), 200):
                 db.execute("INSERT INTO shopping(text, done, created_at) VALUES (?, ?, ?)",
@@ -1955,6 +2557,8 @@ def api_restore(body, query):
                 v = clean_num(settings.get(key), DEFAULT_SETTINGS[key], lo, hi, key)
                 db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
                            (key, json.dumps(int(round(v)) if integer else v)))
+        if "category_warn_days" in settings:
+            set_setting_raw(db, "category_warn_days", clean_cat_warn(settings.get("category_warn_days"), strict=False))
         if checks is not None:
             db.execute("DELETE FROM checks")
             for c, created in checks:
@@ -1964,7 +2568,7 @@ def api_restore(body, query):
             set_setting_raw(db, "plan", plan)
         if answers is not None:
             set_setting_raw(db, "resilience", answers)
-        add_log("restored", "", "Restored %d items from backup" % len(clean_items))
+        add_log("restored", "", "Restored %d items from %s" % (len(clean_items), source))
     HA_REBASE.set()  # a restore isn't things running out
     return {"items": len(clean_items)}
 
@@ -1979,28 +2583,123 @@ def list_backups(suffix="-auto.db"):
         return []
 
 
+KEEP_PRE_RESTORE_DAYS = 14
+BACKUP_NAME_RE = re.compile(r"^dadsarmy-[0-9]{8}-[0-9]{6}-(auto|pre-restore)\.db$")
+
+
 def make_backup(tag="auto"):
-    name = "dadsarmy-%s-%s.db" % (dt.datetime.now().strftime("%Y%m%d-%H%M%S"), tag)
-    path = os.path.join(BACKUP_DIR, name)
-    with LOCK:
-        dest = sqlite3.connect(path)
+    when = dt.datetime.now()
+    while True:   # never overwrite one (two restores in the same second)
+        path = os.path.join(BACKUP_DIR, "dadsarmy-%s-%s.db" % (when.strftime("%Y%m%d-%H%M%S"), tag))
+        if not os.path.exists(path):
+            break
+        when += dt.timedelta(seconds=1)
+    tmp = path + ".tmp"
+    try:
+        # Write it under a temporary name and check it, so a half-written copy never looks like a backup.
+        with LOCK:
+            dest = sqlite3.connect(tmp)
+            try:
+                DB.backup(dest)
+                dest.execute("PRAGMA journal_mode = DELETE")   # one self-contained file
+                ok = dest.execute("PRAGMA quick_check").fetchone()[0]
+            finally:
+                dest.close()
+        if ok != "ok":
+            raise RuntimeError("the backup copy failed its check (%s)" % ok)
+        os.replace(tmp, path)
+    except Exception:
         try:
-            DB.backup(dest)
-        finally:
-            dest.close()
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     for old in list_backups()[:-KEEP_BACKUPS]:
         try:
             os.remove(os.path.join(BACKUP_DIR, old))
         except OSError:
             pass
+    # Copies made before a restore: keep at least two weeks' worth (and always the last 3).
+    cutoff = time.time() - KEEP_PRE_RESTORE_DAYS * 86400
     for old in list_backups("-pre-restore.db")[:-3]:
+        full = os.path.join(BACKUP_DIR, old)
         try:
-            os.remove(os.path.join(BACKUP_DIR, old))
+            if os.path.getmtime(full) < cutoff:
+                os.remove(full)
         except OSError:
             pass
     if tag == "auto":
         LAST_BACKUP["at"] = now_iso()
     return path
+
+
+def read_backup_db(path):
+    """An automatic backup, in the same shape as a downloaded backup file."""
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        settings = {}
+        for row in con.execute("SELECT key, value FROM settings"):
+            if row["key"] in DEFAULT_SETTINGS:
+                try:
+                    settings[row["key"]] = json.loads(row["value"])
+                except ValueError:
+                    pass
+        items = [dict(r) for r in con.execute("SELECT * FROM items ORDER BY id")]
+        by_item = {}
+        for b in con.execute("SELECT * FROM batches ORDER BY id"):
+            by_item.setdefault(b["item_id"], []).append(dict(b))
+        for it in items:
+            it["batches"] = by_item.get(it["id"], [])
+        shopping = [dict(r) for r in con.execute("SELECT * FROM shopping ORDER BY id")]
+        extra = {}
+        try:   # copies made before 2.0 don't have these
+            extra["history"] = [dict(r) for r in con.execute("SELECT * FROM history ORDER BY date")]
+            extra["usage"] = [dict(r) for r in con.execute("SELECT item_id, ts, qty FROM usage ORDER BY id")]
+        except sqlite3.OperationalError:
+            extra = {}
+    finally:
+        con.close()
+    return dict({"app": "dadsarmy", "settings": settings, "items": items, "shopping": shopping}, **extra)
+
+
+def backup_info(name):
+    full = os.path.join(BACKUP_DIR, name)
+    stamp = dt.datetime.strptime(name[9:24], "%Y%m%d-%H%M%S")
+    out = {"name": name, "at": stamp.isoformat(sep=" "), "kind": BACKUP_NAME_RE.match(name).group(1),
+           "size": os.path.getsize(full), "items": None}
+    try:
+        con = sqlite3.connect(full)
+        try:
+            out["items"] = con.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass   # damaged: listed, but can't be restored
+    return out
+
+
+@route("GET", "/api/backups")
+def api_backups(body, query):
+    """The automatic copies on disk, newest first."""
+    names = [n for n in list_backups(".db") if BACKUP_NAME_RE.match(n)]
+    names.sort(key=lambda n: n[9:24], reverse=True)
+    return {"backups": [backup_info(n) for n in names], "keep": KEEP_BACKUPS,
+            "keep_pre_restore_days": KEEP_PRE_RESTORE_DAYS}
+
+
+@route("POST", "/api/backups/restore")
+def api_backups_restore(body, query):
+    name = clean_text(body.get("name"), 80)
+    full = os.path.join(BACKUP_DIR, name)
+    if not BACKUP_NAME_RE.match(name) or not os.path.isfile(full):
+        raise ApiError(404, "That backup isn't there any more")
+    try:
+        payload = read_backup_db(full)
+    except sqlite3.Error as e:
+        raise ApiError(400, "That backup can't be read (%s)" % e)
+    when = backup_info(name)["at"][:16]
+    return restore_payload(payload, body.get("confirm_empty") is True, "the automatic backup of %s" % when)
 
 
 def backup_loop():
@@ -2012,6 +2711,11 @@ def backup_loop():
                 LAST_BACKUP["at"] = dt.datetime.fromtimestamp(newest).replace(microsecond=0).isoformat(sep=" ")
             if time.time() - newest > 20 * 3600:
                 make_backup("auto")
+        except Exception:
+            traceback.print_exc()
+        try:   # hourly, so quiet days (and things going out of date) still get a history row
+            record_history()
+            prune_usage()
         except Exception:
             traceback.print_exc()
         time.sleep(3600)
@@ -2113,7 +2817,8 @@ def ha_entities(s):
         dict(_ha_list(s["expired"]), newly_expired=s["newly_expired"][:LIST_LIMIT]))
     put("sensor.dads_army_expiring_soon", len(s["expiring_soon"]), "Dads Army expiring soon", "mdi:calendar-alert",
         "items", dict(_ha_list(s["expiring_soon"]), warn_days=s["warn_days"],
-                      expires_today=s["expires_today"][:LIST_LIMIT]))
+                      expires_today=s["expires_today"][:LIST_LIMIT],
+                      expires_in_7_days=s.get("expires_in_7_days", [])[:LIST_LIMIT]))
     nxt = s["next_expiry"]
     put("sensor.dads_army_next_expiry", nxt["date"] if nxt else "unknown", "Dads Army next to expire",
         "mdi:calendar-clock", attrs=nxt or {}, measurement=False, device_class="date")
@@ -2171,7 +2876,64 @@ def ha_entities(s):
     put("binary_sensor.dads_army_attention", "on" if reasons else "off", "Dads Army needs attention",
         "mdi:alert-circle" if reasons else "mdi:check-circle", attrs={"reasons": reasons},
         measurement=False, device_class="problem")
+
+    # Live alerts: only once they've been switched on in HQ.
+    snap = INTEL.snapshot() if INTEL else None
+    if snap and snap["enabled"]:
+        alerts = [dict(source=src["name"], **{k: i.get(k, "") for k in ("level", "title", "area", "time", "url")})
+                  for src in snap["sources"] for i in src["items"]
+                  if i.get("scope", "yours") == "yours"
+                  and intel.LEVEL_RANK.get(i.get("level"), 0) >= intel.LEVEL_RANK["minor"]]
+        sources = {src["id"]: ("off" if not src["enabled"] else "ok" if src["ok"] else
+                               "not checked yet" if src["ok"] is None else "failing") for src in snap["sources"]}
+        trends = [{k: t.get(k, "") for k in ("level", "title", "detail", "source")} for t in snap.get("trends") or []]
+        put("sensor.dads_army_live_alerts", snap["active"], "Dads Army live alerts", "mdi:alert-decagram", "alerts",
+            {"level": snap["level"], "alerts": alerts[:LIST_LIMIT], "trends": trends[:LIST_LIMIT], "sources": sources,
+             "elsewhere_in_uk": snap.get("elsewhere", 0)})
+        put("sensor.dads_army_trends", len(trends), "Dads Army trends to watch", "mdi:trending-up", "trends",
+            {"trends": trends[:LIST_LIMIT]})
+        # Not sensor.dads_army_alert_level: that one is the household alert level.
+        put("sensor.dads_army_live_alert_level", snap["level"], "Dads Army live alert level", "mdi:shield-alert",
+            measurement=False, attrs={"options": intel.LEVELS})
     return ents
+
+
+# -- "New live alert" events, for phone alerts ---------------------------------
+ALERT_WORD = {"minor": "Be aware", "moderate": "Be prepared", "severe": "Take action"}
+ALERT_QUIET = 6 * 3600   # an alert that clears and comes back within this long doesn't notify again
+
+
+def alert_events(snap, seen, now):
+    """Events for alerts and trends Home Assistant hasn't been told about. seen is {key: last seen} or None
+    (first run: note what's there, announce nothing). Returns (events, seen)."""
+    current = {}
+    if snap and snap.get("enabled"):
+        names = {src["id"]: src["name"] for src in snap["sources"]}
+        for src in snap["sources"]:
+            for i in src["items"]:
+                if i.get("scope", "yours") != "yours" or i.get("watch") or \
+                        intel.LEVEL_RANK.get(i.get("level"), 0) < intel.LEVEL_RANK["minor"]:
+                    continue
+                key = "%s|%s" % (src["id"], i.get("code") or i.get("ref") or i.get("url") or i.get("title"))
+                current[key] = {"kind": "alert", "source": src["name"], "level": i["level"], "title": i.get("title", ""),
+                                "message": i.get("detail", "")[:300], "url": i.get("url", "")}
+        for t in snap.get("trends") or []:
+            current["trend|" + str(t.get("id"))] = {
+                "kind": "trend", "source": names.get(t.get("source"), ""), "level": t.get("level", "minor"),
+                "title": t.get("title", ""), "message": t.get("detail", "")[:300], "url": ""}
+    if seen is None:
+        return [], {k: now for k in current}
+    events, seen = [], dict(seen)
+    for key, ev in current.items():
+        if key not in seen or now - seen[key] >= ALERT_QUIET:
+            events.append(dict(ev, level_word=ALERT_WORD.get(ev["level"], "Be aware")))
+        seen[key] = now
+    seen = {k: t for k, t in seen.items() if now - t < ALERT_QUIET}
+    if len(events) > 4:   # a storm: one message, not twenty
+        worst = max(events, key=lambda e: intel.LEVEL_RANK.get(e["level"], 0))
+        events = [dict(worst, title="%d new live alerts" % len(events),
+                       message="; ".join(e["title"] for e in events)[:300])]
+    return events, seen
 
 
 # -- "You've run out" events, for phone alerts ------------------------------
@@ -2281,12 +3043,13 @@ def todo_sync(entity, s):
         extras = {r["id"]: dict(r) for r in DB.execute("SELECT id, text, done FROM shopping")}
         tracked = {r["key"]: dict(r) for r in DB.execute("SELECT key, uid, summary, done FROM ha_todo")}
         fresh = bool(setting_raw("ha_todo_fresh", 0))
+    stored = set((t["key"], t["uid"], t["summary"], t["done"]) for t in tracked.values())
     linked = [t for t in tracked.values() if t["uid"] and not t["key"].startswith("x:")]
     if len(linked) > 3 and not any(t["uid"] in by_uid for t in linked):
         # Every linked item has gone at once: the list was emptied or made again. Start
         # afresh rather than deleting the extras here too.
         print("Home Assistant to-do list: %s looks new or emptied, so filling it again" % entity, flush=True)
-        tracked = {}
+        tracked = {k: t for k, t in tracked.items() if k.startswith("x:")}   # still not ours
 
     def done_of(i):
         return 1 if i.get("status") == "completed" else 0
@@ -2295,7 +3058,8 @@ def todo_sync(entity, s):
     claimed = set()  # Home Assistant items accounted for
     orphans = {}     # uid -> item whose Dads Army side has gone (removed unless something takes it over)
     ha_ops = []      # (action, data) to run in Home Assistant
-    app_ops = []     # (sql, args, log text or None, item name)
+    app_ops = []     # (sql, args, log text or None, item name); each only applies if the row is unchanged since
+                     # it was read above, as the Home Assistant calls in between can be slow
     dropped = set()  # extras deleted in Home Assistant
 
     # 1. Everything linked last time.
@@ -2317,15 +3081,17 @@ def todo_sync(entity, s):
             if want is None:                 # back up to target
                 orphans[it["uid"]] = it
                 continue
-            if it.get("summary") != want:
-                ha_ops.append(("update_item", {"item": it["uid"], "rename": want}))
+            if it.get("summary") != want:     # the amount changed: it's needed again, even if ticked
+                ha_ops.append(("update_item", {"item": it["uid"], "rename": want, "status": "needs_action"}))
+                track[key] = [it["uid"], want, 0]
+                continue
             track[key] = [it["uid"], want, done_of(it)]
         elif kind == "s":
             ex = extras.get(int(ref)) if ref.isdigit() else None
             if it is None:                   # deleted there, so delete it here
                 if ex:
                     dropped.add(ex["id"])
-                    app_ops.append(("DELETE FROM shopping WHERE id = ?", (ex["id"],),
+                    app_ops.append(("DELETE FROM shopping WHERE id = ? AND text = ?", (ex["id"], ex["text"]),
                                     "Removed in Home Assistant", ex["text"]))
                 continue
             claimed.add(it["uid"])
@@ -2337,15 +3103,17 @@ def todo_sync(entity, s):
             if ha_text != t["summary"] and clean_text(ha_text, 200):     # renamed there
                 if clean_text(ha_text, 200) != text:
                     text = clean_text(ha_text, 200)
-                    app_ops.append(("UPDATE shopping SET text = ? WHERE id = ?", (text, ex["id"]), None, ""))
+                    app_ops.append(("UPDATE shopping SET text = ? WHERE id = ? AND text = ?",
+                                    (text, ex["id"], ex["text"]), None, ""))
             elif text != clean_text(t["summary"], 200):                   # renamed here
                 ha_ops.append(("update_item", {"item": it["uid"], "rename": text}))
                 ha_text = text
             if ha_done != t["done"]:                                      # ticked there
                 if ha_done != done:
                     done = ha_done
-                    app_ops.append(("UPDATE shopping SET done = ? WHERE id = ?", (done, ex["id"]),
-                                    "Ticked off in Home Assistant" if done else None, text))
+                    app_ops.append(("UPDATE shopping SET done = ? WHERE id = ? AND done = ?",
+                                    (done, ex["id"], ex["done"]), "Ticked off in Home Assistant" if done else None,
+                                    text))
             elif done != ha_done:                                         # ticked here
                 ha_ops.append(("update_item", {"item": it["uid"],
                                                "status": "completed" if done else "needs_action"}))
@@ -2412,19 +3180,24 @@ def todo_sync(entity, s):
                     break
 
     # 5. Then the supply run, and remember the links.
-    changed = bool(app_ops or imports)
+    changed = False
+    if not (app_ops or imports or fresh) and set((k, v[0], v[1], v[2]) for k, v in track.items()) == stored:
+        return changed   # nothing new: leave the database alone
     with tx() as db:
         for sql, args, note, name in app_ops:
-            db.execute(sql, args)
-            if note:
-                add_log("supply", name, note)
+            if db.execute(sql, args).rowcount:   # skipped if it was changed here meanwhile; next sync sorts it
+                changed = True
+                if note:
+                    add_log("supply", name, note)
         for i, text in imports:
             cur = db.execute("INSERT INTO shopping(text, done, created_at) VALUES (?, 0, ?)", (text, now_iso()))
             track["s:%d" % cur.lastrowid] = [i["uid"], i.get("summary") or "", 0]
             add_log("supply", text, "Added in Home Assistant")
-        db.execute("DELETE FROM ha_todo")
-        db.executemany("INSERT INTO ha_todo(key, uid, summary, done) VALUES (?, ?, ?, ?)",
-                       [(k, v[0], v[1], v[2]) for k, v in track.items()])
+            changed = True
+        rows = set((k, v[0], v[1], v[2]) for k, v in track.items())
+        if rows != stored:
+            db.execute("DELETE FROM ha_todo")
+            db.executemany("INSERT INTO ha_todo(key, uid, summary, done) VALUES (?, ?, ?, ?)", sorted(rows))
         if fresh:
             set_setting_raw(db, "ha_todo_fresh", 0)
     return changed
@@ -3161,11 +3934,29 @@ def ha_loop():
         if HA_REBASE.is_set():
             HA_REBASE.clear()
             levels = None
+        if levels is None:
+            levels = now   # the baseline: nothing can have run out yet
         try:
-            ev = ran_out(levels, now) if levels is not None and not failing else None
-            levels = now
+            # Compared with the last levels Home Assistant heard about. While it can't be reached,
+            # that stays the pre-outage baseline, so nothing that ran out meanwhile is missed.
+            ev = ran_out(levels, now)
             if ev:
-                ha_call("POST", "/events/dads_army_ran_out", ev)
+                status = ha_call("POST", "/events/dads_army_ran_out", ev)
+                if not 200 <= status < 300:
+                    raise RuntimeError("Home Assistant answered %s to the ran-out event" % status)
+            levels = now
+            snap = INTEL.snapshot() if INTEL else None
+            seen = setting_raw("intel_notified", None)
+            events, seen_now = alert_events(snap, seen if isinstance(seen, dict) else None, time.time())
+            for ev in events:
+                status = ha_call("POST", "/events/dads_army_alert", ev)
+                if not 200 <= status < 300:
+                    raise RuntimeError("Home Assistant answered %s to the alert event" % status)
+            if not isinstance(seen, dict) or set(seen) != set(seen_now) or \
+                    any(seen_now[k] - seen[k] > 600 for k in seen_now):   # don't write every minute
+                with tx() as db:
+                    db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+                               ("intel_notified", json.dumps(seen_now)))
             ents = ha_entities(s)
             full = last_full is None or time.monotonic() - last_full > 1800
             if not full and ha_call("GET", "/states/" + probe, timeout=5) == 404:
@@ -4598,7 +5389,8 @@ MIME = {
     ".webmanifest": "application/manifest+json; charset=utf-8",
     ".txt": "text/plain; charset=utf-8",
 }
-CSP = ("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+# Map tiles come from OpenStreetMap (only while the live alerts map is shown).
+CSP = ("default-src 'self'; img-src 'self' data: https://tile.openstreetmap.org; style-src 'self' 'unsafe-inline'; "
        "script-src 'self'; connect-src 'self'; frame-ancestors 'self'")
 
 
@@ -4642,7 +5434,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_json(self, status, obj):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_bytes(status, data, "application/json; charset=utf-8", {"Cache-Control": "no-store"})
+        # X-Dads-Army: the app can tell this answer from a proxy's "502 Bad Gateway" and the like.
+        self.send_bytes(status, data, "application/json; charset=utf-8",
+                        {"Cache-Control": "no-store", "X-Dads-Army": VERSION})
 
     def read_json(self):
         try:
@@ -4694,6 +5488,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = fn(body, query, *match.groups())
                 if method != "GET":
                     HA_WAKE.set()  # something changed: refresh the Home Assistant sensors
+                    HIST_WAKE.set()  # and today's history row, once the burst settles
                 if isinstance(result, Raw):
                     extra = {"Cache-Control": "no-store"}
                     if result.filename:
@@ -4737,12 +5532,22 @@ def local_addresses():
     return addrs
 
 
+def intel_changed():
+    HA_WAKE.set()
+    HIST_WAKE.set()   # the alert level is in the history
+
+
 def main():
     if sys.version_info < (3, 7):
         sys.exit("Dads Army needs Python 3.7 or newer")
     init_db()
+    global INTEL
+    INTEL = intel.Intel(DATA_DIR, intel_settings, on_change=intel_changed, home_fn=intel_home)
+    if not os.environ.get("DADSARMY_INTEL_OFF"):   # tests run offline
+        INTEL.start()
     load_warnings()
-    threading.Thread(target=backup_loop, name="backups", daemon=True).start()
+    threading.Thread(target=history_loop, name="history", daemon=True).start()
+    threading.Thread(target=backup_loop, name="backups", daemon=True).start()   # also writes history at start
     threading.Thread(target=warnings_loop, name="warnings", daemon=True).start()
     if HA_TOKEN:
         threading.Thread(target=home_sensors_loop, name="home-sensors", daemon=True).start()
