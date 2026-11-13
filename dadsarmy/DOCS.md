@@ -47,7 +47,10 @@ The quickest way to get Dads Army on your Home Assistant dashboards. Dads Army o
 
 A **Home front** dashboard appears in the Home Assistant sidebar and in the Companion app. It's built from Home Assistant's own cards, so there's nothing extra to install. It has:
 
-- **The household alert level**, big and colour-coded across the top, with the full scale, why it's at that level, and what to do now. **What the levels mean** opens a page that explains them.
+- **The household alert level** in a compact, colour-coded card: the level, the main reason, and the whole scale on one line.
+  - **Why, and what to do now** (or the **Alert level** badge at the top) opens a page with every reason and all the labelled advice.
+  - The **i** next to the heading opens **What the levels mean**.
+  - Home Assistant has no pop-ups of its own, so these open as pages with a back arrow.
 - **Warnings** in force for where you live
 - **Today's checklist:** the routine checks that are due, ready to tick off (see below)
 - **Readiness:** the gauge, plus how long you could hold out, food, water and daily supplies

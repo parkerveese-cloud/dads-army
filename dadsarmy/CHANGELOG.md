@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.8.1
+
+- **A smaller alert level on the Home front dashboard**, so everything else fits on a tablet without scrolling far.
+  - The level now has a compact card: its name and colour, the main reason, and the whole scale on one line. It takes one column, so the warnings and today's checklist sit beside it.
+  - **Why, and what to do now** opens on its own page, with the big scale, every reason and all the labelled advice. The **Alert level** badge at the top opens it too.
+  - The **i** next to the heading opens **What the levels mean**.
+  - Dads Army offers to update a dashboard you've already made. Tap **Update the dashboard**.
+
 ## 1.8.0
 
 - **Household alert level.** A five-step scale for the household, from LOW (green) through MODERATE, SUBSTANTIAL and SEVERE to CRITICAL (black). It uses the names of the UK's national threat levels, the British equivalent of DEFCON, but it's the household's own level, not the official one.

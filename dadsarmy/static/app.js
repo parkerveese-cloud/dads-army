@@ -1274,8 +1274,9 @@
   function dashNote() {
     var ha = S.server.ha;
     if (!ha || !ha.dash_outdated) return '';
-    try { if (localStorage.getItem('da-dash-note') === 'layout2') return ''; } catch (e) { /* show it */ }
-    return '<div class="card tip-card"><p><b>New for the Home front dashboard:</b> the household alert level, at the top. Update the dashboard to add it.</p>' +
+    try { if (localStorage.getItem('da-dash-note') === 'layout3') return ''; } catch (e) { /* show it */ }
+    return '<div class="card tip-card"><p><b>New for the Home front dashboard:</b> the household alert level, in a compact card that leaves room for everything else. ' +
+      'Why, and what to do now, opens on its own page. Update the dashboard to get it.</p>' +
       '<div class="btn-row"><button class="btn small" data-act="ha-dash" data-again="1">Update the dashboard</button>' +
       '<button class="btn small" data-act="dash-note-hide">Not now</button></div></div>';
   }
@@ -2097,7 +2098,7 @@
         return toast('Suggestions ticked. Check them, then Save.');
       }
       case 'dash-note-hide':
-        try { localStorage.setItem('da-dash-note', 'layout2'); } catch (e) { /* fine */ }
+        try { localStorage.setItem('da-dash-note', 'layout3'); } catch (e) { /* fine */ }
         return render();
       case 'help-go': {
         var dest = a.dataset.view;

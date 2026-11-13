@@ -49,7 +49,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -1484,7 +1484,7 @@ CHECKS_LIST_NAME = "Dads Army checks"
 CHECKS_STATUS = {"ok": None, "error": "", "synced_at": None, "name": ""}
 HA_WS = os.environ.get("DADSARMY_HA_WS", "ws://supervisor/core/websocket")
 DASH_URL = "dads-army"
-DASH_LAYOUT = 2   # bump when the dashboard changes, so the app offers to rebuild it
+DASH_LAYOUT = 3   # bump when the dashboard changes, so the app offers to rebuild it
 
 
 class HAError(Exception):
@@ -1589,10 +1589,11 @@ def ha_entities(s):
     sit = s["situation"]
     put("sensor.dads_army_alert_level", sit["name"], "Dads Army alert level", LEVEL_ICONS[sit["level"] - 1],
         attrs={"level": sit["level"], "colour": sit["colour"], "emoji": sit["emoji"], "meaning": sit["meaning"],
+               "action": sit["action"],
                "escalated": sit["escalated"], "reasons": sit["reasons"][:LIST_LIMIT], "notes": sit["notes"],
                "guidance": [{"label": g["label"], "source": g["source"], "text": g["text"]} for g in sit["guidance"]],
-               "scale": [{"level": x["level"], "name": x["name"], "emoji": x["emoji"], "meaning": x["meaning"]}
-                         for x in sit["scale"]]},
+               "scale": [{"level": x["level"], "name": x["name"], "emoji": x["emoji"], "meaning": x["meaning"],
+                          "action": x["action"]} for x in sit["scale"]]},
         measurement=False)
     # Only what needs doing now. Things not bought yet are the supply run's job (they'd keep
     # this on for weeks while the stores are built up), and a check that's never been done
@@ -2250,7 +2251,23 @@ Warnings are switched off. Turn them on in Dads Army under **HQ → Warnings**.
 <ha-icon icon="mdi:check-circle"></ha-icon> No warnings for where you are.
 {%- endif %}"""
 
+# The Home front's alert card: small, so the rest of the dashboard fits on a tablet without
+# scrolling. The level and its colour, the main reason, and the whole scale on one line.
 DASH_LEVEL = """{% set lv = state_attr('sensor.dads_army_alert_level', 'level') | int(0) -%}
+{% set scale = state_attr('sensor.dads_army_alert_level', 'scale') or [] -%}
+{% set r = state_attr('sensor.dads_army_alert_level', 'reasons') or [] -%}
+{% if lv == 0 or not scale -%}
+Dads Army isn't sending updates. Check the app is running.
+{%- else -%}
+{% set me = scale[lv - 1] -%}
+## {{ me.emoji }} {{ me.name }}
+<ha-alert alert-type="{{ ['success', 'warning', 'warning', 'error', 'error'][lv - 1] }}"><b>{{ me.action }}.</b> {% if r %}{{ r[0].title | truncate(80) }}{% if r | count > 1 %}, and {{ r | count - 1 }} more{% endif %}.{% else %}Nothing is raising the level.{% endif %}</ha-alert>
+
+<small>{% for s in scale %}{% if s.level == lv %}<b>{{ s.emoji }} {{ s.name }}</b>{% else %}{{ s.emoji }} {{ s.name }}{% endif %}{% if not loop.last %} · {% endif %}{% endfor %}</small>
+{%- endif %}"""
+
+# The "Why, and what to do now" page: the level big, with the scale top to bottom...
+DASH_LEVEL_FULL = """{% set lv = state_attr('sensor.dads_army_alert_level', 'level') | int(0) -%}
 {% set scale = state_attr('sensor.dads_army_alert_level', 'scale') or [] -%}
 {% if lv == 0 or not scale -%}
 Dads Army isn't sending updates. Check the app is running.
@@ -2266,21 +2283,33 @@ Dads Army isn't sending updates. Check the app is running.
 {% endfor %}
 {%- endif %}"""
 
-DASH_WHY = """{% set r = state_attr('sensor.dads_army_alert_level', 'reasons') or [] -%}
-{% set g = state_attr('sensor.dads_army_alert_level', 'guidance') or [] -%}
-{% if r -%}
+# ...then every reason and all the labelled advice.
+DASH_WHY = """{% set a = 'sensor.dads_army_alert_level' -%}
+{% set scale = state_attr(a, 'scale') or [] -%}
+{% set r = state_attr(a, 'reasons') or [] -%}
+{% set n = state_attr(a, 'notes') or [] -%}
+{% set g = state_attr(a, 'guidance') or [] -%}
 #### Why
-{% for i in r[:6] %}
-- {{ i.title }} ({{ i.name | lower }})
+{% for i in r %}
+- {{ scale[i.level - 1].emoji if scale else '' }} {{ i.title }} ({{ i.name | lower }})
 {%- endfor %}
-{%- if state_attr('sensor.dads_army_alert_level', 'escalated') %}
-- Raised to SEVERE because the stores wouldn't last 3 days
+{%- if state_attr(a, 'escalated') %}
+- ⬆️ Raised to SEVERE because the stores wouldn't last 3 days, so you'd be less able to cope
 {%- endif %}
-{% endif %}
+{%- if not r %}
+Nothing is raising the level.
+{%- endif %}
+{%- if n %}
+
+Also worth knowing: {{ n | join(' · ') }}
+{%- endif %}
+
 #### What to do now
-{% for i in g[:8] %}
+{% for i in g %}
 - **{{ i.label }}:** {{ i.text }}
-{%- endfor %}"""
+{%- endfor %}
+
+<small>UK Government advice is put into plain words, not quoted. SAS statements apply the SAS Survival Handbook's PLAN priorities to a home. Always follow official advice and the emergency services. In an emergency, call 999.</small>"""
 
 DASH_LEVELS_PAGE = """## What the household alert levels mean
 
@@ -2350,20 +2379,33 @@ def dashboard_config():
             c["icon"] = icon
         return c
 
-    def heading(text, icon):
-        return {"type": "heading", "heading": text, "icon": icon}
+    def heading(text, icon, badges=None):
+        h = {"type": "heading", "heading": text, "icon": icon}
+        if badges:
+            h["badges"] = badges
+        return h
+
+    # Home Assistant has no pop-up of its own (only add-ons like browser_mod), so the details
+    # open on their own pages, with a back arrow.
+    level = "sensor.dads_army_alert_level"
+    go_why = {"action": "navigate", "navigation_path": "/%s/alert-level" % DASH_URL}
+    go_levels = {"action": "navigate", "navigation_path": "/%s/alert-levels" % DASH_URL}
+    info = [{"type": "entity", "entity": level, "icon": "mdi:information-outline", "show_icon": True,
+             "show_state": False, "tap_action": go_levels}]
+
+    def nav_tile(name, icon, go):
+        return dict({"type": "tile", "entity": level, "name": name, "icon": icon, "hide_state": True,
+                     "tap_action": go, "icon_tap_action": go}, **full)
 
     checklist = ([dict({"type": "todo-list", "entity": checks, "hide_completed": True}, **full)] if checks else
                  [dict({"type": "markdown", "content": DASH_CHECKS}, **full)])
     shopping = ([dict({"type": "todo-list", "entity": supply, "hide_completed": True}, **full)] if supply else [])
     sections = [
-        {"type": "grid", "column_span": 2, "cards": [
-            heading("Household alert level", "mdi:shield-home"),
+        # One column, so the warnings and today's checklist sit beside it.
+        {"type": "grid", "cards": [
+            heading("Household alert level", "mdi:shield-home", info),
             dict({"type": "markdown", "content": DASH_LEVEL}, **full),
-            dict({"type": "markdown", "content": DASH_WHY}, **full),
-            dict({"type": "button", "name": "What the levels mean", "icon": "mdi:information-outline",
-                  "show_state": False, "tap_action": {"action": "navigate",
-                                                      "navigation_path": "/%s/alert-levels" % DASH_URL}}, **full)]},
+            nav_tile("Why, and what to do now", "mdi:clipboard-list-outline", go_why)]},
         {"type": "grid", "cards": [
             heading("Warnings", "mdi:alert-octagon"),
             dict(tile("sensor.dads_army_warnings", "Warnings in force", "red"), **full),
@@ -2400,8 +2442,8 @@ def dashboard_config():
                 {"entity": "sensor.dads_army_water_days", "name": "Water"}]}, **full)]},
     ]
     return {"views": [{"title": "Home front", "path": "home-front", "type": "sections", "max_columns": 3,
-                       "badges": [{"type": "entity", "entity": "sensor.dads_army_alert_level", "name": "Alert level",
-                                   "show_name": True},
+                       "badges": [{"type": "entity", "entity": level, "name": "Alert level",
+                                   "show_name": True, "tap_action": go_why},
                                   {"type": "entity", "entity": "sensor.dads_army_readiness", "name": "Readiness",
                                    "show_name": True},
                                   {"type": "entity", "entity": "sensor.dads_army_hold_out", "name": "Hold out",
@@ -2409,8 +2451,18 @@ def dashboard_config():
                                   {"type": "entity", "entity": "binary_sensor.dads_army_attention",
                                    "name": "Needs attention", "show_name": True}],
                        "sections": sections},
-                      {"title": "Alert levels", "path": "alert-levels", "subview": True, "type": "panel",
-                       "back_path": "/%s/home-front" % DASH_URL,
+                      {"title": "Household alert level", "path": "alert-level", "subview": True, "type": "sections",
+                       "max_columns": 3, "back_path": "/%s/home-front" % DASH_URL,
+                       "sections": [
+                           {"type": "grid", "cards": [
+                               heading("Where the household stands", "mdi:shield-home", info),
+                               dict({"type": "markdown", "content": DASH_LEVEL_FULL}, **full),
+                               nav_tile("What the levels mean", "mdi:information-outline", go_levels)]},
+                           {"type": "grid", "column_span": 2, "cards": [
+                               heading("Why, and what to do now", "mdi:clipboard-list-outline"),
+                               dict({"type": "markdown", "content": DASH_WHY}, **full)]}]},
+                      # No back_path: back goes to whichever page opened it.
+                      {"title": "What the levels mean", "path": "alert-levels", "subview": True, "type": "panel",
                        "cards": [{"type": "markdown", "content": DASH_LEVELS_PAGE}]}]}
 
 
@@ -3347,6 +3399,9 @@ LEVELS = [
 ]
 LEVEL_ICONS = ["mdi:shield-check", "mdi:shield-alert-outline", "mdi:shield-alert", "mdi:alert-octagon",
                "mdi:alarm-light"]
+# Each level's meaning in a few words, for small spaces like the dashboard's alert card.
+LEVEL_ACTIONS = ["Carry on as normal", "Stay aware", "Get ready", "Act now",
+                 "Danger to life: follow the emergency services' instructions"]
 
 GOV, SAS, FIRE, TIP, NETWORKS = ("UK Government", "SAS Survival Handbook", "Fire & rescue services", "Dads Army tip",
                                  "Electricity networks")
@@ -3800,7 +3855,9 @@ def assess(s, home):
             "notes": [f["title"] for f in factors if f["level"] < 2],
             "guidance": guidance[:12],
             "sensors": bool(r),
-            "scale": [{"level": i + 1, "name": n, "colour": c, "emoji": e, "meaning": m, "mi5": d}
+            "action": LEVEL_ACTIONS[level - 1],
+            "scale": [{"level": i + 1, "name": n, "colour": c, "emoji": e, "meaning": m, "mi5": d,
+                       "action": LEVEL_ACTIONS[i]}
                       for i, (n, c, e, m, d) in enumerate(LEVELS)]}
 
 
