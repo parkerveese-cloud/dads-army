@@ -445,7 +445,7 @@ Under **More of the wider picture** in the warnings settings. All public; the ra
 | Flood risk forecast (Flood Forecasting Centre's outlook for England, five days, from Check for flooding; Scottish Flood Forecast, three days) | The risk where you live, which day, and whether it's rising | Medium or high (in Scotland: flooding possible, or significant flooding possible) |
 | Rainfall near you (Environment Agency, SEPA, Natural Resources Wales) | Rain in 24 hours and 7 days at the nearest gauges (within 25 km) | 30 mm or more in a day |
 | Groundwater near you (Environment Agency, England) | The nearest boreholes (within 30 km) against the time of year; a deep borehole below sea level is marked, as it follows decades rather than this year's rain | Shown, but not a warning |
-| The grid now (NESO, Elexon) | Carbon intensity, the generation mix and the frequency | The frequency dips below 49.8 Hz |
+| The grid now (NESO, Elexon) | Carbon intensity for your region and Great Britain, the generation mix, the frequency, and the greenest 3 hours in the next day | The frequency dips below 49.8 Hz |
 | Electricity margin (Elexon, NESO) | The tightest spare margin in the next 14 hours and two weeks, and Demand Flexibility Service events | The margin is under 3 GW |
 
 - Choose your **Environment Agency area** and **water company** in the warnings settings for drought status and hosepipe bans.
@@ -453,6 +453,24 @@ Under **More of the wider picture** in the warnings settings. All public; the ra
 - Not included: stock markets and commodity prices, as there's no free official source.
 
 Sources: the threat level, the FCDO's travel advice and the Environment Agency's drought reports on GOV.UK; the National Cyber Security Centre; the Flood Forecasting Centre's five-day flood risk outlook (from GOV.UK's Check for flooding); Environment Agency rainfall (real-time data API) and groundwater (Hydrology API) data, all under the Open Government Licence; NESO's Carbon Intensity API (CC BY 4.0) and Data Portal; Elexon's BMRS; the regional providers below; and the water companies' public incident maps and pages.
+
+**Your region's carbon (1.20.0).** The grid now also shows your region's carbon intensity (one of the Carbon Intensity API's 14 regions, which match the electricity networks' areas) and the greenest 3 hours in the next day. The region is worked out on the Pi from home's location, and only its number (13 is London) is asked for. In Northern Ireland, or without a location, it's Great Britain's.
+
+### Road closures (1.20.0)
+
+Closures on England's motorways and major A roads (National Highways' Strategic Road Network) within your near you distance. Council roads aren't included. Under **Road closures** in the warnings settings.
+
+| Feed | What you get | Warns when |
+|---|---|---|
+| Road closures (National Highways, England, with your own key) | Unplanned closures on now, and planned roadworks and closures starting in the next 12 hours, nearest first (up to 40) | Amber: an unplanned closure of the whole road, on now. Yellow: lanes shut by the weather, flooding or damage to the road |
+
+- **It needs your own free key.** Sign up at [developer.data.nationalhighways.co.uk](https://developer.data.nationalhighways.co.uk/), subscribe to **Road and Lane Closures**, and paste the key in the warnings settings. Adding it switches road closures on. The key stays on the Pi, is never shown back, and is left out of backup files and the automatic copies (paste it in again after a restore). Tick **Remove the saved key** to take it off.
+- **What counts as closed.** The feed lists only the lanes affected, so a road counts as closed only when lanes are shut and none are left open, or National Highways says the road or carriageway is closed. A breakdown in one lane is listed, but isn't a warning. Planned roadworks never notify; each unplanned closure notifies once.
+- **On the map** (if it's on), a closure is drawn along the stretch that's shut: unplanned ones solid in their colour with a white edge, planned roadworks dashed grey, with the routine things.
+- Road closures don't change the household alert level.
+- Checked about every 15 minutes. Closures are listed with the road, where, why (a collision, roadworks, the weather) and until when, with a link to Traffic England's live map.
+
+Data: Powered by National Highways' Transport Data Feeds.
 
 ### Trends in the wider picture (1.17.0)
 
@@ -544,7 +562,7 @@ Without an AI set up, the buttons that need one are hidden, and adding an item s
 **Which AI reads the photos.** In **HQ → Scanning**:
 
 - **Home Assistant AI Task** (the default) uses whatever AI you've set up in Home Assistant under **Settings → Devices & services**: Google Gemini, Anthropic or OpenAI. Gemini is tried first, then the others.
-- Or choose **Anthropic Claude** (Claude Haiku 5.5), **Google Gemini** or **OpenAI** and paste an API key. The key stays on the Pi, is never shown back, and is left out of backup files and the automatic database copies (paste it in again after a restore).
+- Or choose **Anthropic Claude** (Claude Haiku 5.5), **Google Gemini** or **OpenAI** and paste an API key. The key stays on the Pi, is never shown back, and is left out of backup files and the automatic database copies (paste it in again after a restore). The National Highways key for road closures is kept the same way.
 
 It costs about 0.1p a photo. The photo is put in Home Assistant's media folder only while the AI reads it, then deleted.
 
@@ -615,6 +633,8 @@ Dads Army needs no internet to run. With warnings and the wider picture switched
 What goes, and when:
 
 - **Emergency Alerts (when switched on):** home's location rounded to about 100 m goes once to postcodes.io (ONS data), to find your district, county, region and constituency, so that an alert for somewhere else doesn't raise your alert level. Again if you move.
+- **Road closures (when switched on, with your key):** your National Highways key goes to National Highways' API (`api.data.nationalhighways.co.uk`) in a header, with England's whole list asked for by time only. Home's location isn't sent.
+- **The grid now (when switched on):** your carbon intensity region's number (one of 14, worked out on the Pi) goes to NESO's Carbon Intensity API. That says roughly which part of Great Britain home is in, and nothing finer.
 - **Rainfall near you (when switched on):** each of the three nearest rain gauges' readings is asked for by the gauge's id, at the Environment Agency, SEPA or Natural Resources Wales. That says home is within 25 km of those gauges.
 - **Scanning:** a new barcode goes to Open Food Facts (only the barcode), unless you use the offline list. A photo of a date or label goes to the AI you choose.
 - **The stores review:** your item names and amounts, to that AI, when you ask.

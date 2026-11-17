@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.19.0"
+VERSION = "1.20.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -4181,6 +4181,7 @@ def scrub_secrets(con):
                 con.execute("UPDATE settings SET value = ? WHERE key = 'scan_ai'", (json.dumps(raw),))
         except ValueError:
             pass
+    con.execute("DELETE FROM settings WHERE key = 'live_keys'")   # 1.20.0: the National Highways key
     con.commit()
     con.execute("VACUUM")   # and no old copies left in free pages
 
@@ -5858,6 +5859,12 @@ FEED_URLS = {
     "margin": "https://data.elexon.co.uk/bmrs/api/v1/forecast/system/loss-of-load?from={start}&to={end}",
     "margin_daily": "https://data.elexon.co.uk/bmrs/api/v1/forecast/margin/daily",
     "dfs": "https://api.neso.energy/api/3/action/datastore_search_sql?",
+    # 1.20.0: home's region of the grid (its number, worked out here) and the next day's forecast, for the greenest
+    # 3 hours; and National Highways' road and lane closures (the whole of England, with your own key).
+    "ci_region": "https://api.carbonintensity.org.uk/regional/regionid/{id}",
+    "ci_region_fw24h": "https://api.carbonintensity.org.uk/regional/intensity/{start}/fw24h/regionid/{id}",
+    "ci_fw24h": "https://api.carbonintensity.org.uk/intensity/{start}/fw24h",
+    "roads": "https://api.data.nationalhighways.co.uk/roads/v2.0/closures",
     "water": "https://utility.arcgis.com/usrsvcs/servers/c69af802939748e29f9d650a7dcde21a/rest/services/PUBLIC/"
              "Aptumo_Contacts_PUBLIC/FeatureServer/0/query?where=1%3D1&outFields=JobGroup__c,JobType__c,"
              "Region__c,ReportedDate__c&returnGeometry=true&outSR=4326&resultRecordCount=2000&f=json",
@@ -5926,6 +5933,7 @@ WARN_SOURCES = [  # key, what it is, on by default
     ("ground", "Groundwater near you (England)", False),
     ("gridnow", "The grid now: carbon and frequency (Great Britain)", False),
     ("gridstress", "Electricity margin and demand flexibility (Great Britain)", True),
+    ("roads", "Road closures near you (England's motorways and major A roads)", False),   # 1.20.0: needs your own key
 ]
 WARN_SOURCE_NAMES = {"metoffice": "Met Office", "floods": "Environment Agency", "govalerts": "GOV.UK Emergency Alerts",
                      "gdacs": "GDACS", "fires": "NASA FIRMS", "ukhsa": "UKHSA", "who": "WHO",
@@ -5933,7 +5941,7 @@ WARN_SOURCE_NAMES = {"metoffice": "Met Office", "floods": "Environment Agency", 
                      "gas": "National Gas", "air": "Defra UK-AIR", "space": "NOAA", "pound": "Bank of England",
                      "threat": "GOV.UK", "cyber": "NCSC", "travel": "FCDO", "drought": "Environment Agency", "water": "your water company",
                      "floodrisk": "Flood Forecasting Centre", "rain": "Environment Agency", "ground": "Environment Agency",
-                     "gridnow": "NESO / Elexon", "gridstress": "Elexon / NESO"}
+                     "gridnow": "NESO / Elexon", "gridstress": "Elexon / NESO", "roads": "National Highways"}
 # A warning from a regional provider says who it's from ("by": "SEPA"), which beats these.
 MET_REGIONS = [  # code, name, rough middle (to guess yours from Home Assistant's location)
     ("os", "Orkney & Shetland", 59.6, -2.0), ("he", "Highlands & Eilean Siar", 57.5, -5.0),
@@ -5997,6 +6005,7 @@ def warn_cfg():
     if raw.get("water_co") in WATER_COS:
         cfg["water_co"] = raw["water_co"]
     MAP_TILES_ON["on"] = cfg["on"] and cfg["map"]   # the web server's CSP lets map pictures in only while it's on
+    cfg["nh_key_set"] = bool(live_keys().get("nh"))   # 1.20.0: whether there's a National Highways key, never the key
     return cfg
 
 
@@ -6243,13 +6252,17 @@ def guess_region(loc):
     return min(pool, key=lambda r: km_between(loc["lat"], loc["lon"], r[2], r[3]))[0]
 
 
-def http_get(url, timeout=20, limit=8 * 1024 * 1024):
+def http_get(url, timeout=20, limit=8 * 1024 * 1024, headers=None, reply=None):
     """Fetch a public feed. Nothing goes with it but Dads Army's name: no cookies, no referrer, no location.
-    Asks for it compressed (some feeds are ten times smaller that way) and unpacks it here."""
-    req = urllib.request.Request(url, headers={"User-Agent": FEED_UA, "Accept": "*/*", "Accept-Encoding": "gzip"})
+    Asks for it compressed (some feeds are ten times smaller that way) and unpacks it here. headers: any more to send
+    (a household's own key, for the one feed that needs it); reply: a dict to put the answer's headers in."""
+    req = urllib.request.Request(url, headers=dict({"User-Agent": FEED_UA, "Accept": "*/*", "Accept-Encoding": "gzip"},
+                                                   **(headers or {})))
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = r.read(limit + 1)
         packed = (r.headers.get("Content-Encoding") or "").lower() == "gzip"
+        if reply is not None:
+            reply.update((k.lower(), v) for k, v in r.headers.items())
     if len(data) > limit:
         raise ValueError("the feed is too big")
     if packed:
@@ -7035,11 +7048,11 @@ def fires_near(home, km, hist, now, ignore=()):
 # picks out what's near home itself. Each turns into a reading for the app and, when something's
 # up, a warning. Trend warnings ("emptying faster than last year") come from the feeds' own history.
 LIVE_KEYS = ("rivers", "power", "grid", "gas", "air", "space", "pound",
-             "threat", "cyber", "travel", "drought", "water", "floodrisk", "rain", "ground", "gridnow", "gridstress")
+             "threat", "cyber", "travel", "drought", "water", "floodrisk", "rain", "ground", "gridnow", "gridstress", "roads")
 LIVE_EVERY = {"rivers": 14 * 60, "power": 14 * 60, "grid": 14 * 60, "gas": 3 * 3600, "air": 55 * 60,
               "space": 29 * 60, "pound": 6 * 3600,     # seconds between fetches: no more often than they change
               "threat": 3 * 3600, "cyber": 3 * 3600, "travel": 3 * 3600, "drought": 12 * 3600, "water": 14 * 60, "floodrisk": 3 * 3600,
-              "rain": 55 * 60, "ground": 24 * 3600, "gridnow": 14 * 60, "gridstress": 55 * 60}
+              "rain": 55 * 60, "ground": 24 * 3600, "gridnow": 14 * 60, "gridstress": 55 * 60, "roads": 14 * 60}
 LIVE_CREDIT = {
     "rivers": "Environment Agency flood and river level data from the real-time data API (Beta), and SEPA's water "
               "levels in Scotland, under the Open Government Licence",
@@ -7064,7 +7077,10 @@ LIVE_CREDIT = {
     "rain": "Rain gauges from the Environment Agency (real-time data API, Beta), SEPA and Natural Resources Wales, under "
             "the Open Government Licence",
     "ground": "Environment Agency groundwater levels from the Hydrology API, under the Open Government Licence",
-    "gridnow": "Carbon intensity from NESO's Carbon Intensity API (CC BY 4.0) and system frequency from Elexon's BMRS",
+    "gridnow": "Carbon intensity, for Great Britain and your region, from NESO's Carbon Intensity API (CC BY 4.0) and "
+               "system frequency from Elexon's BMRS",
+    "roads": "Powered by National Highways' Transport Data Feeds: road and lane closures on England's motorways and major "
+             "A roads (not council roads), with your own free key",
     "gridstress": "Margin forecasts from Elexon's BMRS (Insights) and Demand Flexibility Service events from the NESO "
                   "Data Portal",
 }
@@ -8457,12 +8473,46 @@ def frequency_check(lo, hi):
     return 0, ""
 
 
-def gridnow_live(cur, mix, freq, now):
+# 1.20.0: home's own region too (one of the Carbon Intensity API's 14, matching the electricity networks' areas, so
+# it's worked out here from dno_area: only the region's number is sent), and the greenest 3 hours in the next day.
+CI_REGION_BY_DNO = {17: 1, 18: 2, 16: 3, 15: 4, 23: 5, 13: 6, 21: 7, 14: 8, 11: 9, 10: 10, 22: 11, 20: 12, 12: 13, 19: 14}
+
+
+def ci_region(home):
+    """Home's carbon intensity region (1 to 14), or None: not known, or Northern Ireland (not on Britain's grid)."""
+    return CI_REGION_BY_DNO.get(dno_area(home["lat"], home["lon"])) if home else None
+
+
+def greenest_window(forecast, now, hours=3):
+    """The lowest-carbon run of the next day's half hours: {from, to, avg}, or None. forecast: the API's slots."""
+    rows = []
+    for r in forecast or []:
+        t = parse_when(r.get("from")) if isinstance(r, dict) else None
+        v = (r.get("intensity") or {}).get("forecast") if t and isinstance(r.get("intensity"), dict) else None
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and now - dt.timedelta(minutes=30) < t <= now + dt.timedelta(hours=24):
+            rows.append((t, float(v)))
+    rows.sort()
+    n, best = hours * 2, None
+    for i in range(len(rows) - n + 1):
+        if rows[i + n - 1][0] - rows[i][0] != dt.timedelta(minutes=30 * (n - 1)):
+            continue   # a gap in the forecast
+        avg = sum(v for _, v in rows[i:i + n]) / float(n)
+        if best is None or avg < best[2]:
+            best = (rows[i][0], rows[i + n - 1][0] + dt.timedelta(minutes=30), avg)
+    return {"from": iso_utc(best[0]), "to": iso_utc(best[1]), "avg": int(round(best[2]))} if best else None
+
+
+def gridnow_live(cur, mix, freq, now, region=None, forecast=()):
     ci = cur["intensity"].get("actual")
     ci = cur["intensity"].get("forecast") if ci is None else ci
     reading = {"ci": ci, "index": cur["intensity"].get("index") or "",
                "mix": sorted(({"fuel": str(m.get("fuel")), "pct": round(float(m.get("perc") or 0), 1)}
                               for m in mix if float(m.get("perc") or 0) > 0), key=lambda m: -m["pct"])[:6]}
+    if region:
+        reading["region"] = region
+    green = greenest_window(forecast, now)
+    if green:
+        reading["greenest"] = dict(green, where=region["name"] if region and region.get("forecast") else "Great Britain")
     items = []
     if freq:
         reading.update(hz=round(freq[-1], 3), hz_min=round(min(freq), 3), hz_max=round(max(freq), 3))
@@ -8477,8 +8527,30 @@ def gridnow_live(cur, mix, freq, now):
     return items, reading
 
 
-def fetch_gridnow(now):
+def fetch_gridnow(now, home=None):
     cur = _json(http_get(FEED_URLS["ci_now"]))["data"][0]
+    rid, region, fc = ci_region(home), None, []
+    start = now.strftime("%Y-%m-%dT%H:%MZ")
+    if rid:   # each only adds to the national figures: one failing doesn't fail the source
+        try:
+            got = _json(http_get(FEED_URLS["ci_region"].format(id=rid)))["data"][0]
+            d = got["data"][0]["intensity"]
+            if isinstance(d.get("forecast"), (int, float)):
+                region = {"id": rid, "name": plain(str(got.get("shortname") or ""), 40) or "Your region",
+                          "ci": d["forecast"], "index": str(d.get("index") or "")}
+        except Exception:
+            pass
+        try:
+            fc = (_json(http_get(FEED_URLS["ci_region_fw24h"].format(start=start, id=rid)))["data"] or {}).get("data") or []
+            if region and fc:
+                region["forecast"] = True
+        except Exception:
+            fc = []
+    if not fc:
+        try:
+            fc = _json(http_get(FEED_URLS["ci_fw24h"].format(start=start)))["data"] or []
+        except Exception:
+            fc = []
     try:
         mix = (_json(http_get(FEED_URLS["ci_mix"])).get("data") or {}).get("generationmix") or []
     except Exception:
@@ -8491,7 +8563,7 @@ def fetch_gridnow(now):
                 if isinstance(x, dict) and x.get("frequency")]
     except Exception:
         pass
-    return gridnow_live(cur, mix, freq, now)
+    return gridnow_live(cur, mix, freq, now, region, fc if isinstance(fc, list) else [])
 
 
 # Grid stress: the spare margin over the next 14 hours and two weeks (Elexon), and NESO's Demand
@@ -8796,6 +8868,212 @@ def water_live(reports, co, home, now, km=WATER_NEAR_KM):
                    "planned_here": sum(1 for x in near if x["group"] == "planned" and x["said"])}
 
 
+# Road closures (1.20.0): National Highways' Road and Lane Closures service (DATEX II v3.4, as JSON). England's
+# motorways and major A roads only (the Strategic Road Network), not council roads. It needs the household's own free
+# key (developer.data.nationalhighways.co.uk), kept out of /api/state and of backups like the AI keys. The whole national
+# list is fetched and picked through here, so National Highways isn't told where home is.
+NH_PAGES = 20                     # per closure type; each page is a few hundred records
+NH_FULL_TYPES = ("roadClosed", "carriagewayClosures")
+NH_KEY_RE = re.compile(r"[A-Za-z0-9]{20,100}")
+NH_NEEDS_KEY = "Needs your own National Highways API key: add it in the warnings settings, under Road closures"
+NH_CAUSES = {"roadMaintenance": "roadworks", "vehicleObstruction": "a stopped vehicle", "accident": "a collision",
+             "poorEnvironment": "the weather", "environmentalObstruction": "flooding or debris",
+             "obstruction": "an obstruction", "infrastructureDamageObstruction": "damage to the road",
+             "abnormalTraffic": "heavy traffic", "publicEvent": "an event"}
+NH_HAZARD_CAUSES = ("poorEnvironment", "environmentalObstruction", "infrastructureDamageObstruction")
+ROADS_MOST = 40
+ROADS_URL = "https://www.trafficengland.com/"
+
+
+class FeedRefused(Exception):
+    """A feed turned the request down (a wrong key): says why, in words to show as they are."""
+
+
+def live_keys():
+    """The households' own keys for live sources (National Highways): never in /api/state or backups."""
+    raw = setting_raw("live_keys", {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def nh_get(url, key):
+    """(one page of closures, the next page's link or None). The key goes in a header, and only to National Highways."""
+    base = urlparse(FEED_URLS["roads"])
+    if not url.startswith("%s://%s/" % (base.scheme, base.netloc)):
+        raise ValueError("unexpected National Highways link")
+    got = {}
+    try:
+        data = http_get(url, timeout=40, reply=got, headers={
+            "Accept": "application/json", "X-Response-MediaType": "application/json", "Cache-Control": "no-cache",
+            "Ocp-Apim-Subscription-Key": key})
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise FeedRefused("National Highways didn't accept the API key (HTTP %d)" % e.code)
+        raise
+    nxt = (got.get("x-next") or "").strip()
+    return (_json(data) if data.strip() else {}), (urllib.parse.urljoin(url, nxt) if nxt else None)
+
+
+def _walk(x):
+    """Every dict inside x, x included."""
+    stack = [x]
+    while stack:
+        y = stack.pop()
+        if isinstance(y, dict):
+            yield y
+            stack.extend(y.values())
+        elif isinstance(y, list):
+            stack.extend(y)
+
+
+def nh_points(loc):
+    pts = []
+    for d in _walk(loc):
+        pl = d.get("posList")
+        if isinstance(pl, str):
+            nums = []
+            for bit in pl.split():
+                try:
+                    nums.append(float(bit))
+                except ValueError:
+                    pass
+            pts += [(nums[k], nums[k + 1]) for k in range(0, len(nums) - 1, 2)]
+        if isinstance(d.get("latitude"), (int, float)) and isinstance(d.get("longitude"), (int, float)):
+            pts.append((float(d["latitude"]), float(d["longitude"])))
+    return [(la, lo) for la, lo in pts if 49 <= la <= 61 and -9 <= lo <= 3]   # (lat, lon) in Great Britain
+
+
+def nh_lines(loc):
+    """The closed stretches for the map, one line per piece of road: at most 20, of 60 points each."""
+    out = []
+    for d in _walk(loc):
+        pl = d.get("posList")
+        if not isinstance(pl, str):
+            continue
+        line = nh_points({"posList": pl})
+        if len(line) >= 2:
+            step = max(1, -(-(len(line) - 1) // 59))   # at most 60 points, the far end included
+            keep = line[::step] if line[::step][-1] == line[-1] else line[::step] + [line[-1]]
+            out.append([[round(a, 5), round(b, 5)] for a, b in keep])
+    return out[:20]
+
+
+def nh_closures(payload, unplanned):
+    """National Highways' JSON -> [{id, road, where, comment, cause, status, start, end, full, points, lines, unplanned}]."""
+    p = payload.get("D2Payload") if isinstance(payload, dict) else None
+    out = []
+    for sit in (p if isinstance(p, dict) else {}).get("situation") or []:
+        if not isinstance(sit, dict):
+            continue
+        for rec in sit.get("situationRecord") or []:
+            inner = next((v for k, v in (rec.items() if isinstance(rec, dict) else []) if k.startswith("sit") and isinstance(v, dict)), None)
+            if inner is None:
+                continue
+            val = inner.get("validity") if isinstance(inner.get("validity"), dict) else {}
+            span = val.get("validityTimeSpecification") if isinstance(val.get("validityTimeSpecification"), dict) else {}
+            loc = inner.get("locationReference") or {}
+            road = next((d["roadName"] for d in _walk(loc) if isinstance(d.get("roadName"), str)), "")
+            where = next((d["locationDescription"] for d in _walk(loc) if isinstance(d.get("locationDescription"), str)), "")
+            comments = [str(c.get("comment")) for c in inner.get("generalPublicComment") or [] if isinstance(c, dict) and c.get("comment")]
+            m = inner.get("roadOrCarriagewayOrLaneManagementType")
+            mtype = str(m.get("value") or "") if isinstance(m, dict) else ""
+            full = mtype in NH_FULL_TYPES
+            for d in _walk(loc):
+                # The feed lists only the lanes affected, so "every lane listed is closed" isn't the road closed.
+                # numberOfOperationalLanes is the lanes left open (seen live: "lane 1,2 closures" is 2 restricted,
+                # 1 operational), so lanes restricted and none left open is the carriageway closed.
+                imp = d.get("impactOnCarriageway") if isinstance(d.get("impactOnCarriageway"), dict) else None
+                if imp is not None:
+                    shut, left = imp.get("numberOfLanesRestricted"), imp.get("numberOfOperationalLanes")
+                    if isinstance(shut, int) and isinstance(left, int) and shut > 0 and left == 0:
+                        full = True
+            text = " ".join(comments).lower()
+            if full and mtype not in NH_FULL_TYPES and re.search(r"narrow lanes|\blanes? [\d ,&and]+clos", text) \
+                    and not re.search(r"(road|carriageway|slip road|slip|exit|entry|link) (is )?clos", text):
+                full = False   # "lane 1 and 2 closures" on a three-lane road
+            cause = inner.get("cause") if isinstance(inner.get("cause"), dict) else {}
+            out.append({"id": str(rec.get("idG") or inner.get("idG") or sit.get("idG") or "")[:120],
+                        "road": plain(road, 20), "where": plain(where, 160), "comment": plain(" ".join(comments), 300),
+                        "cause": str(cause.get("causeType") or ""), "status": str(val.get("validityStatus") or ""),
+                        "start": parse_when(span.get("overallStartTime")), "end": parse_when(span.get("overallEndTime")),
+                        "full": full, "points": nh_points(loc), "lines": nh_lines(loc), "unplanned": unplanned})
+    return out
+
+
+def roads_live(closures, home, now, km=WATER_NEAR_KM, checked=None):
+    """Closures within the near distance that are on now (or, if planned, start in the next 12 hours).
+
+    Unplanned and on now: the road shut is a warning (amber); lanes shut by the weather, flooding or damage to the road
+    are worth knowing (yellow); a breakdown in lane 1 isn't. Planned roadworks, and anything not on yet, are listed
+    only (never a notification). Each closure has its own id, so each warns once. One line per stretch, the most
+    serious record."""
+    seen, rows = {}, []
+    for c in closures:
+        if c["status"] == "suspended" or not c["points"]:
+            continue   # cancelled, or nowhere
+        if c["end"] and c["end"] < now:
+            continue   # finished (they stay in the feed for a week)
+        if c["start"] and c["start"] > now + dt.timedelta(hours=12):
+            continue
+        near = min(c["points"], key=lambda q: km_between(home["lat"], home["lon"], q[0], q[1]))
+        d = km_between(home["lat"], home["lon"], near[0], near[1])
+        if d > km:
+            continue
+        on_now = not c["start"] or c["start"] <= now
+        sev = 0 if not (c["unplanned"] and on_now) else 2 if c["full"] else 1 if c["cause"] in NH_HAZARD_CAUSES else 0
+        what = (c["road"] + " closed" if c["full"] else c["road"] + " lane closure").strip()
+        why = NH_CAUSES.get(c["cause"], "")
+        when = ""
+        if c["start"] and c["start"] > now:
+            when = "From " + when_words(iso_utc(c["start"]))
+        if c["end"]:
+            when += (" until " if when else "Until ") + when_words(iso_utc(c["end"]))
+        text = ". ".join(x for x in (
+            ("Unplanned" if c["unplanned"] else "Planned") + (", because of " + why if why else ""), when,
+            c["comment"] if c["comment"] and c["comment"] not in (c["where"], "laneClosures") else "") if x) + "."
+        row = {"id": c["id"], "road": c["road"], "where": c["where"], "full": c["full"], "unplanned": c["unplanned"],
+               "on_now": on_now, "severity": sev, "km": round(d, 1),
+               "dir": DIR_SHORT.get(compass(home["lat"], home["lon"], near[0], near[1]), ""),
+               "title": "%s%s · %s away" % (what[:1].upper() + what[1:], ": " + c["where"] if c["where"] else "", _km_words(d)),
+               "text": text, "when": when, "issued": iso_utc(c["start"]) if c["start"] and on_now else "",
+               "lat": round(near[0], 5), "lon": round(near[1], 5), "lines": c["lines"]}
+        key = (c["road"], c["where"], c["full"], c["unplanned"])
+        if key in seen:
+            if sev > rows[seen[key]]["severity"]:
+                rows[seen[key]] = row
+            continue
+        seen[key] = len(rows)
+        rows.append(row)
+    rows.sort(key=lambda r: (-r["severity"], r["km"]))
+    rows = rows[:ROADS_MOST]
+    items = [{"id": "roads:%s" % (r["id"] or "%s %s" % (r["road"], r["where"])), "source": "roads", "kind": "road",
+              "severity": r["severity"], "level": "Road closed" if r["full"] else "Lane closed", "title": r["title"],
+              "text": r["text"], "area": r["road"], "when": r["when"], "url": ROADS_URL,
+              "issued": r["issued"] or iso_utc(now), "distance_km": r["km"], "lat": r["lat"], "lon": r["lon"],
+              "lines": r["lines"]} for r in rows if r["severity"]]
+    unplanned = [r for r in rows if r["unplanned"] and r["on_now"]]
+    return items, {"closures": rows, "unplanned": len(unplanned), "closed": sum(1 for r in unplanned if r["full"]),
+                   "later": sum(1 for r in rows if not (r["unplanned"] and r["on_now"])),
+                   "checked": len(closures) if checked is None else checked, "within_km": km}
+
+
+def fetch_roads(home, mem, now, km):
+    key = mem.get("nh_key") or ""
+    if not key:
+        raise FeedRefused(NH_NEEDS_KEY)
+    fmt, closures = "%Y-%m-%dT%H:%M:%S", []
+    now = now.replace(microsecond=0)
+    for kind, a, b in (("unplanned", now - dt.timedelta(hours=48), now + dt.timedelta(hours=1)),
+                       ("planned", now - dt.timedelta(hours=1), now + dt.timedelta(hours=12))):
+        url = FEED_URLS["roads"] + "?" + urllib.parse.urlencode(
+            {"closureType": kind, "startDateTime": a.strftime(fmt), "endDateTime": b.strftime(fmt)})
+        for _ in range(NH_PAGES):
+            payload, url = nh_get(url, key)
+            closures += nh_closures(payload, kind == "unplanned")
+            if not url:
+                break
+    return roads_live(closures, home, now, km)
+
+
 DFS_RESOURCE = "3635fd80-49d7-4d02-964d-cc8c08d50302"
 
 
@@ -8805,7 +9083,7 @@ LIVE_LOOK = {"rivers": ("🏞️", "Rivers"), "power": ("🔌", "Power cuts"), "
              "pound": ("💷", "The pound"), "threat": ("🛡️", "Threat level"), "cyber": ("💻", "Cyber security"),
              "travel": ("✈️", "Travel advice"), "drought": ("💧", "Drought and reservoirs"), "water": ("🚰", "Water supply"),
              "floodrisk": ("🌧️", "Flood risk forecast"), "rain": ("☔", "Rainfall"), "ground": ("🕳️", "Groundwater"),
-             "gridnow": ("🔋", "The grid now"), "gridstress": ("📉", "Grid margin")}
+             "gridnow": ("🔋", "The grid now"), "gridstress": ("📉", "Grid margin"), "roads": ("🚧", "Road closures")}
 TREND_WORDS = {"rising": "rising", "falling": "falling", "steady": "steady"}
 
 
@@ -8940,6 +9218,13 @@ def live_rows(live, items, trends=()):
             state = "warn" if b and b[0]["pct"] < 13 and not b[0].get("deep") else "good"
         elif key == "gridnow":
             text = "%s g CO2/kWh (%s)" % (r.get("ci"), r.get("index") or "")
+            g = r.get("greenest")
+            green = " · greenest 3 hours from %s" % _hhmm_local(g["from"]) if g else ""
+            brief = text + green   # Britain's figure: the region's would say roughly where home is
+            reg = r.get("region")
+            if reg:
+                text = "%s: %s g CO2/kWh (%s)" % (reg["name"], reg["ci"], reg["index"])
+            text += green
             if r.get("hz"):
                 text += " · %.2f Hz" % r["hz"]
         elif key == "gridstress":
@@ -8948,6 +9233,20 @@ def live_rows(live, items, trends=()):
                 text += " · 2 weeks: %s GW lowest" % fq(round(r["low_mw"] / 1000.0, 1))
             if r.get("dfs"):
                 text += " · demand flexibility event"
+        elif key == "roads":
+            wk = r.get("within_km", WATER_NEAR_KM)
+            n, closed = r.get("unplanned", 0), r.get("closed", 0)
+            if not r.get("closures"):
+                text = "No closures within %d km" % wk
+            elif closed:
+                text = "%d road%s closed within %d km" % (closed, "" if closed == 1 else "s", wk) + (
+                    " · %d lane closure%s" % (n - closed, "" if n - closed == 1 else "s") if n > closed else "")
+            elif n:
+                text = "%d lane closure%s within %d km" % (n, "" if n == 1 else "s", wk)
+            else:
+                text = "No unplanned closures within %d km" % wk
+            if r.get("later"):
+                text += " · %d planned or later today" % r["later"]
         if worst.get(key, 0) >= 2:
             state = "bad"
         elif (worst.get(key, 0) == 1 or key in rising) and state == "good":
@@ -8965,13 +9264,13 @@ def live_rows(live, items, trends=()):
 # The sources that touch daily life at home: water off, a power cut, a flood, severe weather. The rest of the wider
 # picture (the pound, the threat level, the grid's margin) matters, but it isn't "affecting you" today.
 AFFECT_SOURCES = ("water", "power", "floods", "metoffice", "govalerts", "rivers", "fires", "rain", "floodrisk", "air",
-                  "drought")
-AFFECT_STARTED = ("water", "power", "floods", "govalerts")   # where "issued" is when the trouble started
+                  "drought", "roads")
+AFFECT_STARTED = ("water", "power", "floods", "govalerts", "roads")   # where "issued" is when the trouble started
 KM_AWAY = re.compile(r"\s*(?:·\s*)?[\d.]+ km away\s*$")
 LIVE_GROUPS = [   # the wider picture's lines that need no attention, under these headings, in this order
     ("Water and weather", ("rivers", "floodrisk", "rain", "ground", "drought")),
     ("Power and energy", ("power", "grid", "gridnow", "gridstress", "gas")),
-    ("Home", ("water", "air")),
+    ("Home", ("water", "air", "roads")),
     ("The wider world", ("threat", "cyber", "travel", "space", "pound")),
 ]
 STATE_RANK = {"bad": 2, "warn": 1, "good": 0}
@@ -9054,7 +9353,8 @@ def live_map(cfg, loc, items, live):
     scope: "yours" (a warning in force) or "near" (listed, but not a warning: a power cut more than 2 km away, another
     street's water report, a river gauge). routine: planned work, a river at its usual level, a leak, or anything
     with severity 0 that isn't in "Nearby". i: the warning's place in items, or key: the live source whose details
-    to open. A point may carry lines (lists of [lat, lon]) one day; none do yet."""
+    to open. A road closure (1.20.0) carries the stretches it covers as lines (lists of [lat, lon]), and road:
+    "unplanned" or "planned" (drawn solid, or dashed grey with the routine ones)."""
     if not (cfg["on"] and cfg.get("map")):
         return {"on": False}
     out = {"on": True, "home": [loc["lat"], loc["lon"]] if loc else None, "near_km": cfg["near_km"], "points": []}
@@ -9071,7 +9371,8 @@ def live_map(cfg, loc, items, live):
         add(i.get("lat"), i.get("lon"), i=n, key="", source=i.get("source") or "", kind=i.get("kind") or "",
             title=KM_AWAY.sub("", i.get("title") or ""), level=i.get("level") or "", severity=sev,
             distance_km=i.get("distance_km"), scope="yours",
-            routine=sev < 1 or (i.get("source") == "power" and i.get("level") == "Planned"))
+            routine=sev < 1 or (i.get("source") == "power" and i.get("level") == "Planned"),
+            **({"lines": i.get("lines") or [], "road": "unplanned"} if i.get("source") == "roads" else {}))
     p = live.get("power") or {}
     for c in p.get("cuts") or []:
         if c.get("km") is None or c["km"] <= POWER_NEAR_KM:
@@ -9094,6 +9395,14 @@ def live_map(cfg, loc, items, live):
         add(g.get("lat"), g.get("lon"), key="rivers", source="rivers", kind="river", title=g.get("where") or "River gauge",
             level="Usual level" if g.get("state") == "normal" else "Low" if g.get("state") == "low" else "",
             severity=0, distance_km=g.get("km"), scope="near", routine=True, area="")
+    for c in (live.get("roads") or {}).get("closures") or []:
+        if c.get("severity"):
+            continue   # a warning: on the map already
+        live_now = c.get("unplanned") and c.get("on_now")
+        add(c.get("lat"), c.get("lon"), key="roads", source="roads", kind="road", title=KM_AWAY.sub("", c.get("title") or ""),
+            level="Lane closed" if live_now else "Planned", severity=0, distance_km=c.get("km"), scope="near",
+            routine=not live_now, area=c.get("road") or "", lines=c.get("lines") or [],
+            road="unplanned" if live_now else "planned")
     return out
 
 
@@ -9129,7 +9438,7 @@ def fetch_live(key, cfg, home, mem, now):
     if key == "floodrisk":
         return fetch_floodrisk(home)   # Scotland's own forecast for a home there
     if key == "gridnow":
-        return fetch_gridnow(now)
+        return fetch_gridnow(now, home)
     if key == "gridstress":
         return fetch_gridstress(now)
     if not home:
@@ -9184,6 +9493,8 @@ def fetch_live(key, cfg, home, mem, now):
         return fetch_rain(home, mem, now)
     if key == "ground":
         return fetch_ground(home, mem, now)
+    if key == "roads":
+        return fetch_roads(home, mem, now, cfg["near_km"])
     raise ValueError("unknown source")
 
 
@@ -9215,6 +9526,8 @@ def home_key(home):
 
 
 def why_failed(e):
+    if isinstance(e, FeedRefused):
+        return str(e)
     if isinstance(e, urllib.error.HTTPError):
         return "the site answered %s" % e.code
     if isinstance(e, (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError)):
@@ -9232,7 +9545,7 @@ def warnings_run():
         mem = {"areas": setting_raw("flood_areas", {}) or {}, "fire_cells": setting_raw("fire_cells", {}) or {},
                "fire_ignore": fire_ignore_list(), "river_stations": setting_raw("river_stations", {}) or {},
                "river_history": setting_raw("river_history", {}) or {}, "air_forecast": setting_raw("air_forecast", {}) or {},
-               "rain_stations": setting_raw("rain_stations", {}) or {}}
+               "rain_stations": setting_raw("rain_stations", {}) or {}, "nh_key": live_keys().get("nh") or ""}
     if not cfg["on"]:
         return
     home = home_location(cfg)
@@ -9378,6 +9691,7 @@ SOURCE_COVERAGE = {
     "ground": nation_coverage(("england",), "Only covers England (the Environment Agency's boreholes)"),
     "drought": nation_coverage(("england",), "Only covers England (the Environment Agency's weekly drought report)"),
     "grid": nation_coverage(GB, GB_ONLY), "gridnow": nation_coverage(GB, GB_ONLY), "gridstress": nation_coverage(GB, GB_ONLY),
+    "roads": nation_coverage(("england",), "Only covers England (National Highways' motorways and major A roads)"),
 }
 
 
@@ -9402,6 +9716,7 @@ TREND_METRICS = [  # key, the source it belongs with, what it counts, the least 
     ("rivers_high", "rivers", "Rivers above their usual range near you", 2),
     ("fires", "fires", "Possible fires near you", 3),
     ("grid", "grid", "Grid notices", 2),
+    ("roads_near", "roads", "Unplanned road closures near you", 3),
 ]
 TREND_NAME = dict((k, n) for k, _, n, _ in TREND_METRICS)
 
@@ -9425,6 +9740,8 @@ def trend_counts(live, by_src, statuses, mem):
         out["fires"] = len(by_src.get("fires") or [])
     if ok("grid"):
         out["grid"] = len(by_src.get("grid") or [])
+    if ok("roads") and live.get("roads"):
+        out["roads_near"] = live["roads"].get("unplanned", 0)
     return out
 
 
@@ -9596,7 +9913,20 @@ def api_warnings_set(body, query):
             if v and v not in allowed:
                 raise ApiError(400, "That isn't one of the choices")
             cur[k] = v
+    keys = live_keys()
+    if "nh_key" in body:   # 1.20.0: an empty box leaves the key alone; null removes it
+        v = str(body.get("nh_key") or "").strip()
+        if v and not NH_KEY_RE.fullmatch(v):
+            raise ApiError(400, "That doesn't look like a National Highways API key (20 to 100 letters and numbers)")
+        if v:
+            if not keys.get("nh"):
+                cur["sources"]["roads"] = True   # adding a key is asking for road closures
+            keys["nh"] = v
+        elif body.get("nh_key") is None:
+            keys.pop("nh", None)
+    cur.pop("nh_key_set", None)
     with tx() as db:
+        set_setting_raw(db, "live_keys", keys)
         set_setting_raw(db, "warnings", cur)
         add_log("settings", "", "Warnings switched on" if cur["on"] and "on" in body and body.get("on")
                 else "Warnings switched off" if "on" in body and not cur["on"] else "Warnings settings updated")

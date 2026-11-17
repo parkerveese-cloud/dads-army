@@ -50,6 +50,7 @@ Every line of code, idea, test and word of feedback here has helped a household 
 - SSEN: power cuts
 - Northern Powergrid: power cuts
 - NESO and Elexon: electricity grid notices
+- National Highways: road and lane closures (Powered by National Highways' Transport Data Feeds)
 - National Gas: gas storage
 - Defra UK-AIR: air quality
 - [Open Food Facts contributors](https://world.openfoodfacts.org): product names, sizes and calories for scanned barcodes, under the Open Database Licence

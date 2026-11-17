@@ -303,7 +303,7 @@ class RegionalRunTest(AppTest):
     def test_glasgow(self):
         w = self.run_for(GLASGOW)
         rows = dict((r["key"], r) for r in w["live_rows"])
-        self.assertEqual(sorted(w["unavailable"]), ["drought", "ground", "water"])   # England's, and no company chosen
+        self.assertEqual(sorted(w["unavailable"]), ["drought", "ground", "roads", "water"])   # England's, and no company chosen
         self.assertEqual(w["unavailable"]["water"], server.WATER_CHOOSE)
         self.assertEqual([i["title"] for i in w["items"] if i["source"] == "floods"],
                          ["Flood warning: White Cart Water at Pollokshaws", "Flood alert: Glasgow and Clyde"])
@@ -330,7 +330,7 @@ class RegionalRunTest(AppTest):
     def test_belfast(self):
         w = self.run_for(BELFAST)
         self.assertEqual(sorted(w["unavailable"]), ["drought", "floodrisk", "floods", "grid", "gridnow", "gridstress",
-                                                    "ground", "rain", "rivers"])
+                                                    "ground", "rain", "rivers", "roads"])
         self.assertEqual(sorted(r["key"] for r in w["live_rows"]), ["power", "water"])   # NI Water: not guessed, known
         self.assertEqual(w["live"]["water"]["company"], "NI Water")
         self.assertTrue([i for i in w["items"] if i["source"] == "power" and "NIE Networks" in i["text"]])

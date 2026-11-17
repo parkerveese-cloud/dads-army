@@ -191,7 +191,7 @@ class GroupedLayoutTest(AppTest):
         self.assertEqual(lay["attention"], ["power", "air", "threat"])
         self.assertEqual([g["name"] for g in lay["groups"]],
                          ["Water and weather", "Power and energy", "Home", "The wider world"])
-        self.assertEqual(lay["groups"][2]["keys"], ["water"])   # air needs attention, so it's up top instead
+        self.assertEqual(lay["groups"][2]["keys"], ["water", "roads"])   # air needs attention, so it's up top instead
         placed = lay["attention"] + [k for g in lay["groups"] for k in g["keys"]]
         self.assertEqual(sorted(placed), sorted(server.LIVE_KEYS))   # every line once
 

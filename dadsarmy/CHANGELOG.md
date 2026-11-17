@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.20.0
+
+**Road closures**
+
+- **A new live source:** closures on England's motorways and major A roads within your near you distance, from National Highways. Council roads aren't covered. Off until you add a key.
+- **It needs your own free key.** Sign up at developer.data.nationalhighways.co.uk, subscribe to Road and Lane Closures, and paste the key in the warnings settings, under **Road closures**. Adding a key switches road closures on. Like the AI keys, it stays on the Pi, is never shown back (the app only learns that one is saved), and is left out of backup files and the automatic copies. A key National Highways doesn't accept says so in the last check.
+- **What's a warning.** An unplanned closure of the whole road that's on now (a crash, flooding) is amber; lanes shut by the weather, flooding or damage to the road are yellow; a breakdown in lane 1 isn't a warning. Planned roadworks, and closures starting later today, are listed in the details but never notify. Each closure warns once, and one stretch with several records is one line.
+- **Lanes left open.** The feed lists only the lanes affected, so the road counts as closed only when lanes are shut and none are left open (National Highways' "operational lanes"), or it says the road or carriageway is closed. "Narrow lanes" and "lane 1 and 2 closures" stay lane closures.
+- **In Affecting you** when one is a warning, and **on the map** as the stretch that's shut: unplanned closures as a solid line in their colour with a white edge, planned roadworks as a dashed grey line with the routine things (behind **Show routine**). The key under the map only shows the lines that are on it.
+- **Your location isn't sent.** England's whole list is fetched (closures from the last two days to the next hour, and planned work for the next 12 hours) and picked through on the Pi. The key goes only to National Highways, in a header.
+- England only: elsewhere its switch says it's not for your area.
+- Powered by National Highways' Transport Data Feeds.
+
+**The grid now, fuller**
+
+- **Your region's carbon intensity**, as well as Great Britain's: one of the 14 regions of NESO's Carbon Intensity API, worked out on the Pi from your electricity network's area, so only the region's number is asked for.
+- **The greenest 3 hours in the next day**, from the half-hourly forecast for your region (or Great Britain's), for the washing machine or charging.
+- The wider picture's line leads with your region; the daily briefing is given Great Britain's figure only.
+
+- Key boxes (this one, and the AI keys under Scanning) now look like the other boxes.
+- In `GET /api/state`, the warnings' `config` has `nh_key_set` (never the key), and `live` has `roads` (`closures`, `unplanned`, `closed`, `later`, `checked`, `within_km`) and, in `gridnow`, `region` and `greenest`. `PUT /api/warnings` takes `nh_key` (an empty one leaves it alone, `null` removes it). A trend counts unplanned road closures near you.
+
 ## 1.19.0
 
 **A map of the live alerts**

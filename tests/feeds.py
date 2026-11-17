@@ -295,6 +295,69 @@ def water():
                                      "geometry": {"x": -0.12, "y": 51.51}}]}).encode()
 
 
+# 1.20.0: home's region of the grid, and the next day's half hours from the next hour on (GREEN_FROM: the greenest
+# three hours start 5 hours after that), in the Carbon Intensity API's shapes.
+GREEN_FROM = NOW.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=6)
+
+
+def _halfhours(low=40):
+    t = NOW.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
+    out = []
+    for n in range(48):
+        f = t + dt.timedelta(minutes=30 * n)
+        v = low if 10 <= n < 16 else 200
+        out.append({"from": f.strftime("%Y-%m-%dT%H:%MZ"), "to": (f + dt.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%MZ"),
+                    "intensity": {"forecast": v, "index": "low" if v < 100 else "moderate"}})
+    return out
+
+
+def ciregion():
+    return json.dumps({"data": [{"regionid": 13, "dnoregion": "UKPN London", "shortname": "London", "data": [
+        {"from": ago(minutes=10).strftime("%Y-%m-%dT%H:%MZ"), "intensity": {"forecast": 95, "index": "low"},
+         "generationmix": [{"fuel": "wind", "perc": 50}]}]}]}).encode()
+
+
+def ciregionfw():
+    return json.dumps({"data": {"regionid": 13, "shortname": "London", "data": _halfhours()}}).encode()
+
+
+def cifw():
+    return json.dumps({"data": _halfhours()}).encode()
+
+
+# National Highways' Road and Lane Closures (DATEX II v3.4 as JSON), in the shape it had on 17 November 2026: one
+# situation record per closure. By default an unplanned closure of the A2 near Blackheath, south-east London.
+def nh_record(kind="sitRoadOrCarriagewayOrLaneManagement", mtype="laneClosures", status="active", start=None, end=None,
+              cause="vehicleObstruction", road="A2", where="A2 eastbound near Blackheath",
+              pos="51.4700 0.0100 51.4710 0.0120", lanes=("closed", "closed"), point=None, rid="r1", comment="Broken down vehicle"):
+    start = start or ago(hours=1).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end = end or (NOW + dt.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    loc = ({"locPointLocation": {"pointByCoordinates": {"pointCoordinates": {"latitude": point[0], "longitude": point[1]}},
+                                 "pointAlongLinearElement": [{"linearElement": {"locLinearElementByCode": {"roadName": road}}}],
+                                 "supplementaryPositionalDescription": {"locationDescription": where}}}
+           if point else
+           {"locLocationGroupByList": {"locationContainedInGroup": [{
+               "locLinearLocation": {
+                   "gmlLineString": {"locGmlLineString": {"srsDimension": 2, "posList": pos}},
+                   "supplementaryPositionalDescription": {"locationDescription": where, "carriageway": [{
+                       "carriageway": {"value": "extendedG", "extendedValueG": "dualCarriageway"},
+                       "lane": [{"laneNumber": n + 1, "laneExtensionG": {"impactOnLanes": {"impactExtensionG": {"lanesStatus": s}}}}
+                                for n, s in enumerate(lanes)],
+                       "carriagewayExtensionG": {"impactOnCarriageway": {
+                           "numberOfLanesRestricted": lanes.count("closed"), "numberOfOperationalLanes": lanes.count("open")}}}]}},
+               "locSingleRoadLinearLocation": {"linearWithinLinearElement": [
+                   {"linearElement": {"locLinearElementByCode": {"roadName": road}}}]}}]}})
+    return {kind: {"idG": rid, "roadOrCarriagewayOrLaneManagementType": {"value": mtype},
+                   "validity": {"validityStatus": status,
+                                "validityTimeSpecification": {"overallStartTime": start, "overallEndTime": end}},
+                   "cause": {"causeType": cause}, "generalPublicComment": [{"comment": comment}],
+                   "locationReference": loc}}
+
+
+def nh_payload(*recs):
+    return {"D2Payload": {"situation": [{"idG": "s%d" % n, "situationRecord": [r]} for n, r in enumerate(recs)]}}
+
+
 def wider_routes():
     return {"threat": (threat, "application/xml"), "ncsc": (ncsc, "application/xml"), "fcdo": (fcdo, "application/xml"),
             "dsearch": (dsearch, "application/json"), "govuk": (govuk, "application/json"),
@@ -303,7 +366,10 @@ def wider_routes():
             "ci": (ci, "application/json"), "cimix": (cimix, "application/json"), "freq": (freq, "application/json"),
             "margin": (margin, "application/json"), "margind": (margind, "application/json"),
             "dfs": (dfs, "application/json"), "water": (water, "application/json"),
-            "places": (places, "application/json")}
+            "places": (places, "application/json"),
+            # 1.20.0: home's carbon intensity region and the next day's forecasts, and National Highways' closures
+            "ciregion": (ciregion, "application/json"), "ciregionfw": (ciregionfw, "application/json"),
+            "cifw": (cifw, "application/json"), "nh": (lambda: json.dumps(nh_payload(nh_record())).encode(), "application/json")}
 
 
 def wider_urls(b):
@@ -312,7 +378,9 @@ def wider_urls(b):
             "rain": b + "rain/{id}?since={since}", "gw_stations": b + "gwst", "gw": b + "gw/{id}?{query}",
             "ci_now": b + "ci", "ci_mix": b + "cimix", "frequency": b + "freq?from={start}&to={end}",
             "margin": b + "margin?from={start}&to={end}", "margin_daily": b + "margind", "dfs": b + "dfs?",
-            "water": b + "water", "places": b + "places"}
+            "water": b + "water", "places": b + "places",
+            "ci_region": b + "ciregion/{id}", "ci_region_fw24h": b + "ciregionfw/{start}/{id}", "ci_fw24h": b + "cifw/{start}",
+            "roads": b + "nh"}
 
 
 # -- The rest of the UK (1.15.0): stand-ins for the regional providers, in the shapes their real feeds had on

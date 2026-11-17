@@ -238,7 +238,7 @@ class LiveRunTest(AppTest):
                                  "air": b + "air", "air_forecast": b + "airfc", "space": b + "space",
                                  "pound": b + "pound?from={start}"})
         server.FEED_URLS.update(wider_urls(b))   # 1.15.0's sources
-        server.api_warnings_set({"on": True, "lat": HOME["lat"], "lon": HOME["lon"],
+        server.api_warnings_set({"on": True, "lat": HOME["lat"], "lon": HOME["lon"], "nh_key": "k" * 32,   # 1.20.0's roads
                                  "sources": {k: True for k in server.LIVE_KEYS}}, {})
 
     def tearDown(self):

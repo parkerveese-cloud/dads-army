@@ -1534,12 +1534,12 @@
   // ------------------------------------------------------------------
   var WARN_ICON = { weather: '🌦️', flood: '🌊', alert: '📢', disaster: '🌍', fire: '🔥', news: '🩺',
     river: '🏞️', power: '🔌', grid: '⚡', gas: '🔥', air: '🌫️', space: '☀️', money: '💷',
-    threat: '🛡️', cyber: '💻', drought: '💧', water: '🚰' };
+    threat: '🛡️', cyber: '💻', drought: '💧', water: '🚰', road: '🚧' };
   var SRC_NAME = { metoffice: 'Met Office', floods: 'Environment Agency', govalerts: 'GOV.UK', gdacs: 'GDACS', fires: 'NASA FIRMS',
     ukhsa: 'UKHSA', who: 'WHO', rivers: 'Environment Agency', power: 'Power networks', grid: 'NESO', gas: 'National Gas',
     air: 'Defra UK-AIR', space: 'NOAA', pound: 'Bank of England', threat: 'GOV.UK', cyber: 'NCSC', travel: 'FCDO',
     drought: 'Environment Agency', water: 'Your water company', floodrisk: 'Flood Forecasting Centre', rain: 'Environment Agency',
-    ground: 'Environment Agency', gridnow: 'NESO / Elexon', gridstress: 'Elexon / NESO' };
+    ground: 'Environment Agency', gridnow: 'NESO / Elexon', gridstress: 'Elexon / NESO', roads: 'National Highways' };
   var LIVE_KEYS = ['rivers', 'power', 'grid', 'gas', 'air', 'space', 'pound'];
   var LIVE_MORE = 'threat';   // 1.15.0's sources start here in the settings
   function W() {
@@ -1690,15 +1690,16 @@
   try { MAP_ROUTINE = localStorage.getItem('da-map-routine') === '1'; } catch (e) { MAP_ROUTINE = false; }
   var SEV_WORD = { 3: 'Red', 2: 'Amber', 1: 'Yellow' };
   var KIND_WORD = { weather: 'Weather', flood: 'Floods', alert: 'Emergency Alerts', disaster: 'Disasters', fire: 'Fires',
-    river: 'Rivers', power: 'Power', water: 'Water', air: 'Air' };
+    river: 'Rivers', power: 'Power', water: 'Water', air: 'Air', road: 'Roads' };
   var UK_BOUNDS = [[49.9, -8.2], [60.9, 1.8]];
   function mapOn(w) { return !!(w.on && w.map && w.map.on && w.map.home); }
   function isRoutine(p) { return !!p.routine; }
   function mapPoints(w) { return (w.map && w.map.points) || []; }
   function mapHtml(w) {
     if (!mapOn(w)) return '';
-    var pts = mapPoints(w), sev = {}, kinds = {}, rkinds = {}, near = false, routine = 0;
+    var pts = mapPoints(w), sev = {}, kinds = {}, rkinds = {}, near = false, routine = 0, roads = {};
     pts.forEach(function (p) {
+      if (p.lines && p.lines.length) roads[p.road === 'planned' ? 'planned' : 'unplanned'] = 1;   // 1.20.0
       if (isRoutine(p)) { routine++; rkinds[p.kind] = 1; return; }
       kinds[p.kind] = 1;
       if (p.scope === 'near') near = true; else sev[Math.max(1, Math.min(3, p.severity))] = 1;
@@ -1708,6 +1709,8 @@
     });
     if (near) lg.push('<span><i class="lg-near"></i>Nearby, not a warning</span>');
     if (routine) lg.push('<span class="lg-routine"><i class="lg-near routine"></i>Routine</span>');
+    if (roads.unplanned) lg.push('<span><i class="lg-road"></i>Closures on now</span>');
+    if (roads.planned) lg.push('<span class="lg-routine"><i class="lg-road planned"></i>Planned roadworks</span>');
     lg.push('<span><i class="lg-ring"></i>Near you (' + esc(String(w.map.near_km)) + ' km)</span>');
     var icons = Object.keys(kinds).concat(Object.keys(rkinds).filter(function (k) { return !kinds[k]; }));
     lg.push('<span class="lg-icons">' + icons.map(function (k) {
@@ -1780,8 +1783,16 @@
       if (isRoutine(p) && !MAP_ROUTINE) { hidden++; return; }
       var near = p.scope === 'near' || isRoutine(p);
       var c = near ? cssVar('--muted', '#6f7462') : colour[Math.max(1, Math.min(3, p.severity))];
-      // A hook for road closures (a later version): a point may carry the stretch it covers as lines.
-      (p.lines || []).forEach(function (ln) { L.polyline(ln, { color: c, weight: 5, opacity: 0.9 }).addTo(map); });
+      // Road closures (1.20.0) carry the stretches they cover: unplanned ones solid in the point's colour over a white
+      // casing, so they stand out from the roads under them; planned roadworks dashed grey, with the routine ones.
+      (p.lines || []).forEach(function (ln) {
+        if (p.road === 'planned') {
+          L.polyline(ln, { color: c, weight: 4, opacity: 0.9, dashArray: '8 7', interactive: false }).addTo(map);
+          return;
+        }
+        L.polyline(ln, { color: '#fff', weight: 9, opacity: 0.95, interactive: false }).addTo(map);
+        L.polyline(ln, { color: c, weight: 5, opacity: 0.95, interactive: false }).addTo(map);
+      });
       var sz = near ? 22 : 30;
       L.marker([p.lat, p.lon], { keyboard: false, title: p.title || '', zIndexOffset: near ? 0 : 500 + p.severity * 100,
         icon: L.divIcon({ className: 'map-badge' + (near ? ' near' : '') + (isRoutine(p) ? ' routine' : ''), iconSize: [sz, sz],
@@ -1803,7 +1814,7 @@
           var b = L.DomUtil.create('button', 'map-routine');
           b.type = 'button';
           b.textContent = MAP_ROUTINE ? 'Hide routine' : 'Show routine (' + hidden + ')';
-          b.title = 'Planned power cuts and water company work, leaks, and river gauges at their usual level';
+          b.title = 'Planned power cuts, roadworks and water company work, leaks, and river gauges at their usual level';
           L.DomEvent.disableClickPropagation(b);
           L.DomEvent.on(b, 'click', function () {
             MAP_ROUTINE = !MAP_ROUTINE;
@@ -2000,13 +2011,27 @@
       }).join('') + '</tbody></table>' : '<p class="small muted">' + (r.any_near ? 'The boreholes within 30 km haven\'t been read lately.' : 'No Environment Agency borehole within 30 km of home.') + '</p>';
       h += '<p class="small muted">Groundwater feeds many springs, wells and rivers. Most boreholes are read by hand every few months, so each reading is compared with the same time of year since records began.</p>';
     } else if (key === 'gridnow') {
-      h += '<p>Carbon intensity: <b>' + esc(String(r.ci)) + ' g CO2 per kWh</b> (' + esc(r.index || '') + ').' + (r.hz ? ' Frequency ' + esc(r.hz.toFixed(2)) + ' Hz (' + esc(r.hz_min.toFixed(2)) + '–' + esc(r.hz_max.toFixed(2)) + ' in 15 minutes).' : '') + '</p>' +
+      var hm = function (t) { var d = new Date(t); return isNaN(d) ? '' : d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }); };
+      if (r.region) h += '<p>' + esc(r.region.name) + ', your region: <b>' + esc(String(r.region.ci)) + ' g CO2 per kWh</b> (' + esc(r.region.index) + ').</p>';
+      if (r.greenest) h += '<p>Greenest 3 hours in the next day' + (r.greenest.where ? ' (' + esc(r.greenest.where) + ')' : '') + ': <b>' +
+        esc(hm(r.greenest.from)) + '–' + esc(hm(r.greenest.to)) + '</b>, about ' + esc(String(r.greenest.avg)) + ' g. A good time for the washing machine or charging.</p>';
+      h += '<p>' + (r.region ? 'Great Britain' : 'Carbon intensity') + ': <b>' + esc(String(r.ci)) + ' g CO2 per kWh</b> (' + esc(r.index || '') + ').' + (r.hz ? ' Frequency ' + esc(r.hz.toFixed(2)) + ' Hz (' + esc(r.hz_min.toFixed(2)) + '–' + esc(r.hz_max.toFixed(2)) + ' in 15 minutes).' : '') + '</p>' +
         ((r.mix || []).length ? '<div class="chips">' + r.mix.map(function (m) { return '<span class="chip static">' + esc(m.fuel) + ' ' + esc(fq(m.pct)) + '%</span>'; }).join('') + '</div>' : '') +
         '<p class="small muted">Britain\'s grid runs at 50 Hz. A dip below 49.8 usually means a large power station or link has tripped.</p>';
     } else if (key === 'gridstress') {
       h += '<p>Tightest in the next 14 hours: <b>' + esc(fq(Math.round(r.margin_mw / 100) / 10)) + ' GW spare</b>.' + (r.low_mw != null ? ' Lowest in the next two weeks: ' + esc(fq(Math.round(r.low_mw / 100) / 10)) + ' GW on ' + esc(fmtDate(r.low_on)) + '.' : '') + '</p>' +
         ((r.dfs || []).length ? '<p>Demand Flexibility Service: ' + r.dfs.map(function (e) { return esc(fmtDate(e.day) + ' ' + e.from + '–' + e.to); }).join(', ') + '. If your supplier takes part, you may be paid to use less then.</p>' : '') +
         '<p class="small muted">The de-rated margin is the spare generating capacity once likely breakdowns are allowed for. Above about 3 GW is comfortable.</p>';
+    } else if (key === 'roads') {
+      // 1.20.0: the warnings (a road shut) are listed above; the rest near home are here, planned work included.
+      var others = (r.closures || []).filter(function (c) { return !c.severity; });
+      h += others.length ? '<div class="list">' + others.map(function (c) {
+        return '<div class="li"><span class="li-ico">' + (c.unplanned && c.on_now ? '🚧' : '🛠️') + '</span><span class="li-main"><span class="li-title wrap">' +
+          esc(c.title) + '</span><span class="li-sub">' + esc(c.text) + '</span></span></div>';
+      }).join('') + '</div>' : (r.closures || []).length ? '' : '<p class="small muted">No closures within ' + esc(String(r.within_km || 10)) +
+        ' km on England\'s motorways and major A roads. Checked ' + esc(String(r.checked || 0)) + ' closures.</p>';
+      h += '<p class="small muted">An unplanned closure of the whole road is a warning; lanes shut by the weather, flooding or damage to the road are worth watching. ' +
+        'Planned roadworks, and closures starting later today, are listed only. Council roads aren\'t included. <a href="https://www.trafficengland.com/" target="_blank" rel="noopener noreferrer">Traffic England</a> has the live map.</p>';
     } else if (key === 'pound') {
       h += '<table class="live-table"><tbody>' +
         (r.usd ? '<tr><td>£1 in dollars</td><td class="num">$' + esc(r.usd.toFixed(2)) + '</td><td class="num">' + (r.usd_week != null ? esc((r.usd_week > 0 ? '+' : '') + fq(r.usd_week)) + '% in a week' : '') + '</td></tr>' : '') +
@@ -2095,6 +2120,12 @@
         'Check the flood warnings for where you live, and sign up for free ones at gov.uk/sign-up-for-flood-warnings.',
         'Keep documents and medicines somewhere high.',
         'Never walk or drive through flood water.'] };
+    }
+    if (w.kind === 'road') {   // 1.20.0
+      return { plan: ['meet_near', 'meet_far'], tips: [
+        'Allow longer, or find another way: Traffic England\'s map shows the closure and the queues.',
+        'If you\'re stuck in a queue on a motorway, stay in your vehicle, with water, warm clothes and a charged phone.',
+        'If someone has to fetch the children or a relative, agree who now.'] };
     }
     if (w.kind === 'grid') {
       return { plan: [], tips: [
@@ -2199,6 +2230,14 @@
                 : 'Not for your area: ' + esc(w.unavailable[s[0]].charAt(0).toLowerCase() + w.unavailable[s[0]].slice(1))) + '</span></span></label>'
             : '<label class="opt"><input type="checkbox" name="src_' + s[0] + '"' + (c.sources[s[0]] ? ' checked' : '') + '><span>' + esc(s[1]) + '</span></label>');
       }).join('') +
+      '<h3>Road closures</h3>' +
+      '<p class="small muted">England\'s motorways and major A roads, from National Highways. It needs your own free API key: sign up at ' +
+      '<a href="https://developer.data.nationalhighways.co.uk/" target="_blank" rel="noopener noreferrer">developer.data.nationalhighways.co.uk</a>, ' +
+      'subscribe to Road and Lane Closures, and paste the key here. It\'s kept on this Pi, never shown again and never put in a backup. ' +
+      'The whole of England\'s list is fetched and picked through here, so National Highways isn\'t told where you live.</p>' +
+      '<label class="field"><span>National Highways API key</span><input type="password" name="nh_key" autocomplete="off" spellcheck="false" maxlength="100" placeholder="' +
+      (c.nh_key_set ? 'Saved. Paste a new key to replace it' : 'Paste your key here') + '"></label>' +
+      (c.nh_key_set ? '<label class="opt"><input type="checkbox" name="nh_key_remove"><span>Remove the saved key</span></label>' : '') +
       '<h3>Where you are</h3>' +
       '<div class="grid2"><label class="field"><span>Environment Agency area</span><select name="ea_area"><option value="">Not set (England\'s totals)</option>' +
       (w.ea_areas || []).map(function (a) { return '<option' + (c.ea_area === a ? ' selected' : '') + '>' + esc(a) + '</option>'; }).join('') + '</select>' +
@@ -2236,7 +2275,8 @@
       'SEPA (Scotland\'s flood warnings, river levels, rain gauges and the Scottish Flood Forecast), Natural Resources Wales (Wales\' flood warnings and rain gauges), ' +
       'GOV.UK Emergency Alerts, GDACS, NASA FIRMS (fire detections), UK Health Security Agency, the World Health Organization, ' +
       'UK Power Networks, National Grid, SSEN, Northern Powergrid, Electricity North West and NIE Networks (power cuts), NESO and Elexon (grid notices), National Gas (gas storage), ' +
-      'Defra UK-AIR (air quality), NOAA (space weather), the Bank of England (the pound and Bank Rate) and your water company. The DOCS list each one\'s licence.</p>' +
+      'Defra UK-AIR (air quality), NOAA (space weather), the Bank of England (the pound and Bank Rate), your water company, and road closures ' +
+      'Powered by National Highways\' Transport Data Feeds. The DOCS list each one\'s licence.</p>' +
       '<div class="sheet-actions"><button class="btn primary block" type="submit">Save and check now</button></div></form>';
   }
 
@@ -4643,6 +4683,8 @@
         flood_km: num(d.flood_km), gdacs_km: num(d.gdacs_km), fire_km: num(d.fire_km), near_km: num(d.near_km), sources: {},
         ea_area: d.ea_area || '', water_co: d.water_co || '', map: f.elements.map.checked };
       W().source_list.forEach(function (s) { wbody.sources[s[0]] = f.elements['src_' + s[0]].checked; });
+      if (f.elements.nh_key_remove && f.elements.nh_key_remove.checked) wbody.nh_key = null;   // 1.20.0
+      else if ((f.elements.nh_key.value || '').trim()) wbody.nh_key = f.elements.nh_key.value.trim();   // empty: keep the saved one
       // The page's security policy only lets map pictures in while the map is on, and it's set when the page loads.
       var mapChanged = !!(W().config.map && wbody.on) !== !!(wbody.map && wbody.on);
       if ((d.lat === '') !== (d.lon === '')) { toast('Give both a latitude and a longitude, or leave both empty', { error: true }); return; }
