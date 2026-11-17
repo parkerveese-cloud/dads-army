@@ -362,7 +362,7 @@ Dads Army can show official warnings for where you live: on the Sitrep, on the *
 |---|---|
 | Met Office | Yellow, amber and red weather warnings for your region |
 | Environment Agency, SEPA and Natural Resources Wales | Flood alerts, flood warnings and severe flood warnings near you: England's, Scotland's and Wales' (see [The rest of the UK](#the-rest-of-the-uk)) |
-| GOV.UK Emergency Alerts | Alerts about a danger to life, while they're being sent and for 12 hours after. Only one whose area takes in home (your district, county, region, constituency or police force area, or the whole UK, Great Britain or your nation, compared as whole names) raises your alert level; to know that, home's location rounded to about 100 m is looked up once at postcodes.io. Until it's known, every alert counts |
+| GOV.UK Emergency Alerts | Alerts about a danger to life, while they're being sent and for 12 hours after. Only one whose area takes in home (your district, county, region, constituency or police force area, or the whole UK, Great Britain or your nation, compared as whole names) raises your alert level, if you tick **Only alerts for my area**: to know that, home's location rounded to about 100 m is looked up once at postcodes.io. It's off until you tick it, and until then every alert counts |
 | GDACS (the UN and EU disaster alert system) | Orange and red alerts for earthquakes, floods, storms, volcanoes and tsunamis within 1,000 km, and volcanoes within 2,000 km. Only one in the UK or Ireland, within 300 km, or a volcano within 2,000 km (ash closes airports) raises your alert level: an earthquake in Norway shows here but doesn't, and nor does a drought across Europe that lists Ireland among many countries |
 | NASA FIRMS (optional) | Possible fires within 10 km: hotspots seen by satellite in the last 24 hours |
 | UK Health Security Agency (optional) | Its latest news, such as cold-weather and heat-health alerts |
@@ -370,7 +370,7 @@ Dads Army can show official warnings for where you live: on the Sitrep, on the *
 
 How it works:
 
-- Dads Army checks every 15 minutes while the internet is up. It downloads the same public files for everyone and works out which warnings are near you on your own machine. Your location isn't sent with them (see [What leaves your network](#what-leaves-your-network) for the two exceptions).
+- Dads Army checks every 15 minutes while the internet is up. It downloads the same public files for everyone and works out which warnings are near you on your own machine. Your location isn't sent with them, except by the few options that say so, each off until you tick it (see [What leaves your network](#what-leaves-your-network)).
 - Your location comes from Home Assistant's home location. You can set it by hand instead in the warnings settings. The Met Office region is worked out from it, and you can change that too.
 - Tap a warning for the full message, a link to the official page, what to do, and the parts of your emergency plan that matter, such as where to meet and how to turn things off.
 - If the internet goes down, everything else carries on, and the last warnings found stay on show with when they were checked.
@@ -433,7 +433,7 @@ The map pictures are OpenStreetMap's, loaded by your phone or browser straight f
 
 ### More of the wider picture (1.15.0)
 
-Under **More of the wider picture** in the warnings settings. All public; the rain gauges and boreholes are the whole national list, and Dads Army picks the nearest itself.
+Under **More of the wider picture** in the warnings settings. All public; the rain gauges and boreholes are the whole national list, and Dads Army picks the nearest itself. Rainfall and groundwater are off until you tick them, because their readings are then asked for by the nearest gauges' and boreholes' ids, which says roughly where home is.
 
 | Feed | What you get | Warns when |
 |---|---|---|
@@ -481,7 +481,7 @@ For homes on UK Power Networks' network (London, the South East and the East of 
 | Your power supply (UK Power Networks' Open Data Portal, with your own key) | Your local substation, how many customers it serves and how much of its capacity is used; the primary substation it's fed from; that part of the network's faults each year against the network's average per substation, power cuts per customer, and the typical and longest recent cut | Never by itself. A power cut in your substation's area counts as yours (below) |
 
 - **It needs your own free key.** Make an account on [UK Power Networks' Open Data Portal](https://ukpowernetworks.opendatasoft.com/), copy the API key from your account settings, and paste it in the warnings settings. Adding it switches the source on. Like the National Highways key, it stays on the Pi, is never shown back, and is left out of backup files and the automatic copies (paste it in again after a restore). Tick **Remove the saved key** to take it off.
-- **It sends home's location to UK Power Networks.** This is the one source that does: home's location, rounded to 4 decimal places (about 10 m), goes to UK Power Networks' portal with your key, to find which substation areas home is in. Nothing is sent until you add a key, and never for a home off its network. See *What leaves your network*.
+- **It sends home's location to UK Power Networks.** Home's location, rounded to 4 decimal places (about 10 m), goes to UK Power Networks' portal with your key, to find which substation areas home is in. Nothing is sent until you add a key, and never for a home off its network. See *What leaves your network*.
 - **A power cut at your substation is yours.** Once the area your local substation supplies is known, a live power cut inside it is a warning (*Power cut at your substation*), in Affecting you and on the map, wherever its pin is. The area's outline stays on the Pi.
 - **Resilience.** If your local network had more faults than most last year (a fifth more than the average or worse), or a recent cut lasted 6 hours or more, the UPS and longer-lasting power recommendations go up a step (recommended to essential, extra to recommended), and say why.
 - Checked once a day: the fault records are UK Power Networks' yearly returns to Ofgem (the Interruptions Incentive Scheme), and the network's average is asked for once a day too. The line is under Power and energy; the daily briefing isn't told the substation's name.
@@ -648,11 +648,12 @@ Dads Army needs no internet to run. With warnings and the wider picture switched
 
 What goes, and when:
 
-- **Emergency Alerts (when switched on):** home's location rounded to about 100 m goes once to postcodes.io (ONS data), to find your district, county, region and constituency, so that an alert for somewhere else doesn't raise your alert level. Again if you move.
+- **Only alerts for my area (off until you tick it):** home's location rounded to about 100 m goes once to postcodes.io (ONS data), to find your district, county, region and constituency, so that an Emergency Alert for somewhere else doesn't raise your alert level. Again if you move. Untick it and Dads Army forgets the answer, and every alert counts again.
 - **Road closures (when switched on, with your key):** your National Highways key goes to National Highways' API (`api.data.nationalhighways.co.uk`) in a header, with England's whole list asked for by time only. Home's location isn't sent.
 - **Your power supply (when switched on, with your key, for a home on UK Power Networks' network):** **home's location, rounded to about 10 m (4 decimal places), goes to UK Power Networks' Open Data Portal (`ukpowernetworks.opendatasoft.com`)**, with your key in a header, to find the substation that supplies you. Then the substation's id and name are asked for, to find its fault records. Once a day. It's the only source that sends home's location, and nothing goes until you add your key.
 - **The grid now (when switched on):** your carbon intensity region's number (one of 14, worked out on the Pi) goes to NESO's Carbon Intensity API. That says roughly which part of Great Britain home is in, and nothing finer.
-- **Rainfall near you (when switched on):** each of the three nearest rain gauges' readings is asked for by the gauge's id, at the Environment Agency, SEPA or Natural Resources Wales. That says home is within 25 km of those gauges.
+- **Rainfall near you (off until you tick it):** each of the three nearest rain gauges' readings is asked for by the gauge's id, at the Environment Agency, SEPA or Natural Resources Wales. That says home is within 25 km of those gauges.
+- **Groundwater near you (off until you tick it):** the readings of up to three of the nearest boreholes are asked for by their ids, at the Environment Agency. That says home is within 30 km of them.
 - **Scanning:** a new barcode goes to Open Food Facts (only the barcode), unless you use the offline list. A photo of a date or label goes to the AI you choose.
 - **The stores review:** your item names and amounts, to that AI, when you ask.
 - **The daily briefing (when switched on):** the area name, the day's warnings and wider picture (without postcodes, streets, gauge names or distances), health news and how long your stores would last, to Anthropic, once a day.

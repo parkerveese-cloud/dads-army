@@ -2243,19 +2243,24 @@
       '<label class="opt big"><input type="checkbox" name="on"' + (c.on ? ' checked' : '') + '><span><b>Show warnings</b>' +
       '<span class="small muted">Checked every 15 minutes while the internet is up</span></span></label>' +
       '<p class="small muted">Dads Army downloads the public warning feeds (the same files for everyone) and works out here which are near you. ' +
-      'Nothing about you is sent. If the internet goes down, everything else carries on and the last warnings stay on show.</p>' +
+      'Nothing about you is sent, unless you tick one of the few options that say they do. If the internet goes down, everything else carries on and the last warnings stay on show.</p>' +
       '<h3>Sources</h3>' + w.source_list.map(function (s) {
         return (s[0] === LIVE_KEYS[0] ? '<h3>Live information</h3><p class="small muted">The wider picture: rivers and power cuts near home, the electricity grid, ' +
           'gas storage, air quality, space weather and the pound. Each is a public feed for the whole country (or a whole region or network), so nothing is sent about where you are. ' +
           'Where England\'s feeds don\'t reach, Scotland\'s, Wales\' and Northern Ireland\'s own take over, near home only.</p>' : '') +
           (s[0] === LIVE_MORE ? '<h3>More of the wider picture</h3><p class="small muted">The threat level, cyber security, travel advice, drought, the five-day flood risk, ' +
-            'rain and groundwater near home, and the electricity grid. The daily briefing reads these too. Public feeds again: only the nearest rain gauges, asked for by name, say roughly where you are.</p>' : '') +
+            'rain and groundwater near home, and the electricity grid. The daily briefing reads these too. Public feeds again, except rainfall and groundwater: ' +
+            'they ask for the rain gauges and boreholes nearest home by name, which says roughly where you are (within 25 km), so they\'re off until you tick them.</p>' : '') +
           (w.unavailable && w.unavailable[s[0]]
             ? '<label class="opt is-off"><input type="checkbox" name="src_' + s[0] + '" disabled' + (c.sources[s[0]] ? ' checked' : '') + '><span>' + esc(s[1]) +
               '<span class="small muted">' + (/^(Choose|Needs) /.test(w.unavailable[s[0]]) ? esc(w.unavailable[s[0]])   // something to set, not somewhere it can't go
                 : 'Not for your area: ' + esc(w.unavailable[s[0]].charAt(0).toLowerCase() + w.unavailable[s[0]].slice(1))) + '</span></span></label>'
             : '<label class="opt"><input type="checkbox" name="src_' + s[0] + '"' + (c.sources[s[0]] ? ' checked' : '') + '><span>' + esc(s[1]) + '</span></label>');
       }).join('') +
+      '<h3>Emergency Alerts for your area</h3>' +
+      '<label class="opt"><input type="checkbox" name="alert_area"' + (c.alert_area ? ' checked' : '') + '><span><b>Only alerts for my area raise the alert level</b>' +
+      '<span class="small muted">To know which alerts are for your area, Dads Army finds your district, county and region by sending your home\'s location, ' +
+      'rounded to about 100 m, to postcodes.io (ONS data), once. Off until you tick it: until then, every Emergency Alert counts, wherever it\'s for.</span></span></label>' +
       '<h3>Road closures</h3>' +
       '<p class="small muted">England\'s motorways and major A roads, from National Highways. It needs your own free API key: sign up at ' +
       '<a href="https://developer.data.nationalhighways.co.uk/" target="_blank" rel="noopener noreferrer">developer.data.nationalhighways.co.uk</a>, ' +
@@ -2270,7 +2275,7 @@
       'It needs your own free API key: make an account on <a href="https://ukpowernetworks.opendatasoft.com/" target="_blank" rel="noopener noreferrer">UK Power Networks\' Open Data Portal</a>, ' +
       'copy the API key from your account, and paste it here. It\'s kept on this Pi, never shown again and never put in a backup.</p>' +
       '<p class="small callout info"><b>This sends your home\'s location to UK Power Networks to find the substation that supplies you</b> (rounded to about 10 m, once a day, with your key). ' +
-      'It\'s the only source that does. Nothing is sent until you add a key.</p>' +
+      'Nothing is sent until you add a key.</p>' +
       '<label class="field"><span>UK Power Networks API key</span><input type="password" name="ukpn_key" autocomplete="off" spellcheck="false" maxlength="100" placeholder="' +
       (c.ukpn_key_set ? 'Saved. Paste a new key to replace it' : 'Paste your key here') + '"></label>' +
       (c.ukpn_key_set ? '<label class="opt"><input type="checkbox" name="ukpn_key_remove"><span>Remove the saved key</span></label>' : '') +
@@ -2289,7 +2294,7 @@
       '<div class="field"><span>Location</span><div class="grid2">' +
       '<input type="number" name="lat" inputmode="decimal" step="any" placeholder="Latitude, e.g. 53.96" value="' + (c.lat != null ? c.lat : '') + '" aria-label="Latitude">' +
       '<input type="number" name="lon" inputmode="decimal" step="any" placeholder="Longitude, e.g. -1.08" value="' + (c.lon != null ? c.lon : '') + '" aria-label="Longitude"></div>' +
-      '<div class="hint">' + esc(locLine) + ' Used for flood and disaster warnings, worked out here. With Emergency Alerts on, it\'s looked up once, rounded to about 100 m, to find your district (see the documentation). ' +
+      '<div class="hint">' + esc(locLine) + ' Used for flood and disaster warnings, worked out here, and only sent anywhere by the options above that say so. ' +
       (w.ha ? 'Leave empty to use your Home Assistant home location.' : 'Long-press your home in a maps app to find it.') + '</div></div>' +
       '<div class="grid2"><label class="field"><span>Floods within (km)</span><input type="number" name="flood_km" inputmode="numeric" min="1" max="200" value="' + c.flood_km + '"></label>' +
       '<label class="field"><span>Fires within (km)</span><input type="number" name="fire_km" inputmode="numeric" min="2" max="50" value="' + c.fire_km + '"></label></div>' +
@@ -4717,7 +4722,8 @@
     if (f.id === 'warnForm') {
       var wbody = { on: f.elements.on.checked, region: d.region || '', lat: d.lat, lon: d.lon,
         flood_km: num(d.flood_km), gdacs_km: num(d.gdacs_km), fire_km: num(d.fire_km), near_km: num(d.near_km), sources: {},
-        ea_area: d.ea_area || '', water_co: d.water_co || '', map: f.elements.map.checked };
+        ea_area: d.ea_area || '', water_co: d.water_co || '', map: f.elements.map.checked,
+        alert_area: f.elements.alert_area.checked };   // 1.21.0: off until ticked, as it sends home's location
       W().source_list.forEach(function (s) { wbody.sources[s[0]] = f.elements['src_' + s[0]].checked; });
       if (f.elements.nh_key_remove && f.elements.nh_key_remove.checked) wbody.nh_key = null;   // 1.20.0
       else if ((f.elements.nh_key.value || '').trim()) wbody.nh_key = f.elements.nh_key.value.trim();   // empty: keep the saved one

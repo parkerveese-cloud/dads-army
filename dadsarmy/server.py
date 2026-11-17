@@ -5959,7 +5959,8 @@ WARN_SOURCES = [  # key, what it is, on by default
     ("drought", "Drought, reservoirs and hosepipe bans (England)", True),
     ("water", "Water supply problems near you (six water companies)", True),
     ("floodrisk", "Flood risk forecast (England and Scotland)", True),
-    ("rain", "Rainfall near you (England, Scotland and Wales)", True),
+    # Off until ticked: it asks for the nearest gauges by name, which says roughly where home is.
+    ("rain", "Rainfall near you (England, Scotland and Wales)", False),
     ("ground", "Groundwater near you (England)", False),
     ("gridnow", "The grid now: carbon and frequency (Great Britain)", False),
     ("gridstress", "Electricity margin and demand flexibility (Great Britain)", True),
@@ -5991,6 +5992,9 @@ WARN_DEFAULTS = {"on": False, "sources": {k: d for k, _, d in WARN_SOURCES}, "re
                  "flood_km": 20, "gdacs_km": 1000, "fire_km": 10,
                  "near_km": 10,   # 1.18.0: how far power cuts and water reports are listed, as "nearby"
                  "map": False,    # 1.19.0: the live alerts map, which loads map pictures from OpenStreetMap
+                 # 1.21.0: only Emergency Alerts whose area takes in home count. Finding home's district sends its
+                 # location (to about 100 m) to postcodes.io, so it's off until ticked; until then every alert counts.
+                 "alert_area": False,
                  "ea_area": "", "water_co": ""}   # 1.15.0: for drought status and hosepipe bans
 WARN_EVERY = 15 * 60      # seconds between checks
 # 1.19.0: whether the live alerts map is on (warnings on, and "Show a map" ticked). Kept here by warn_cfg, so the web
@@ -6016,6 +6020,7 @@ def warn_cfg():
     cfg = json.loads(json.dumps(WARN_DEFAULTS))
     cfg["on"] = bool(raw.get("on"))
     cfg["map"] = raw.get("map") is True
+    cfg["alert_area"] = raw.get("alert_area") is True
     src = raw.get("sources") if isinstance(raw.get("sources"), dict) else {}
     for k in cfg["sources"]:
         if k in src:
@@ -9862,8 +9867,10 @@ def warnings_run():
     home = home_location(cfg)
     region = cfg["region"] or guess_region(home) or "UK"
     now = dt.datetime.now(dt.timezone.utc)
-    if cfg["sources"].get("govalerts") and home:
+    if cfg["sources"].get("govalerts") and cfg["alert_area"] and home:
         refresh_home_places(home)   # which Emergency Alerts cover home: its county, district and region
+    elif HOME_PLACES["key"] is not None:
+        forget_home_places()   # switched off: every alert counts again, and nothing more is asked
     with WARN_LOCK:
         prev = json.loads(json.dumps(WARN_STATE))
     by_src = {}
@@ -10194,6 +10201,10 @@ def api_warnings_set(body, query):
         if not isinstance(body["map"], bool):
             raise ApiError(400, "Show a map is either on (true) or off (false)")
         cur["map"] = body["map"]
+    if "alert_area" in body:
+        if not isinstance(body["alert_area"], bool):
+            raise ApiError(400, "Only alerts for my area is either on (true) or off (false)")
+        cur["alert_area"] = body["alert_area"]
     if isinstance(body.get("sources"), dict):
         for k in cur["sources"]:
             if k in body["sources"]:
@@ -10952,6 +10963,12 @@ def refresh_home_places(loc):
         return
     HOME_PLACES["busy"] = True
     _lookup_places(key)
+
+
+def forget_home_places():
+    """Only alerts for my area switched off (or Emergency Alerts): every alert counts again."""
+    if not HOME_PLACES["busy"]:
+        HOME_PLACES.update(key=None, names=[], nation="", at=0.0)
 
 
 def home_places(loc):

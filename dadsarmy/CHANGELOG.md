@@ -2,11 +2,17 @@
 
 ## 1.21.0
 
+**Your location stays at home unless you say so**
+
+- **Only alerts for my area** is a new tick box in the warnings settings, off to begin with. Ticked, Emergency Alerts only raise the alert level when their area takes in home, which means sending home's location (rounded to about 100 m) once to postcodes.io to find your district and county. Unticked, nothing is sent and every Emergency Alert counts, as before 1.15.0. Untick it later and the answer is forgotten.
+- **Rainfall near you starts off.** It asks for the nearest rain gauges by their ids, which says roughly where home is, so it's off until you tick it, like Groundwater near you.
+- **What leaves your network** in the documentation lists groundwater too.
+
 **Your power supply**
 
 - **A new live source, for homes on UK Power Networks' network** (London, the South East and the East of England): the substation that supplies home, how many customers it serves and how much of its capacity is used, the primary substation it's fed from, and how many faults that part of the network had each year against the network's average per substation, with power cuts per customer and the typical and longest recent cut. Off until you add a key; elsewhere its switch says it's not for your area.
 - **It needs your own free key.** Make an account on UK Power Networks' Open Data Portal (ukpowernetworks.opendatasoft.com), copy your API key, and paste it in the warnings settings, under **Your power supply**. Adding a key switches it on. Like the National Highways key, it stays on the Pi, is never shown back (the app only learns that one is saved), and is left out of backup files and the automatic copies. A key UK Power Networks doesn't accept says so in the last check.
-- **It sends home's location to UK Power Networks.** The settings say so next to the key box: home's location, rounded to 4 decimal places (about 10 m), goes to UK Power Networks' portal with your key, to find the substation areas home is in. It's the only source that sends home's location, nothing goes until you add a key, and never for a home off its network. The key and the location go nowhere else.
+- **It sends home's location to UK Power Networks.** The settings say so next to the key box: home's location, rounded to 4 decimal places (about 10 m), goes to UK Power Networks' portal with your key, to find the substation areas home is in. Nothing goes until you add a key, and never for a home off its network. The key and the location go nowhere else.
 - **A power cut at your substation is yours.** A live power cut inside the area your local substation supplies is a warning, *Power cut at your substation*, in Affecting you and on the map, wherever its pin is. The area's outline stays on the Pi.
 - **Resilience takes it into account.** If your local network had more faults than most last year, or a recent cut lasted 6 hours or more, the UPS and longer-lasting power recommendations go up a step, and say why.
 - **Slow data, checked once a day.** The fault records are UK Power Networks' yearly returns to Ofgem (the Interruptions Incentive Scheme). The substation's own id is tried first, then its name (never a single vague word such as "North"). The line is under Power and energy; the daily briefing isn't told the substation's name.
