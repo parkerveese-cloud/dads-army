@@ -585,6 +585,7 @@
     var hi = opt.max || niceMax(Math.max.apply(null, [opt.target || 0].concat(rows.map(function (r) {
       return Math.max.apply(null, series.map(function (s) { return r[s.key] > 0 ? r[s.key] : 0; }));
     }))) * 1.08);
+    if (opt.whole) hi = Math.max(4, Math.ceil(hi / 4) * 4);   // counts: whole numbers on every gridline
     var y = function (v) { return T + ph - ph * Math.min(v, hi) / hi; };
     var g = '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' + esc(opt.label) + '">';
     for (var k = 0; k <= 4; k++) {
@@ -599,7 +600,7 @@
     var ends = [];
     if (opt.target) {
       g += '<line class="target" x1="' + L + '" x2="' + (W - R) + '" y1="' + y(opt.target) + '" y2="' + y(opt.target) + '"/>';
-      ends.push({ y: y(opt.target), x: W - R, text: 'Target ' + fq(opt.target), cls: 'axis tgt' });
+      ends.push({ y: y(opt.target), x: W - R, text: (opt.targetLabel || 'Target') + ' ' + fq(opt.target), cls: 'axis tgt' });
     }
     series.forEach(function (s) {
       var d = '', pen = false, last = null;
@@ -829,9 +830,9 @@
   });
 
   function renderSitrep(el) {
-    if (!S.items.length) { el.innerHTML = briefCard() + levelCard() + warnCard(false) + liveCard() + emptyCard() + resilienceCard(); return; }
+    if (!S.items.length) { el.innerHTML = watchCard() + briefCard() + levelCard() + warnCard(false) + liveCard() + emptyCard() + resilienceCard(); return; }
     var st = S.settings, r = readiness(), target = st.target_days;
-    var html = briefCard() + levelCard() + dashNote() + warnCard(false) + liveCard() + resilienceCard();
+    var html = watchCard() + briefCard() + levelCard() + dashNote() + warnCard(false) + liveCard() + resilienceCard();
 
     // Hero: how long could we hold out?
     if (r.people === 0) {
@@ -1632,6 +1633,49 @@
       }).join('') + '</div></section>';
   }
 
+  // Things to watch (1.17.0): counts from the live sources that are well up on the last two weeks, at the top of
+  // the Sitrep. Each opens the wider picture at its source, where the chart shows the rise.
+  function watchCard() {
+    var w = W(), t = w.on ? (w.trends || []) : [];
+    if (!t.length) return '';
+    return '<section class="card flush watch-card" aria-label="Things to watch"><div class="card-head"><h2>Things to watch</h2></div><div class="list">' +
+      t.map(function (x) {
+        return '<button class="li live-row" data-state="warn" data-act="live-open" data-key="' + esc(x.source) + '">' +
+          '<span class="li-ico">📈</span><span class="li-main"><span class="li-title wrap">' + esc(x.title) + '</span>' +
+          '<span class="li-sub">' + esc(x.text) + '</span></span>' + ICON.chev + '</button>';
+      }).join('') + '</div></section>';
+  }
+  // The counts behind the trends, fetched when the wider picture opens (and kept for a few minutes).
+  var LIVEHIST = { data: null, at: 0, loading: false };
+  function loadLiveHistory() {
+    if (LIVEHIST.loading || (LIVEHIST.data && Date.now() - LIVEHIST.at < 5 * 60000)) return;
+    LIVEHIST.loading = true;
+    api('GET', 'api/live/history').then(function (res) {
+      LIVEHIST.data = res; LIVEHIST.at = Date.now(); LIVEHIST.loading = false;
+      var top = stack[stack.length - 1];
+      if (top && top.type === 'live') renderSheet();
+    }, function () { LIVEHIST.loading = false; });
+  }
+  function trendNotes(source) {
+    return (W().trends || []).filter(function (t) { return t.source === source; }).map(function (t) {
+      return '<p class="callout small">📈 <b>' + esc(t.title) + '</b>. ' + esc(t.text) + '</p>';
+    }).join('');
+  }
+  // One chart for each count a source keeps: the same line chart as the Trends card, with the usual as a dashed line.
+  function countCharts(metrics) {
+    return metrics.map(function (m) {
+      var have = m.rows.filter(function (r) { return r.value >= 0; });
+      var h = '<h4 class="count-h">' + esc(m.name) + ', a day at a time</h4>';
+      if (have.length < 2) return h + '<p class="small muted">This fills in a day at a time: come back in a day or two.</p>';
+      var vals = have.map(function (r) { return r.value; }), last = have[have.length - 1];
+      var label = m.name + ', the highest each day over the last ' + have.length + ' days: from ' + fq(Math.min.apply(null, vals)) +
+        ' to ' + fq(Math.max.apply(null, vals)) + ', ' + fq(last.value) + ' on ' + fmtDate(last.day) +
+        (m.usual != null ? ', usually ' + fq(m.usual) : '');
+      return h + lineChart('count-' + m.key, m.rows, [{ key: 'value', name: 'Count', color: '--series-1' }],
+        { label: label, target: m.usual || 0, targetLabel: 'Usual', whole: true, width: Math.min(chartWidth(), 600) });
+    }).join('');
+  }
+
   function liveDetail(key, r) {
     var h = '';
     if (key === 'rivers') {
@@ -1751,16 +1795,30 @@
     var html = sheetHead('The wider picture', 'Live, from public sources', '🌍');
     if (!rows.length) return html + '<p class="small muted">Nothing yet. These come with warnings, and are checked every 15 minutes or so.</p>';
     var order = s.key ? rows.filter(function (r) { return r.key === s.key; }).concat(rows.filter(function (r) { return r.key !== s.key; })) : rows;
+    loadLiveHistory();
+    var counts = (LIVEHIST.data && LIVEHIST.data.metrics) || [];
+    var keys = rows.map(function (r) { return r.key; });
     html += order.map(function (r) {
       var its = w.items.filter(function (x) { return x.source === r.key; });
       return '<div class="live-block" data-state="' + r.state + '"><h3>' + r.emoji + ' ' + esc(r.name) + '</h3>' +
+        trendNotes(r.key) +
         its.map(function (x) {
           return '<div class="li warn-row sev' + x.severity + '"><span class="li-ico">' + (WARN_ICON[x.kind] || '⚠️') + '</span>' +
             '<button class="li-main" data-act="warn-open" data-i="' + w.items.indexOf(x) + '"><span class="li-title wrap">' + esc(x.title) + '</span></button></div>';
         }).join('') +
         liveDetail(r.key, w.live[r.key] || {}) +
+        countCharts(counts.filter(function (m) { return m.source === r.key; })) +
         '<p class="credit small muted">' + esc(r.credit) + (r.checked_at ? ' · checked ' + esc(ago(r.checked_at)) : '') + '</p></div>';
     }).join('');
+    // Flood warnings and fires are warnings, not live lines, but their counts are kept too: they go at the end.
+    var other = counts.filter(function (m) { return keys.indexOf(m.source) < 0; });
+    if (other.length) {
+      var srcs = other.map(function (m) { return m.source; }).filter(function (x, i, a) { return a.indexOf(x) === i; });
+      var up = (w.trends || []).some(function (t) { return srcs.indexOf(t.source) >= 0; });
+      html += '<div class="live-block" data-state="' + (up ? 'warn' : 'good') + '"><h3>📈 Warnings, counted</h3>' +
+        srcs.map(trendNotes).join('') + countCharts(other) +
+        '<p class="credit small muted">The day\'s highest, kept for two weeks. A count twice its usual or more is a trend to watch.</p></div>';
+    }
     return html + '<button class="btn block" data-act="warn-set">Choose what to show</button>';
   }
 

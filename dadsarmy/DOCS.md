@@ -31,6 +31,10 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_alert_level` | The household alert level: LOW, MODERATE, SUBSTANTIAL, SEVERE or CRITICAL (see below) | `level` (1–5), `meaning`, `reasons`, `guidance` (each with `label`, `source` and `text`), `scale`, `escalated`, `escalated_why`, `notes` |
 | `sensor.dads_army_resilience` | How resilient the household is, in %: the average of ten areas, from water and power to communications and safety (see **Resilience** below) | `areas` (each with `name`, `pct`, `dot`, `done`, `total`, `essentials_missing` and `next`), `next_steps`, `measures` (every recommendation, by area), `done`, `total` |
 | `sensor.dads_army_live` | The wider picture: how many of the live feeds have something worth watching (see **The wider picture** below) | `rows` (each with `name`, `emoji`, `text`, `state` good, warn or bad, and `dot`), `enabled`, `checked_at` |
+| `sensor.dads_army_trends` | How many counts in the wider picture are well up on the last two weeks (see **Trends in the wider picture** below). 0 while warnings are off. | `trends` (each with `title`, `text`, `source`, `name`, `value` and `usual`), `enabled` |
+| `sensor.dads_army_reservoirs` | How full England's reservoirs are, in %, from the Environment Agency's weekly drought report. Only once there's a report. | `vs_average` (against the time of year), `week_to`, `area`, `drought_stage`, `hosepipe_ban`, `stale`, `url` |
+| `sensor.dads_army_uk_threat_level` | The UK national threat level: Low, Moderate, Substantial, Severe or Critical. Only with the threat level source on. | `means`, `northern_ireland`, `raised_on`, `since`, `options` |
+| `sensor.dads_army_pet_food_days` | Days the pet food lasts, from its **Used a day**. Only once pet food has one. | `runs_out_first`, `pets`, `target_days` |
 | `sensor.dads_army_places` | How many places are on the map (see **Places to go** below) | `located`, `active` (emergencies happening now), `hazards` (each with `what`, `emoji`, `active`, `advice` and `places`), `help` |
 | `geo_location.dads_army_*` | Home and each place to go, for Home Assistant's map card. The state is the distance from home in km. | `latitude`, `longitude`, `source` (`dads_army`, or `dads_army_far` for places over 20 km away), `what`, `direction`, `for` |
 | `binary_sensor.dads_army_attention` | **On** when something needs doing now: stock past its best-before date, a check that's overdue, or a serious warning (amber or worse). Things you haven't bought yet don't count: they're on the supply run. | `reasons` |
@@ -424,6 +428,23 @@ Under **More of the wider picture** in the warnings settings. All public; the ra
 - Not included: stock markets and commodity prices, as there's no free official source.
 
 Sources: the threat level, the FCDO's travel advice and the Environment Agency's drought reports on GOV.UK; the National Cyber Security Centre; the Flood Forecasting Centre's five-day flood risk outlook (from GOV.UK's Check for flooding); Environment Agency rainfall (real-time data API) and groundwater (Hydrology API) data, all under the Open Government Licence; NESO's Carbon Intensity API (CC BY 4.0) and Data Portal; Elexon's BMRS; the regional providers below; and the water companies' public incident maps and pages.
+
+### Trends in the wider picture (1.17.0)
+
+Each warnings check keeps a few counts, one a day for two weeks (the day's highest), and compares today's with the usual: the middle of the days before.
+
+| Count | From |
+|---|---|
+| Power cuts near you (within 10 km), and across the networks (every live power cut on the networks checked) | Power cuts |
+| Flood warnings and alerts near you (within your flood distance), and across England | Flood warnings |
+| Rivers above their usual range near you | River levels |
+| Possible fires near you | NASA satellites |
+| Grid notices | The electricity grid |
+
+- **A trend** is today's count at twice the usual or more, and big enough to matter (2 power cuts near you, 30 across the networks, 20 flood warnings and alerts across England, and so on). It needs four days of counts before today, so a new install says nothing for the first few days, and a feed that failed doesn't count as a quiet day.
+- **Things to watch** at the top of the Sitrep lists them, and the source's line turns amber. They don't raise the household alert level: they're a reason to look, not a warning.
+- **Charts:** each source's details (tap a line in **The wider picture**) chart its counts a day at a time, with the usual as a dashed line. Flood warnings and fires are at the end. `GET /api/live/history?days=15` gives the figures.
+- Nothing extra is fetched or sent: the counts come from the feeds already read. They're kept on the Pi for two weeks, and aren't in the downloaded backup file.
 
 ### The rest of the UK
 

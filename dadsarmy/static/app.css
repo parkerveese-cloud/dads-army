@@ -1084,3 +1084,7 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
 .tl-bad { background: var(--bad); }
 .timeline-card .legend i { height: 10px; width: 10px; border-radius: 2px; }
 .timeline-card .legend .muted { color: var(--muted); }
+
+/* Things to watch (1.17.0): trends on the Sitrep, and the counts behind them in the wider picture. */
+.watch-card { border-left: 4px solid var(--warn); }
+.live-block .count-h { margin: 12px 0 2px; font-size: 14px; font-weight: 650; color: var(--ink-2); }

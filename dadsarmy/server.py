@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.16.0"
+VERSION = "1.17.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -217,6 +217,14 @@ CREATE TABLE IF NOT EXISTS history (
     expired      INTEGER NOT NULL DEFAULT 0,
     below_target INTEGER NOT NULL DEFAULT 0,
     value        REAL    NOT NULL DEFAULT 0
+);
+-- 1.17.0: a few counts from the live sources (power cuts, flood warnings, high rivers...), one row a day for each,
+-- holding the day's highest. Kept for two weeks, so a rise stands out against what's been usual lately.
+CREATE TABLE IF NOT EXISTS live_counts (
+    day    TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    value  REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, metric)
 );
 """
 # Columns added to items after 1.0, for databases made by older versions.
@@ -4487,6 +4495,29 @@ def ha_entities(s):
     put("sensor.dads_army_live", watch, "Dads Army wider picture",
         "mdi:earth-box" if not watch else "mdi:earth-box-minus", "alerts",
         {"rows": live, "enabled": w["enabled"], "checked_at": w["checked_at"]})
+    # 1.17.0: counts well up on the last two weeks, and three figures from the wider picture worth an automation of
+    # their own. The last three are only sent once there's something to say.
+    tr = w.get("trends") or []
+    put("sensor.dads_army_trends", len(tr), "Dads Army trends to watch",
+        "mdi:trending-up" if tr else "mdi:trending-neutral", "trends",
+        {"trends": tr[:LIST_LIMIT], "enabled": w["enabled"]})
+    dr = w.get("drought") or {}
+    if dr.get("storage") is not None:
+        put("sensor.dads_army_reservoirs", dr["storage"], "Dads Army reservoirs (England)", "mdi:water-percent", "%", {
+            "vs_average": dr.get("vs_average"), "week_to": dr.get("week"), "area": dr.get("area") or None,
+            "drought_stage": dr.get("stage") or None, "hosepipe_ban": bool(dr.get("ban")), "stale": bool(dr.get("stale")),
+            "url": dr.get("url")})
+    th = w.get("threat") or {}
+    if th.get("level"):
+        put("sensor.dads_army_uk_threat_level", th["level"].title(), "UK threat level", "mdi:security",
+            attrs={"means": th.get("means"), "northern_ireland": (th.get("ni") or "").title() or None,
+                   "raised_on": th.get("raised_on"), "since": th.get("since"),
+                   "options": [n.title() for n in THREAT_NAMES]}, measurement=False)
+    pets = s.get("pets") or {}
+    if pets.get("food_days") is not None:
+        put("sensor.dads_army_pet_food_days", pets["food_days"], "Dads Army pet food", "mdi:paw", "days",
+            {"runs_out_first": pets.get("food_runs_out_first"), "pets": pets.get("count"),
+             "target_days": s["target_days"]})
     sit = s["situation"]
     put("sensor.dads_army_alert_level", sit["name"], "Dads Army alert level", LEVEL_ICONS[sit["level"] - 1],
         attrs={"level": sit["level"], "colour": sit["colour"], "emoji": sit["emoji"], "meaning": sit["meaning"],
@@ -6323,7 +6354,9 @@ def ea_floods(home, km, mem):
     """England's flood warnings within km of home: look up where each flood area is (once), then keep the near ones."""
     areas = mem["areas"]
     out, looked = [], 0
-    for r in parse_floods(http_get(FEED_URLS["floods"])):
+    every = parse_floods(http_get(FEED_URLS["floods"]))
+    mem["flood_total"] = len(every)   # England's whole list, for the trends (1.17.0)
+    for r in every:
         centre = areas.get(r["area_id"])
         if centre is None:
             if looked >= FLOOD_LOOKUPS:
@@ -7446,6 +7479,8 @@ def power_live(cuts, home, failed=(), no_feed=""):
     rows.sort(key=lambda r: r["km"])
     unplanned = [r for r in rows if not r["planned"]]
     return items, {"cuts": rows[:6], "count": len(unplanned), "planned": len(rows) - len(unplanned),
+                   # every power cut on the networks checked, near or not: for the trends (1.17.0)
+                   "networks": sum(1 for c in cuts if not c.get("planned")),
                    "homes": sum(r["customers"] for r in unplanned), "near": sum(1 for r in unplanned if r["km"] <= POWER_NEAR_KM),
                    "failed": list(failed), "no_feed": no_feed, "no_feed_url": NO_LIVE_FEED.get(no_feed, "")}
 
@@ -8764,9 +8799,13 @@ def _signed(x):
     return ("+" if x > 0 else "−" if x < 0 else "") + fq(abs(x))
 
 
-def live_rows(live, items):
+def live_rows(live, items, trends=()):
     """One line for each live source that's on: what it says now, and whether that's fine (good), worth
-    watching (warn) or serious (bad). The app, the Home Assistant sensor and the dashboard all use these."""
+    watching (warn) or serious (bad). The app, the Home Assistant sensor and the dashboard all use these.
+    A source with a trend (1.17.0) is worth watching too, even when nothing's near home."""
+    rising = {}
+    for t in trends:
+        rising.setdefault(t["source"], t)
     worst = {}
     for i in items:
         worst[i["source"]] = max(worst.get(i["source"], 0), i.get("severity") or 0)
@@ -8896,11 +8935,14 @@ def live_rows(live, items):
                 text += " · demand flexibility event"
         if worst.get(key, 0) >= 2:
             state = "bad"
-        elif worst.get(key, 0) == 1 and state == "good":
+        elif (worst.get(key, 0) == 1 or key in rising) and state == "good":
             state = "warn"
-        rows.append({"key": key, "emoji": emoji, "name": name, "text": text, "state": state,
-                     "dot": {"good": "🟢", "warn": "🟡", "bad": "🔴"}[state], "checked_at": r.get("checked_at"),
-                     "credit": r.get("credit", ""), "brief": brief or text})
+        row = {"key": key, "emoji": emoji, "name": name, "text": text, "state": state,
+               "dot": {"good": "🟢", "warn": "🟡", "bad": "🔴"}[state], "checked_at": r.get("checked_at"),
+               "credit": r.get("credit", ""), "brief": brief or text}
+        if key in rising:
+            row["trend"] = rising[key]["title"]
+        rows.append(row)
     return rows
 
 
@@ -9110,6 +9152,7 @@ def warnings_run():
     with WARN_LOCK:
         WARN_STATE.clear()
         WARN_STATE.update(state)
+    record_counts(trend_counts(live, by_src, statuses, mem))
     if new and HA_TOKEN:
         try:
             ha_call("POST", "/events/dads_army_warning", warning_event(new))
@@ -9192,6 +9235,130 @@ def source_covers(key, cfg, home):
     check = SOURCE_COVERAGE.get(key)
     return check(cfg, home) if check else (True, "")
 
+# -- Trends (1.17.0) ---------------------------------------------------------------------------------------
+# A few counts from the live sources are kept, one a day (the day's highest), for two weeks. Today's is compared with
+# the middle of the days before it, so "3 power cuts" means something: on a network that usually has 40, nothing;
+# where there are usually none, worth knowing. Nothing here is fetched: the counts come from what the warnings
+# check already has.
+TREND_KEEP_DAYS = 14      # days of counts kept, before today
+TREND_MIN_DAYS = 4        # days of counts needed before today's can be called a rise
+TREND_RISE = 2.0          # today against the usual: twice it, or more, is a rise
+TREND_METRICS = [  # key, the source it belongs with, what it counts, the least that's worth a mention
+    ("power_near", "power", "Power cuts near you", 2),
+    ("power_networks", "power", "Power cuts across the networks", 30),
+    ("floods_near", "floods", "Flood warnings and alerts near you", 2),
+    ("floods_england", "floods", "Flood warnings and alerts in England", 20),
+    ("rivers_high", "rivers", "Rivers above their usual range near you", 2),
+    ("fires", "fires", "Possible fires near you", 3),
+    ("grid", "grid", "Grid notices", 2),
+]
+TREND_NAME = dict((k, n) for k, _, n, _ in TREND_METRICS)
+
+
+def trend_counts(live, by_src, statuses, mem):
+    """{metric: today's count} from this check. Only sources that worked this time: a feed that's down isn't a quiet day."""
+    ok = lambda k: (statuses.get(k) or {}).get("ok")
+    out = {}
+    p = live.get("power")
+    if ok("power") and p:
+        out["power_near"] = p.get("count", 0)
+        if p.get("networks") is not None:
+            out["power_networks"] = p["networks"]
+    if ok("floods"):
+        out["floods_near"] = len(by_src.get("floods") or [])
+        if mem.get("flood_total") is not None:
+            out["floods_england"] = mem["flood_total"]
+    if ok("rivers") and live.get("rivers"):
+        out["rivers_high"] = live["rivers"].get("high", 0)
+    if ok("fires"):
+        out["fires"] = len(by_src.get("fires") or [])
+    if ok("grid"):
+        out["grid"] = len(by_src.get("grid") or [])
+    return out
+
+
+def record_counts(counts, today=None):
+    """Today's row for each count, keeping the day's highest, and drop anything over two weeks old."""
+    today = today or dt.date.today()
+    with tx() as db:
+        for metric, value in counts.items():
+            db.execute("INSERT INTO live_counts(day, metric, value) VALUES (?, ?, ?) ON CONFLICT(day, metric) "
+                       "DO UPDATE SET value = MAX(value, excluded.value)", (today.isoformat(), metric, float(value)))
+        db.execute("DELETE FROM live_counts WHERE day < ?", ((today - dt.timedelta(days=TREND_KEEP_DAYS)).isoformat(),))
+
+
+def count_rows(today=None):
+    """{metric: {day: value}} for the last two weeks and today."""
+    today = today or dt.date.today()
+    since = (today - dt.timedelta(days=TREND_KEEP_DAYS)).isoformat()
+    out = {}
+    with LOCK:
+        for r in DB.execute("SELECT day, metric, value FROM live_counts WHERE day >= ? AND day <= ? ORDER BY day",
+                            (since, today.isoformat())):
+            out.setdefault(r["metric"], {})[r["day"]] = _num(r["value"])
+    return out
+
+
+def _median(vals):
+    v = sorted(vals)
+    n = len(v)
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
+
+
+def times_words(ratio):
+    """2.04 -> '2×', 2.6 -> '2.5×', 7.2 -> '7×'."""
+    return "%s×" % fq(round(ratio) if ratio >= 5 else round(ratio * 2) / 2.0)
+
+
+def find_trends(sources=None, today=None):
+    """Counts that are well up on the usual: [{key, source, name, title, text, value, usual, days}], biggest rise
+    first. sources: the ones switched on (None for all). Too little history, or a count too small to matter, isn't one."""
+    today = today or dt.date.today()
+    rows = count_rows(today)
+    out = []
+    for key, source, name, least in TREND_METRICS:
+        if sources is not None and source not in sources:
+            continue
+        days = rows.get(key) or {}
+        v = days.get(today.isoformat())
+        past = [x for d, x in days.items() if d < today.isoformat()]
+        if v is None or len(past) < TREND_MIN_DAYS:
+            continue
+        usual = _median(past)
+        if v < least or v < usual * TREND_RISE or v - usual < least / 2.0:
+            continue
+        vs = "usually none" if usual <= 0 else "%s the usual" % times_words(v / usual)
+        out.append({"key": key, "source": source, "name": name, "title": "%s: %s" % (name, vs),
+                    "text": "%s today, against %s on a usual day over the last %d days." % (
+                        fq(v), fq(round(usual, 1)), len(past)),
+                    "value": v, "usual": _num(round(usual, 1)), "days": len(past),
+                    "ratio": round(v / usual, 1) if usual > 0 else None})
+    out.sort(key=lambda t: -(t["ratio"] or 99))
+    return out
+
+
+@route("GET", "/api/live/history")
+def api_live_history(body, query):
+    """The counts behind the trends, a row for each day (oldest first, -1 for a day with none), for the charts in
+    each live source's details. ?days=7 for fewer."""
+    days = int(clean_num((query.get("days") or [str(TREND_KEEP_DAYS + 1)])[0], TREND_KEEP_DAYS + 1, 2,
+                         TREND_KEEP_DAYS + 1, "Days"))
+    today = dt.date.today()
+    span = [(today - dt.timedelta(days=n)).isoformat() for n in range(days - 1, -1, -1)]
+    rows = count_rows(today)
+    w = warn_public()
+    on = set(k for k, v in w["config"]["sources"].items() if v and k not in w["unavailable"]) if w["on"] else set()
+    metrics = []
+    for key, source, name, _ in TREND_METRICS:
+        have = rows.get(key) or {}
+        if source not in on or not any(d in have for d in span):
+            continue
+        past = [v for d, v in have.items() if d < today.isoformat()]
+        metrics.append({"key": key, "source": source, "name": name,
+                        "usual": _num(round(_median(past), 1)) if len(past) >= TREND_MIN_DAYS else None,
+                        "rows": [{"day": d, "value": have.get(d, -1)} for d in span]})
+    return {"days": days, "metrics": metrics, "trends": w["trends"]}
+
 
 def warn_public():
     """For the app: the settings, what's in force and how each source is doing."""
@@ -9204,7 +9371,9 @@ def warn_public():
     live = dict((k, v) for k, v in (st.get("live") or {}).items() if on and cfg["sources"].get(k) and k not in unavailable)
     if unavailable:
         st["items"] = [i for i in st["items"] if i.get("source") not in unavailable]
-    return {"config": cfg, "on": on, "live": live, "live_rows": live_rows(live, st["items"] if on else []),
+    trends = find_trends(set(k for k, v in cfg["sources"].items() if v and k not in unavailable)) if on else []
+    return {"config": cfg, "on": on, "live": live, "live_rows": live_rows(live, st["items"] if on else [], trends),
+            "trends": trends,
             "items": st["items"] if on else [], "news": st["news"] if on else [],
             "sources": st["sources"] if on else {}, "checked_at": st["checked_at"] if on else None,
             "location": loc, "region": cfg["region"] or guess_region(loc) or "UK", "region_guessed": not cfg["region"],
@@ -9225,7 +9394,10 @@ def warn_brief():
             "serious": sum(1 for i in w["items"] if i["severity"] >= 2),
             "news": [{k: i.get(k) for k in ("title", "source", "url", "issued")} for i in w["news"]],
             "checked_at": w["checked_at"],
-            "live": [{k: r[k] for k in ("key", "emoji", "name", "text", "state", "dot")} for r in w["live_rows"]]}
+            "live": [{k: r[k] for k in ("key", "emoji", "name", "text", "state", "dot")} for r in w["live_rows"]],
+            "trends": [{k: t[k] for k in ("title", "text", "source", "name", "value", "usual")} for t in w["trends"]],
+            # For the reservoir and threat level sensors (1.17.0)
+            "drought": w["live"].get("drought"), "threat": w["live"].get("threat")}
 
 
 @route("PUT", "/api/warnings")
@@ -10493,6 +10665,8 @@ def brief_known(sm=None):
         for r in w["live_rows"]:
             lines.append("- %s: %s (%s)" % (r["name"], r.get("brief") or r["text"], {
                 "good": "fine", "warn": "worth watching", "bad": "serious"}.get(r["state"], r["state"])))
+        for t in w["trends"]:   # 1.17.0: counts, never where anything is
+            lines.append("- Trend: %s (%s)" % (t["title"], t["text"]))
         for i in w["items"][:10]:
             lines.append("- Warning (%s): %s%s" % (i.get("by") or WARN_SOURCE_NAMES.get(i.get("source"), i.get("source")),
                                                    brief_safe(i.get("source"), i.get("title", ""), i.get("river")),

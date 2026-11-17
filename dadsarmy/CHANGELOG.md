@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.17.0
+
+**Trends in the wider picture**
+
+- **A rise against the usual.** Each warnings check now keeps a few counts, one a day (the day's highest) for two weeks: power cuts near you and across the networks, flood warnings and alerts near you and across England, rivers above their usual range near you, possible fires near you and grid notices. When today's is twice the usual over the last fortnight or more, and big enough to matter, it's a trend: "Power cuts across the networks: 3× the usual". It needs four days of counts first, so it says nothing for the first few days. Nothing new is fetched: the counts come from the feeds the warnings already read.
+- **Things to watch**, at the top of the Sitrep when there's a trend. Tap one to open the wider picture at its source. A source with a trend shows amber there, and says why.
+- **A chart for each count** in the source's details, a day at a time, with the usual as a dashed line. Point at it (or touch it) for a day's figure. Flood warnings and fires, which aren't live lines, have theirs at the end. `GET /api/live/history`.
+- **The daily briefing** is told about any trend, as counts only.
+
+**Home Assistant**
+
+- `sensor.dads_army_trends`: how many trends there are, with each one's `title`, `text`, `source`, `value` and `usual` as attributes.
+- `sensor.dads_army_reservoirs`: how full England's reservoirs are, in %, from the drought report, with `vs_average`, `week_to`, your area's `drought_stage` and `hosepipe_ban`.
+- `sensor.dads_army_uk_threat_level`: the national threat level (Low to Critical), with `northern_ireland`, `raised_on` and what it `means`.
+- `sensor.dads_army_pet_food_days`: how many days the pet food lasts, with what `runs_out_first`. Each of these three appears once there's something to show.
+
 ## 1.16.0
 
 **Supply run**
