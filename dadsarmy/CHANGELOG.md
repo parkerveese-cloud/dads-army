@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.19.0
+
+**A map of the live alerts**
+
+- **Off until you ask for it.** Tick **Show a map** in the warnings settings, under Map. Until then nothing changes: the map's code isn't loaded and no map pictures are asked for. The map pictures come from OpenStreetMap, loaded by your phone or browser: OpenStreetMap sees your IP address and the area you look at (the map opens on the area round home), and nothing else. The Pi fetches nothing new for it.
+- **Home and your near you distance.** Home in the middle, with your near you distance as a dashed ring round it.
+- **Each warning with a place** is a badge showing what it is (🔌 🚰 🌊 🏞️ 🔥), ringed in its colour: yellow, amber or red, as in the lists. Power cuts and water supply reports further out, the ones under *Nearby, not in your area*, are smaller and grey. Tap a badge for its details.
+- **Routine things stay off** until you tap **Show routine** at the top left: planned power cuts and water company work, leaks, and river gauges at their usual level. Each phone or browser remembers which you chose.
+- **The key under the map** only lists what's on it, and the routine entries only while they're shown. **🏠** goes back to home; **UK** appears when a warning is well outside the ring (**All**, if one is abroad).
+- **Small credits** in the corner (OpenStreetMap contributors, and the sources on the map), so they never cover a button on a phone.
+- The map is drawn by [Leaflet](https://leafletjs.com) 1.9.4 (BSD 2-Clause licence), which comes with the app: nothing is loaded from elsewhere.
+- In `GET /api/state`, the warnings have `map` (`on`, `home`, `near_km` and `points`), and `map` in `config`. Power cut, water supply, high river and disaster warnings now carry the `lat` and `lon` the feeds gave, as flood warnings and fires already did. The web server's security policy lets OpenStreetMap's pictures in only while the map is on.
+
 ## 1.18.0
 
 **Affecting you**

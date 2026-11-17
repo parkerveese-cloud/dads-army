@@ -1115,4 +1115,51 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
 .ia-more { background: none; border: 0; padding: 8px 0 4px; font: inherit; font-size: 14px; font-weight: 600;
   color: var(--olive); cursor: pointer; }
 .live-calm { margin: 0; border-top: 0; }
+
+/* The live alerts map (1.19.0): only drawn when "Show a map" is ticked in the warnings settings. */
+.live-map-wrap { margin: 12px 16px 8px; }
+.live-map { height: 340px; border-radius: 10px; overflow: hidden; border: 1px solid var(--line); background: var(--surface-2); z-index: 0; }
+@media (max-width: 699px) { .live-map { height: 300px; } }
+.live-map.leaflet-container { font: inherit; background: var(--surface-2); }
+.live-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 2px 0; font-size: 12px; font-weight: 600; color: var(--muted); }
+.live-legend > span, .live-legend .lg-icons > span { display: inline-flex; align-items: center; gap: 6px; }
+.live-legend .lg-icons { display: inline-flex; flex-wrap: wrap; gap: 4px 12px; }
+.live-legend .lg-icons b { font-weight: 400; }
+.live-legend i { width: 11px; height: 11px; border-radius: 50%; box-sizing: border-box; background: var(--surface); border: 3px solid var(--yel); }
+.live-legend i.sev2 { border-color: var(--warn); }
+.live-legend i.sev3 { border-color: var(--bad); }
+.live-legend i.lg-near { border: 2px solid var(--muted); opacity: .85; }
+.live-legend i.lg-near.routine { border-style: dashed; }
+.live-legend i.lg-ring { width: 14px; height: 14px; border: 1.5px dashed var(--olive); background: none; }
+/* Routine entries in the key only while the routine points are on the map. */
+.live-map-wrap:not(.show-routine) .lg-routine { display: none !important; }
+.map-badge span {
+  display: grid; place-items: center; width: 100%; height: 100%; box-sizing: border-box; border-radius: 50%;
+  background: var(--surface); border: 3px solid var(--c); font-size: 15px; line-height: 1; box-shadow: 0 1px 4px rgba(0, 0, 0, .35);
+}
+.map-badge.near span { border-width: 2px; font-size: 11px; opacity: .85; }
+.map-badge.routine span { border-style: dashed; opacity: .75; }
+.map-home span {
+  display: grid; place-items: center; width: 30px; height: 30px; font-size: 17px; border-radius: 50%; box-sizing: border-box;
+  background: var(--surface); border: 2px solid var(--olive); box-shadow: 0 2px 6px rgba(0, 0, 0, .3);
+}
+.map-routine {
+  font: inherit; font-size: 12px; font-weight: 600; padding: 7px 10px; border-radius: 10px; cursor: pointer; min-height: 34px;
+  background: var(--surface); color: var(--ink); border: 1px solid var(--line-strong); box-shadow: 0 1px 4px rgba(0, 0, 0, .2);
+}
+.live-map-wrap .live-map .leaflet-top.leaflet-left .map-routine { margin-top: 8px; }
+.live-map-wrap .live-map .leaflet-bar { border: 1px solid var(--line-strong); border-radius: 10px; overflow: hidden; }
+.live-map-wrap .live-map .leaflet-bar a, .live-map-wrap .live-map .leaflet-bar a:hover { background: var(--surface); color: var(--ink); border-bottom-color: var(--line); }
+.live-map-wrap .live-map .leaflet-bar a:hover { background: var(--surface-2); }
+.live-map-wrap .live-map .leaflet-bar a.leaflet-disabled { background: var(--surface-2); color: var(--muted); }
+.map-views a { font-weight: 800; font-size: 13px; text-decoration: none; }
+/* The credits stay small, so they never cover the map's buttons on a phone. */
+.live-map-wrap .live-map .leaflet-control-attribution { font-size: 10px; line-height: 1.35; padding: 1px 5px; max-width: 100%; box-sizing: border-box;
+  background: rgba(255, 255, 255, .86); color: #333; }
+.live-map-wrap .live-map .leaflet-control-attribution a { color: #1f4f8f; }
+.live-map-wrap .live-map .leaflet-tooltip { font: inherit; font-size: 13px; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .live-map-wrap .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(.85) contrast(.9) saturate(.7); }
+}
+:root[data-theme="dark"] .live-map .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(.85) contrast(.9) saturate(.7); }
 .live-calm .li-main { display: flex; flex-direction: column; }

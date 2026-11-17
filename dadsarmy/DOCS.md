@@ -374,6 +374,7 @@ How it works:
 - Your location comes from Home Assistant's home location. You can set it by hand instead in the warnings settings. The Met Office region is worked out from it, and you can change that too.
 - Tap a warning for the full message, a link to the official page, what to do, and the parts of your emergency plan that matter, such as where to meet and how to turn things off.
 - If the internet goes down, everything else carries on, and the last warnings found stay on show with when they were checked.
+- **Show a map** (under Map in the warnings settings, off to start with) adds a map of the warnings and nearby reports to the wider picture. Its map pictures come from OpenStreetMap: see [The live alerts map](#the-live-alerts-map-1190).
 - Keep **Emergency Alerts** switched on in your phone's settings too. They reach the phone directly, much faster than any feed.
 - Every request carries only Dads Army's name: no cookies, no referrer and nothing about you.
 
@@ -416,6 +417,19 @@ On the Sitrep, the wider picture starts with what's affecting home:
 - **Then the lines:** those that need attention first, worst first (or *Nothing needs attention*), and the rest under Water and weather, Power and energy, Home, and The wider world.
 
 **Near you** in the warnings settings (5 to 40 km, 10 km to start with) is how far power cuts and water supply reports are listed. It doesn't change what's a warning, and flood warnings and fires keep their own distances. River gauges are always within 10 km, as a high river near home is a warning.
+
+### The live alerts map (1.19.0)
+
+Off until you tick **Show a map** in the warnings settings (under **Map**). Then the wider picture on the Sitrep has a map under Affecting you:
+
+- **Home**, with your near you distance as a dashed ring round it.
+- **Each warning with a place** (power cuts, water supply problems, flood warnings, high rivers, possible fires and disasters near the UK) as a badge showing what it is, ringed in yellow, amber or red as in the lists. Met Office warnings and Emergency Alerts cover areas, not places, so they aren't on it.
+- **Nearby, not in your area:** power cuts and water supply reports within your near you distance that aren't warnings, as smaller grey badges.
+- **Routine** things are hidden until you tap **Show routine (N)** at the top left, under the zoom buttons: planned power cuts and water company work, leaks, and river gauges at their usual level. Each phone or browser remembers your choice (in its own storage).
+- Tap a badge for its details. **🏠** goes back to home. **UK** shows the whole country when a warning is well outside the ring (**All** when one is abroad, such as a disaster).
+- The key under the map lists only what's on it. The map follows the app's dark theme.
+
+The map pictures are OpenStreetMap's, loaded by your phone or browser straight from `tile.openstreetmap.org` (see What leaves your network). Everything on them comes from the feeds the warnings already read, worked out on the Pi: nothing new is fetched or sent for the map. Map data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright). The map is drawn by [Leaflet](https://leafletjs.com) (BSD 2-Clause licence), which comes with the app.
 
 ### More of the wider picture (1.15.0)
 
@@ -606,6 +620,7 @@ What goes, and when:
 - **The stores review:** your item names and amounts, to that AI, when you ask.
 - **The daily briefing (when switched on):** the area name, the day's warnings and wider picture (without postcodes, streets, gauge names or distances), health news and how long your stores would last, to Anthropic, once a day.
 - **Credits:** two fixed public addresses on GitHub, only when you tap **Check GitHub for new names**.
+- **The live alerts map (when switched on):** your phone or browser loads the map pictures from OpenStreetMap's tile server, `tile.openstreetmap.org`. OpenStreetMap sees your IP address and which map squares you look at, so roughly the area round home, as the map opens there, and nothing else: no cookies, no referrer, nothing from Dads Army. The Pi itself fetches nothing for the map. Switched off (as it starts), the app doesn't load the map at all, and the page's security policy blocks pictures from anywhere but Dads Army itself.
 
 ## Security
 

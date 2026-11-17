@@ -497,6 +497,7 @@
       else renderSitrep(el);
     }
     if (stack.length && /^(item|area|resall)$/.test(stack[stack.length - 1].type)) renderSheet();
+    mountLiveMap();   // 1.19.0: the live alerts map, when it's switched on
   }
 
   function updateBadge() {
@@ -1636,7 +1637,7 @@
     rows.forEach(function (r) { byKey[r.key] = r; });
     var lay = w.live_layout || { attention: [], groups: [{ name: '', keys: rows.map(function (r) { return r.key; }) }] };
     var html = '<section class="card flush live-card"><div class="card-head"><h2>The wider picture</h2>' +
-      '<button class="link" data-act="live-open">More</button></div>' + (w.location ? affectHtml(aff) : '');
+      '<button class="link" data-act="live-open">More</button></div>' + (w.location ? affectHtml(aff) : '') + mapHtml(w);
     html += lay.attention.length
       ? '<h3 class="group-head">Needs attention <span class="n">' + lay.attention.length + '</span></h3><div class="list">' +
         lay.attention.map(function (k) { return liveRow(byKey[k]); }).join('') + '</div>'
@@ -1676,6 +1677,187 @@
       '<span class="ia-ico" aria-hidden="true">' + (WARN_ICON[x.kind] || '⚠️') + '</span>' +
       '<span class="ia-main"><span class="ia-title">' + esc(x.title) + '</span><span class="ia-sub">' + esc(bits.join(' · ')) + '</span></span>' +
       ICON.chev + '</button>';
+  }
+
+  // ------------------------------------------------------------------
+  // The live alerts map (1.19.0), in the wider picture. Off unless "Show a map" is ticked in the warnings settings:
+  // until then Leaflet isn't loaded and no map pictures are asked for. The points are worked out on the Pi (map in
+  // the warnings); the pictures come from OpenStreetMap, loaded by this browser.
+  // ------------------------------------------------------------------
+  var MAPI = null, MAP_SIG = '', MAP_VIEW = null, LEAFLET = null;
+  // Routine points (planned work, a river at its usual level, a leak) stay off the map unless asked for, per device.
+  var MAP_ROUTINE = false;
+  try { MAP_ROUTINE = localStorage.getItem('da-map-routine') === '1'; } catch (e) { MAP_ROUTINE = false; }
+  var SEV_WORD = { 3: 'Red', 2: 'Amber', 1: 'Yellow' };
+  var KIND_WORD = { weather: 'Weather', flood: 'Floods', alert: 'Emergency Alerts', disaster: 'Disasters', fire: 'Fires',
+    river: 'Rivers', power: 'Power', water: 'Water', air: 'Air' };
+  var UK_BOUNDS = [[49.9, -8.2], [60.9, 1.8]];
+  function mapOn(w) { return !!(w.on && w.map && w.map.on && w.map.home); }
+  function isRoutine(p) { return !!p.routine; }
+  function mapPoints(w) { return (w.map && w.map.points) || []; }
+  function mapHtml(w) {
+    if (!mapOn(w)) return '';
+    var pts = mapPoints(w), sev = {}, kinds = {}, rkinds = {}, near = false, routine = 0;
+    pts.forEach(function (p) {
+      if (isRoutine(p)) { routine++; rkinds[p.kind] = 1; return; }
+      kinds[p.kind] = 1;
+      if (p.scope === 'near') near = true; else sev[Math.max(1, Math.min(3, p.severity))] = 1;
+    });
+    var lg = [3, 2, 1].filter(function (s) { return sev[s]; }).map(function (s) {
+      return '<span><i class="lg-sev sev' + s + '"></i>' + SEV_WORD[s] + '</span>';
+    });
+    if (near) lg.push('<span><i class="lg-near"></i>Nearby, not a warning</span>');
+    if (routine) lg.push('<span class="lg-routine"><i class="lg-near routine"></i>Routine</span>');
+    lg.push('<span><i class="lg-ring"></i>Near you (' + esc(String(w.map.near_km)) + ' km)</span>');
+    var icons = Object.keys(kinds).concat(Object.keys(rkinds).filter(function (k) { return !kinds[k]; }));
+    lg.push('<span class="lg-icons">' + icons.map(function (k) {
+      return '<span' + (kinds[k] ? '' : ' class="lg-routine"') + '><b>' + (WARN_ICON[k] || '⚠️') + '</b>' + esc(KIND_WORD[k] || k) + '</span>';
+    }).join('') + '</span>');
+    return '<div class="live-map-wrap' + (MAP_ROUTINE ? ' show-routine' : '') + '">' +
+      '<div id="liveMap" class="live-map" role="region" aria-label="Map of live alerts near home"></div>' +
+      '<div class="live-legend" aria-hidden="true">' + lg.join('') + '</div></div>';
+  }
+  function ensureLeaflet() {
+    if (window.L) return Promise.resolve(window.L);
+    if (LEAFLET) return LEAFLET;
+    LEAFLET = new Promise(function (ok, fail) {
+      var css = document.createElement('link');
+      css.rel = 'stylesheet'; css.href = 'vendor/leaflet/leaflet.css';
+      document.head.appendChild(css);
+      var js = document.createElement('script');
+      js.src = 'vendor/leaflet/leaflet.js';
+      js.onload = function () { ok(window.L); };
+      js.onerror = function () { LEAFLET = null; fail(new Error('map library')); };
+      document.head.appendChild(js);
+    });
+    return LEAFLET;
+  }
+  function cssVar(name, fallback) {
+    try { return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback; } catch (e) { return fallback; }
+  }
+  function dropMap() {
+    if (!MAPI) return;
+    MAP_VIEW = { c: MAPI.getCenter(), z: MAPI.getZoom() };
+    MAPI.remove(); MAPI = null; MAP_SIG = '';
+  }
+  // Called after each render. The Sitrep is redrawn every 30 seconds: when nothing on the map has changed, the same
+  // map is put back in its place, so it doesn't flicker or lose where you'd moved it.
+  function mountLiveMap() {
+    var el = document.getElementById('liveMap'), w = W();
+    if (!el || !mapOn(w)) { dropMap(); return; }
+    var sig = JSON.stringify([w.map, MAP_ROUTINE]);
+    if (MAPI && sig === MAP_SIG) {
+      var box = MAPI.getContainer();
+      if (box !== el) { el.parentNode.replaceChild(box, el); MAPI.invalidateSize(); }
+      return;
+    }
+    ensureLeaflet().then(function (L) {
+      if (!document.body.contains(el)) return;   // redrawn while loading: that render mounts it
+      dropMap();
+      drawMap(L, el, w);
+    }).catch(function () {
+      el.innerHTML = '<p class="small muted" style="padding:16px">The map couldn\'t load. Everything below is still live.</p>';
+    });
+  }
+  function drawMap(L, el, w) {
+    var M = w.map, home = M.home, pts = mapPoints(w);
+    var map = MAPI = L.map(el, { scrollWheelZoom: false, zoomControl: true, attributionControl: true });
+    MAP_SIG = JSON.stringify([M, MAP_ROUTINE]);
+    map.setView(home, 11);   // a starting view: the ring can't measure itself without one
+    var srcs = {};
+    pts.forEach(function (p) { if (!isRoutine(p) || MAP_ROUTINE) srcs[p.source] = 1; });
+    var credit = Object.keys(srcs).map(function (k) { return srcName(k); }).filter(function (n, i, a) { return a.indexOf(n) === i; });
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18,
+      attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap contributors</a>' +
+        (credit.length ? ' · ' + credit.map(esc).join(', ') : '')
+    }).addTo(map);
+    map.attributionControl.setPrefix(false);   // Leaflet is credited in Help and the documentation
+
+    var colour = { 3: cssVar('--bad', '#b0342c'), 2: cssVar('--warn', '#b77600'), 1: cssVar('--yel', '#c9a800') };
+    var hidden = 0, far = [];
+    pts.forEach(function (p) {
+      if (isRoutine(p) && !MAP_ROUTINE) { hidden++; return; }
+      var near = p.scope === 'near' || isRoutine(p);
+      var c = near ? cssVar('--muted', '#6f7462') : colour[Math.max(1, Math.min(3, p.severity))];
+      // A hook for road closures (a later version): a point may carry the stretch it covers as lines.
+      (p.lines || []).forEach(function (ln) { L.polyline(ln, { color: c, weight: 5, opacity: 0.9 }).addTo(map); });
+      var sz = near ? 22 : 30;
+      L.marker([p.lat, p.lon], { keyboard: false, title: p.title || '', zIndexOffset: near ? 0 : 500 + p.severity * 100,
+        icon: L.divIcon({ className: 'map-badge' + (near ? ' near' : '') + (isRoutine(p) ? ' routine' : ''), iconSize: [sz, sz],
+          iconAnchor: [sz / 2, sz / 2], html: '<span style="--c:' + c + '">' + (WARN_ICON[p.kind] || '⚠️') + '</span>' }) })
+        .bindTooltip(esc(p.title) + (p.distance_km != null ? ' · ' + esc(fq(p.distance_km)) + ' km' : ''), { direction: 'top', offset: [0, -sz / 2] })
+        .on('click', function () {
+          if (p.i != null && W().items[p.i]) openSheet({ type: 'warning', w: W().items[p.i] });
+          else if (p.key) openSheet({ type: 'live', key: p.key });
+        })
+        .addTo(map);
+      far.push([p.lat, p.lon]);
+    });
+
+    // Show or hide the routine ones: top left, under the zoom buttons, so the credits never cover it on a phone.
+    if (hidden || MAP_ROUTINE) {
+      var Routine = L.Control.extend({
+        options: { position: 'topleft' },
+        onAdd: function () {
+          var b = L.DomUtil.create('button', 'map-routine');
+          b.type = 'button';
+          b.textContent = MAP_ROUTINE ? 'Hide routine' : 'Show routine (' + hidden + ')';
+          b.title = 'Planned power cuts and water company work, leaks, and river gauges at their usual level';
+          L.DomEvent.disableClickPropagation(b);
+          L.DomEvent.on(b, 'click', function () {
+            MAP_ROUTINE = !MAP_ROUTINE;
+            try { localStorage.setItem('da-map-routine', MAP_ROUTINE ? '1' : '0'); } catch (e) { /* this device only */ }
+            var wrap = map.getContainer().parentNode;
+            if (wrap && wrap.classList) wrap.classList.toggle('show-routine', MAP_ROUTINE);
+            MAP_VIEW = { c: map.getCenter(), z: map.getZoom() };
+            var keep = MAP_VIEW;
+            dropMap(); MAP_VIEW = keep;
+            drawMap(L, el, W());
+          });
+          return b;
+        }
+      });
+      map.addControl(new Routine());
+    }
+
+    L.marker(home, { title: 'Home', keyboard: false,
+      icon: L.divIcon({ className: 'map-home', html: '<span>🏠</span>', iconSize: [30, 30], iconAnchor: [15, 15] }) })
+      .bindTooltip('Home').addTo(map);
+    var ring = L.circle(home, { radius: (M.near_km || 10) * 1000, color: cssVar('--olive', '#4b5320'), weight: 1.5,
+      dashArray: '6 6', fill: true, fillOpacity: 0.04, interactive: false }).addTo(map);
+    function goHome() { map.fitBounds(ring.getBounds(), { padding: [12, 12], maxZoom: 13 }); }
+    // Anything well outside the ring (a flood warning further off, a disaster abroad): a second button shows it all.
+    var hb = L.latLng(home), out = far.filter(function (q) { return hb.distanceTo(q) > (M.near_km || 10) * 1500; });
+    var inUK = out.every(function (q) { return L.latLngBounds(UK_BOUNDS).contains(q); });
+    function goWide() {
+      if (inUK) map.fitBounds(UK_BOUNDS);
+      else map.fitBounds(L.latLngBounds(far.concat([home])), { padding: [20, 20] });
+    }
+    var Views = L.Control.extend({
+      options: { position: 'topright' },
+      onAdd: function () {
+        var box = L.DomUtil.create('div', 'leaflet-bar map-views');
+        box.innerHTML = '<a href="#" role="button" data-v="home" title="Back to home" aria-label="Back to home">🏠</a>' +
+          (out.length ? (inUK ? '<a href="#" role="button" data-v="wide" title="The whole UK" aria-label="The whole UK">UK</a>'
+            : '<a href="#" role="button" data-v="wide" title="Everything on the map" aria-label="Everything on the map">All</a>') : '');
+        L.DomEvent.disableClickPropagation(box);
+        L.DomEvent.on(box, 'click', function (e) {
+          L.DomEvent.preventDefault(e);
+          var v = e.target.closest('[data-v]');
+          if (v) { if (v.getAttribute('data-v') === 'wide') goWide(); else goHome(); }
+        });
+        return box;
+      }
+    });
+    map.addControl(new Views());
+    // Fit once the card has its final size (fitting a map that hasn't been laid out zooms right in).
+    var saved = MAP_VIEW;
+    requestAnimationFrame(function () {
+      if (MAPI !== map) return;
+      map.invalidateSize();
+      if (saved) map.setView(saved.c, saved.z); else goHome();
+    });
   }
 
   // Things to watch (1.17.0): counts from the live sources that are well up on the last two weeks, at the top of
@@ -2043,6 +2225,10 @@
       '<p class="small muted" style="margin:-6px 0 12px">Disasters are orange and red alerts from GDACS, the UN and EU disaster alert system. ' +
       'Fires are hotspots NASA satellites saw in the last 24 hours: often controlled burns or farm fires, sometimes a wildfire. ' +
       'Places seen again and again over a week or more, like industrial flares, are left out, and you can tell it to ignore a spot.</p>' +
+      '<h3>Map</h3>' +
+      '<label class="opt"><input type="checkbox" name="map"' + (c.map ? ' checked' : '') + '><span><b>Show a map</b>' +
+      '<span class="small muted">A map of the warnings and nearby reports in the wider picture, round home. It loads map pictures from OpenStreetMap: ' +
+      'they see your IP address and the area you look at (it opens on the area round home), and nothing else. Off until you tick it.</span></span></label>' +
       (w.fire_ignored ? '<p class="small muted">Ignoring ' + w.fire_ignored + ' fire spot' + (w.fire_ignored === 1 ? '' : 's') +
         ' you\'ve marked as not a wildfire. <button type="button" class="link" data-act="fire-unignore">Show them again</button></p>' : '') +
       (status ? '<h3>Last check</h3>' + status : '') +
@@ -2785,6 +2971,13 @@
   function doneSheet() {
     if (stack.some(function (x) { return SCAN_SHEETS.indexOf(x.type) >= 0; })) closeAllSheets();
     else closeSheet();
+  }
+  // Load the page again once closing the sheet has stepped back in history (a reload started before that is lost).
+  function reloadSoon() {
+    var done = false;
+    function go() { if (!done) { done = true; location.reload(); } }
+    window.addEventListener('popstate', go);
+    setTimeout(go, 600);
   }
   function closeAllSheets(then) {
     var n = stack.length, hs = history.state && history.state.daSheet;
@@ -4448,12 +4641,15 @@
     if (f.id === 'warnForm') {
       var wbody = { on: f.elements.on.checked, region: d.region || '', lat: d.lat, lon: d.lon,
         flood_km: num(d.flood_km), gdacs_km: num(d.gdacs_km), fire_km: num(d.fire_km), near_km: num(d.near_km), sources: {},
-        ea_area: d.ea_area || '', water_co: d.water_co || '' };
+        ea_area: d.ea_area || '', water_co: d.water_co || '', map: f.elements.map.checked };
       W().source_list.forEach(function (s) { wbody.sources[s[0]] = f.elements['src_' + s[0]].checked; });
+      // The page's security policy only lets map pictures in while the map is on, and it's set when the page loads.
+      var mapChanged = !!(W().config.map && wbody.on) !== !!(wbody.map && wbody.on);
       if ((d.lat === '') !== (d.lon === '')) { toast('Give both a latitude and a longitude, or leave both empty', { error: true }); return; }
       return run(function () {
         return api('PUT', 'api/warnings', wbody).then(function () {
           closeSheet();
+          if (mapChanged) { reloadSoon(); return; }
           if (!wbody.on) return refresh().then(function () { toast('Warnings switched off'); });
           return checkWarnings(null);
         });

@@ -36,7 +36,8 @@ Every line of code, idea, test and word of feedback here has helped a household 
 
 ## Open data and maps
 
-- [OpenStreetMap contributors](https://www.openstreetmap.org/copyright): places to go, under the Open Database Licence
+- [OpenStreetMap contributors](https://www.openstreetmap.org/copyright): places to go, and the live alerts map, under the Open Database Licence
+- [Leaflet](https://leafletjs.com): draws the live alerts map, under the BSD 2-Clause licence
 - Met Office: weather warnings
 - Environment Agency: flood warnings and river levels, under the Open Government Licence
 - GOV.UK Emergency Alerts: emergency alerts

@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.18.0"
+VERSION = "1.19.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -5950,8 +5950,12 @@ MET_NAME = {c: n for c, n, _, _ in MET_REGIONS}
 WARN_DEFAULTS = {"on": False, "sources": {k: d for k, _, d in WARN_SOURCES}, "region": "", "lat": None, "lon": None,
                  "flood_km": 20, "gdacs_km": 1000, "fire_km": 10,
                  "near_km": 10,   # 1.18.0: how far power cuts and water reports are listed, as "nearby"
+                 "map": False,    # 1.19.0: the live alerts map, which loads map pictures from OpenStreetMap
                  "ea_area": "", "water_co": ""}   # 1.15.0: for drought status and hosepipe bans
 WARN_EVERY = 15 * 60      # seconds between checks
+# 1.19.0: whether the live alerts map is on (warnings on, and "Show a map" ticked). Kept here by warn_cfg, so the web
+# server can say in its Content-Security-Policy whether map pictures may load, without reading the database each time.
+MAP_TILES_ON = {"on": False}
 FLOOD_LOOKUPS = 80        # flood areas to look up per check (they're kept once found)
 WARN_STATE = {"items": [], "news": [], "sources": {}, "checked_at": None, "region": "", "seen": {}, "live": {}}
 WARN_LOCK = threading.Lock()
@@ -5971,6 +5975,7 @@ def warn_cfg():
     raw = raw if isinstance(raw, dict) else {}
     cfg = json.loads(json.dumps(WARN_DEFAULTS))
     cfg["on"] = bool(raw.get("on"))
+    cfg["map"] = raw.get("map") is True
     src = raw.get("sources") if isinstance(raw.get("sources"), dict) else {}
     for k in cfg["sources"]:
         if k in src:
@@ -5991,6 +5996,7 @@ def warn_cfg():
         cfg["ea_area"] = raw["ea_area"]
     if raw.get("water_co") in WATER_COS:
         cfg["water_co"] = raw["water_co"]
+    MAP_TILES_ON["on"] = cfg["on"] and cfg["map"]   # the web server's CSP lets map pictures in only while it's on
     return cfg
 
 
@@ -6533,7 +6539,8 @@ def parse_gdacs(data, home, km):
                     "event": event,
                     "title": plain(it.findtext("title"), 300), "text": plain(it.findtext("description"), 1500),
                     "area": plain(it.findtext(GDACS + "country"), 120), "distance_km": int(round(d)), "when": "",
-                    "url": safe_url(it.findtext("link")), "issued": iso_utc(parse_when(it.findtext("pubDate")))})
+                    "url": safe_url(it.findtext("link")), "issued": iso_utc(parse_when(it.findtext("pubDate"))),
+                    "lat": round(lat, 4), "lon": round(lon, 4)})   # for the map (1.19.0)
     return out
 
 
@@ -7276,7 +7283,7 @@ def rivers_live(stations, levels, hist, home, now):
                               "Keep an eye on flood warnings, and know how you'd get out if it rises further."),
                           "area": st["town"] or st["name"], "distance_km": int(round(d)), "when": "",
                           "url": row["url"], "issued": iso_utc(parse_when(when) or now), "by": row["by"],
-                          "river": st["river"]})
+                          "river": st["river"], "lat": st["lat"], "lon": st["lon"]})
     rows.sort(key=lambda r: r["km"])
     order = {"very_high": 0, "high": 1}
     top = sorted(rows, key=lambda r: (order.get(r["state"], 2), r["km"]))
@@ -7478,7 +7485,8 @@ def power_live(cuts, home, failed=(), no_feed="", km=POWER_KM):
             items.append({"id": "power:%s:%s" % (c["dno"], c["ref"]), "source": "power", "kind": "power",
                           "severity": 1 if c["planned"] else 2, "level": "Planned" if c["planned"] else "Power cut",
                           "title": title, "text": text, "area": c["where"], "distance_km": int(round(d)),
-                          "back_by": when_words(c["etr"]) if c["etr"] and not c["planned"] else "", "when": "", "url": "https://www.powercut105.com/", "issued": iso_utc(parse_when(c["started"]) or dt.datetime.now(dt.timezone.utc))})
+                          "back_by": when_words(c["etr"]) if c["etr"] and not c["planned"] else "", "when": "", "url": "https://www.powercut105.com/", "issued": iso_utc(parse_when(c["started"]) or dt.datetime.now(dt.timezone.utc)),
+                          "lat": c["lat"], "lon": c["lon"]})   # for the map (1.19.0)
     rows.sort(key=lambda r: r["km"])
     unplanned = [r for r in rows if not r["planned"]]
     return items, {"cuts": rows[:6], "count": len(unplanned), "planned": len(rows) - len(unplanned),
@@ -8774,11 +8782,12 @@ def water_live(reports, co, home, now, km=WATER_NEAR_KM):
                           "text": ((x["text"] + " ") if x["text"] else "") + "Reported to %s. If your taps are affected, "
                                   "check %s's website or call them, and use your stored water." % (co, co),
                           "area": x["place"] or co, "when": "", "url": x["url"] or WATER_PAGES[co],
-                          "issued": iso_utc(x["when"]) or iso_utc(now), "distance_km": int(round(x["km"])), "by": co})
+                          "issued": iso_utc(x["when"]) or iso_utc(now), "distance_km": int(round(x["km"])), "by": co,
+                          "lat": x["lat"], "lon": x["lon"]})   # for the map (1.19.0)
         rows.append({"kind": x["what"], "group": {"supply": "Supply", "quality": "Water quality", "planned": "Planned work",
                                                    "leak": "Leak"}.get(x["group"], "Other"),
                      "km": x["km"], "issued": iso_utc(x["when"]), "where": x["place"], "yours": bool(yours),
-                     "url": x["url"]})
+                     "url": x["url"], "lat": x["lat"], "lon": x["lon"]})
     supply = [x for x in near if x["group"] in ("supply", "quality")]
     return items, {"company": co, "reports": rows[:10], "supply": len(supply), "url": WATER_PAGES[co],
                    "close": sum(1 for x in supply if x["km"] <= WATER_CLOSE_KM), "within_km": km,
@@ -9029,6 +9038,63 @@ def live_layout(rows):
         if got:
             groups.append({"name": name, "keys": got})
     return {"attention": [r["key"] for r in att], "groups": groups}
+
+
+# The live alerts map (1.19.0). Off unless "Show a map" is ticked in the warnings settings. The Pi fetches nothing for
+# it: every point is a warning or a reading the feeds already gave, and the map pictures are loaded by the phone's
+# browser from OpenStreetMap (see MAP_TILES and csp()). Routine points (planned work, a river at its usual level, a
+# leak) are drawn only when someone asks for them on the map.
+WATER_SUPPLY_GROUPS = ("Supply", "Water quality")
+
+
+def live_map(cfg, loc, items, live):
+    """What the live alerts map draws: home, the near you distance, and a point for everything with a place.
+
+    Each point: lat, lon, source, kind (for its icon, as the rows), title, level, severity (0 to 3), distance_km, and
+    scope: "yours" (a warning in force) or "near" (listed, but not a warning: a power cut more than 2 km away, another
+    street's water report, a river gauge). routine: planned work, a river at its usual level, a leak, or anything
+    with severity 0 that isn't in "Nearby". i: the warning's place in items, or key: the live source whose details
+    to open. A point may carry lines (lists of [lat, lon]) one day; none do yet."""
+    if not (cfg["on"] and cfg.get("map")):
+        return {"on": False}
+    out = {"on": True, "home": [loc["lat"], loc["lon"]] if loc else None, "near_km": cfg["near_km"], "points": []}
+
+    def add(lat, lon, **kw):
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and not isinstance(lat, bool) \
+                and -90 <= lat <= 90 and -180 <= lon <= 180:
+            out["points"].append(dict(kw, lat=round(lat, 5), lon=round(lon, 5)))
+
+    for n, i in enumerate(items):
+        if i.get("kind") == "news" or i.get("lat") is None:
+            continue
+        sev = i.get("severity") or 0
+        add(i.get("lat"), i.get("lon"), i=n, key="", source=i.get("source") or "", kind=i.get("kind") or "",
+            title=KM_AWAY.sub("", i.get("title") or ""), level=i.get("level") or "", severity=sev,
+            distance_km=i.get("distance_km"), scope="yours",
+            routine=sev < 1 or (i.get("source") == "power" and i.get("level") == "Planned"))
+    p = live.get("power") or {}
+    for c in p.get("cuts") or []:
+        if c.get("km") is None or c["km"] <= POWER_NEAR_KM:
+            continue   # within 2 km, it's a warning: on the map already
+        add(c.get("lat"), c.get("lon"), key="power", source="power", kind="power",
+            title="Planned power cut" if c.get("planned") else "Power cut", level="Planned" if c.get("planned") else "",
+            severity=0, distance_km=c["km"], scope="near", routine=bool(c.get("planned")), area=c.get("where") or "")
+    w = live.get("water") or {}
+    for r in w.get("reports") or []:
+        supply = r.get("group") in WATER_SUPPLY_GROUPS
+        if supply and r.get("yours"):
+            continue   # a warning: on the map already
+        add(r.get("lat"), r.get("lon"), key="water", source="water", kind="water",
+            title=r.get("kind") or "Water supply problem", level=r.get("group") or "", severity=0,
+            distance_km=r.get("km"), scope="near", routine=not supply, area=r.get("where") or "")
+    rv = live.get("rivers") or {}
+    for g in rv.get("stations") or []:
+        if g.get("state") in ("high", "very_high"):
+            continue   # a warning: on the map already
+        add(g.get("lat"), g.get("lon"), key="rivers", source="rivers", kind="river", title=g.get("where") or "River gauge",
+            level="Usual level" if g.get("state") == "normal" else "Low" if g.get("state") == "low" else "",
+            severity=0, distance_km=g.get("km"), scope="near", routine=True, area="")
+    return out
 
 
 def fetch_live(key, cfg, home, mem, now):
@@ -9461,6 +9527,7 @@ def warn_public():
     return {"config": cfg, "on": on, "live": live, "live_rows": rows, "trends": trends,
             # 1.18.0: what's affecting home and what's nearby, and the lines in their groups
             "affecting": affecting(st["items"] if on else [], live), "live_layout": live_layout(rows),
+            "map": live_map(cfg, loc, st["items"] if on else [], live),   # 1.19.0: what the live alerts map draws
             "items": st["items"] if on else [], "news": st["news"] if on else [],
             "sources": st["sources"] if on else {}, "checked_at": st["checked_at"] if on else None,
             "location": loc, "region": cfg["region"] or guess_region(loc) or "UK", "region_guessed": not cfg["region"],
@@ -9492,6 +9559,10 @@ def api_warnings_set(body, query):
     cur = warn_cfg()
     if "on" in body:
         cur["on"] = bool(body.get("on"))
+    if "map" in body:
+        if not isinstance(body["map"], bool):
+            raise ApiError(400, "Show a map is either on (true) or off (false)")
+        cur["map"] = body["map"]
     if isinstance(body.get("sources"), dict):
         for k in cur["sources"]:
             if k in body["sources"]:
@@ -10516,6 +10587,15 @@ MIME = {
 }
 CSP = ("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
        "script-src 'self'; connect-src 'self'; frame-ancestors 'self'")
+# 1.19.0: the live alerts map's pictures come from OpenStreetMap's tile server, loaded by the browser. Only while the
+# map is switched on does the page allow images from there; switched off, the policy is exactly as before, so even a
+# stray request for a map picture would be blocked. Leaflet, which draws the map, is bundled (static/vendor/leaflet).
+MAP_TILES = "https://tile.openstreetmap.org"
+CSP_MAP = CSP.replace("img-src 'self' data:", "img-src 'self' data: " + MAP_TILES)
+
+
+def csp():
+    return CSP_MAP if MAP_TILES_ON["on"] else CSP
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -10543,7 +10623,7 @@ class Handler(BaseHTTPRequestHandler):
     def common_headers(self):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("Content-Security-Policy", csp())
 
     def send_bytes(self, status, data, content_type, extra=None, head=False):
         self.send_response(status)
@@ -10999,6 +11079,7 @@ def main():
         sys.exit("Dads Army needs Python 3.7 or newer")
     init_db()
     load_warnings()
+    warn_cfg()   # sets MAP_TILES_ON, so the first page served has the right Content-Security-Policy (1.19.0)
     ai_ready()   # Home Assistant's AI Task: asked in the background, so the first screen has the answer sooner
     threading.Thread(target=backup_loop, name="backups", daemon=True).start()
     threading.Thread(target=history_loop, name="history", daemon=True).start()
