@@ -1620,17 +1620,62 @@
   }
 
   // The wider picture: one line for each live feed (worked out on the Pi), green, amber or red.
+  function liveRow(r) {
+    return '<button class="li live-row" data-state="' + r.state + '" data-act="live-open" data-key="' + r.key + '">' +
+      '<span class="li-ico">' + r.emoji + '</span><span class="li-main"><span class="li-title">' + esc(r.name) + '</span>' +
+      '<span class="li-sub">' + esc(r.text) + '</span></span><span class="live-dot" aria-label="' +
+      ({ good: 'Fine', warn: 'Worth watching', bad: 'Serious' }[r.state] || '') + '"></span></button>';
+  }
+  // 1.18.0: what's affecting home comes first, item by item, then the lines that need attention (worst first), then
+  // the rest under headings. What counts as yours, and the order, are worked out on the Pi (affecting, live_layout),
+  // so "Affecting you" lists exactly the warnings that turn a line amber or red, and never disagrees with it.
   function liveCard() {
-    var w = W(), rows = w.live_rows || [];
-    if (!w.on || !rows.length) return '';
-    return '<section class="card flush live-card"><div class="card-head"><h2>The wider picture</h2>' +
-      '<button class="link" data-act="live-open">More</button></div><div class="list">' +
-      rows.map(function (r) {
-        return '<button class="li live-row" data-state="' + r.state + '" data-act="live-open" data-key="' + r.key + '">' +
-          '<span class="li-ico">' + r.emoji + '</span><span class="li-main"><span class="li-title">' + esc(r.name) + '</span>' +
-          '<span class="li-sub">' + esc(r.text) + '</span></span><span class="live-dot" aria-label="' +
-          ({ good: 'Fine', warn: 'Worth watching', bad: 'Serious' }[r.state] || '') + '"></span></button>';
-      }).join('') + '</div></section>';
+    var w = W(), rows = w.live_rows || [], aff = w.affecting || { yours: [], near: [], near_count: 0 };
+    if (!w.on || (!rows.length && !aff.yours.length)) return '';
+    var byKey = {};
+    rows.forEach(function (r) { byKey[r.key] = r; });
+    var lay = w.live_layout || { attention: [], groups: [{ name: '', keys: rows.map(function (r) { return r.key; }) }] };
+    var html = '<section class="card flush live-card"><div class="card-head"><h2>The wider picture</h2>' +
+      '<button class="link" data-act="live-open">More</button></div>' + (w.location ? affectHtml(aff) : '');
+    html += lay.attention.length
+      ? '<h3 class="group-head">Needs attention <span class="n">' + lay.attention.length + '</span></h3><div class="list">' +
+        lay.attention.map(function (k) { return liveRow(byKey[k]); }).join('') + '</div>'
+      : rows.length ? '<p class="li live-calm small"><span class="li-ico" aria-hidden="true">✅</span><span class="li-main"><b>Nothing needs attention</b>' +
+        '<span class="li-sub">Every line is clear. Tap one for its details.</span></span></p>' : '';
+    html += lay.groups.map(function (g) {
+      return (g.name ? '<h3 class="group-head">' + esc(g.name) + '</h3>' : '') + '<div class="list">' +
+        g.keys.map(function (k) { return liveRow(byKey[k]); }).join('') + '</div>';
+    }).join('');
+    return html + '</section>';
+  }
+  function affectHtml(aff) {
+    var html = !aff.yours.length
+      ? '<div class="affect calm"><span class="ia-ico" aria-hidden="true">✅</span><span class="ia-main"><b>Nothing affecting you</b>' +
+        '<span class="ia-sub">No water, power, flood or weather problems in your area right now.</span></span></div>'
+      : '<div class="affect"><h3 class="group-head">Affecting you <span class="n">' + aff.yours.length + '</span></h3>' +
+        aff.yours.map(function (x) { return affectRow(x, false); }).join('') + '</div>';
+    if (aff.near.length) {
+      var more = Math.max(aff.near_count, aff.near.length) - Math.min(3, aff.near.length);
+      html += '<div class="affect"><h3 class="group-head">Nearby, not in your area <span class="n">' + Math.max(aff.near_count, aff.near.length) + '</span></h3>' +
+        aff.near.slice(0, 3).map(function (x) { return affectRow(x, true); }).join('') +
+        (more > 0 ? '<button class="ia-more" data-act="live-open" data-key="' + esc(aff.near[0].key) + '">and ' + more + ' more</button>' : '') + '</div>';
+    }
+    return html;
+  }
+  // One thing affecting home: what it is, then how serious, how far, the postcodes (a power cut), when it started or
+  // is expected back, and the first sentence of the details. Tapping it opens that source's details.
+  function affectRow(x, near) {
+    var lvl = x.level && x.title.toLowerCase().indexOf(x.level.toLowerCase()) !== 0 ? x.level : '';
+    var km = x.distance_km == null ? '' : x.distance_km < 1 ? 'under 1 km away' : fq(x.distance_km) + ' km away';
+    var when = x.back_by ? 'back by ' + x.back_by : x.started ? 'started ' + ago(x.started) : x.when;
+    // The details' first sentence, unless it only repeats the distance or the time back (a power cut's text starts so).
+    var detail = x.detail && !/\bkm\b/i.test(x.detail) && !(x.back_by && x.detail.indexOf(x.back_by) >= 0) ? x.detail : '';
+    var bits = [near ? '' : lvl, km, x.postcodes, when, detail].filter(Boolean);
+    var act = x.key ? 'data-act="live-open" data-key="' + esc(x.key) + '"' : 'data-act="warn-open" data-i="' + x.i + '"';
+    return '<button class="ia-row' + (near ? ' near' : ' sev' + x.severity) + '" ' + act + '>' +
+      '<span class="ia-ico" aria-hidden="true">' + (WARN_ICON[x.kind] || '⚠️') + '</span>' +
+      '<span class="ia-main"><span class="ia-title">' + esc(x.title) + '</span><span class="ia-sub">' + esc(bits.join(' · ')) + '</span></span>' +
+      ICON.chev + '</button>';
   }
 
   // Things to watch (1.17.0): counts from the live sources that are well up on the last two weeks, at the top of
@@ -1693,7 +1738,7 @@
       h += r.cuts.length ? '<div class="list">' + r.cuts.map(function (c) {
         return '<div class="li"><span class="li-ico">' + (c.planned ? '🛠️' : '🔌') + '</span><span class="li-main"><span class="li-title wrap">' + esc(c.text) + '</span>' +
           '<span class="li-sub">' + esc(c.dno) + (c.customers ? ' · ' + c.customers + ' home' + (c.customers === 1 ? '' : 's') : '') + '</span></span></div>';
-      }).join('') + '</div>' : '<p class="small muted">No power cuts reported within 10 km.</p>';
+      }).join('') + '</div>' : '<p class="small muted">No power cuts reported within ' + (r.within_km || 10) + ' km.</p>';
       if (r.no_feed) {
         h += '<p class="callout info small">' + esc(r.no_feed) + ', your network, only publishes its live power cuts to registered users, so they can\'t be shown here. ' +
           (r.no_feed_url ? '<a href="' + esc(r.no_feed_url) + '" target="_blank" rel="noopener noreferrer">See its power cut map</a>, or call 105.' : 'Call 105.') + '</p>';
@@ -1748,7 +1793,7 @@
       h += (r.reports || []).length ? '<div class="list">' + r.reports.map(function (x) {
         return '<div class="li"><span class="li-ico">' + (x.yours ? '⚠️' : '🚰') + '</span><span class="li-main"><span class="li-title wrap">' + esc(x.kind) + (x.yours ? ' · may be yours' : '') + '</span>' +
           '<span class="li-sub">' + esc(fq(x.km)) + ' km away · ' + esc(x.group) + (x.where ? ' · ' + esc(x.where) : '') + (x.issued ? ' · ' + esc(whenText(x.issued)) : '') + '</span></span></div>';
-      }).join('') + '</div>' : '<p class="small muted">Nothing reported within 10 km.</p>';
+      }).join('') + '</div>' : '<p class="small muted">Nothing reported within ' + (r.within_km || 10) + ' km.</p>';
       h += '<p class="small muted">From ' + esc(r.company) + '\'s <a href="' + esc(r.url) + '" target="_blank" rel="noopener noreferrer">in your area</a> page. A supply problem is counted as yours when ' +
         'the company says your area is affected, or two are reported within 3 km, or one within 1 km.</p>';
     } else if (key === 'floodrisk') {
@@ -1991,7 +2036,10 @@
       (w.ha ? 'Leave empty to use your Home Assistant home location.' : 'Long-press your home in a maps app to find it.') + '</div></div>' +
       '<div class="grid2"><label class="field"><span>Floods within (km)</span><input type="number" name="flood_km" inputmode="numeric" min="1" max="200" value="' + c.flood_km + '"></label>' +
       '<label class="field"><span>Fires within (km)</span><input type="number" name="fire_km" inputmode="numeric" min="2" max="50" value="' + c.fire_km + '"></label></div>' +
-      '<div class="grid2"><label class="field"><span>Disasters within (km)</span><input type="number" name="gdacs_km" inputmode="numeric" min="50" max="5000" value="' + c.gdacs_km + '"></label></div>' +
+      '<div class="grid2"><label class="field"><span>Disasters within (km)</span><input type="number" name="gdacs_km" inputmode="numeric" min="50" max="5000" value="' + c.gdacs_km + '"></label>' +
+      '<label class="field"><span>Near you (km)</span><input type="number" name="near_km" inputmode="numeric" min="5" max="40" step="1" value="' + (c.near_km || 10) + '" aria-describedby="nearKmHint"></label></div>' +
+      '<p class="small muted" id="nearKmHint" style="margin:-6px 0 12px">Near you, 5 to 40 km: how far power cuts and water supply reports are listed, under <b>Nearby, not in your area</b>. ' +
+      'Only one in your own area (a power cut within 2 km, a supply problem the water company says is yours) is a warning, whatever this is.</p>' +
       '<p class="small muted" style="margin:-6px 0 12px">Disasters are orange and red alerts from GDACS, the UN and EU disaster alert system. ' +
       'Fires are hotspots NASA satellites saw in the last 24 hours: often controlled burns or farm fires, sometimes a wildfire. ' +
       'Places seen again and again over a week or more, like industrial flares, are left out, and you can tell it to ignore a spot.</p>' +
@@ -4399,7 +4447,7 @@
     }
     if (f.id === 'warnForm') {
       var wbody = { on: f.elements.on.checked, region: d.region || '', lat: d.lat, lon: d.lon,
-        flood_km: num(d.flood_km), gdacs_km: num(d.gdacs_km), fire_km: num(d.fire_km), sources: {},
+        flood_km: num(d.flood_km), gdacs_km: num(d.gdacs_km), fire_km: num(d.fire_km), near_km: num(d.near_km), sources: {},
         ea_area: d.ea_area || '', water_co: d.water_co || '' };
       W().source_list.forEach(function (s) { wbody.sources[s[0]] = f.elements['src_' + s[0]].checked; });
       if ((d.lat === '') !== (d.lon === '')) { toast('Give both a latitude and a longitude, or leave both empty', { error: true }); return; }

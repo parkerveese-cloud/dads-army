@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.18.0
+
+**Affecting you**
+
+- **What's touching home comes first.** At the top of the wider picture on the Sitrep, each thing affecting your own area gets its own line: water off, a power cut, a flood warning, severe weather, a high river. Each says how serious it is, how far away, the postcodes a power cut covers, when it started or when power's expected back, and the first sentence of the details. The colour down its left side is how serious it is. Tap it for that source's details.
+- **The same "yours" as the lines.** Affecting you is exactly the warnings behind a line turning amber or red, so a line never says all's well while Affecting you lists something from it. A power cut 6 km away, or another street's burst main, isn't a warning: it's listed underneath, more quietly, as **Nearby, not in your area** (the nearest three, and how many more).
+- **When nothing is**, one calm line says so: *Nothing affecting you*.
+
+**The wider picture, grouped**
+
+- **Lines that need attention come first**, worst first. When none do, one line says *Nothing needs attention*.
+- **The rest are under headings:** Water and weather, Power and energy, Home, and The wider world. The lines themselves are as before.
+
+**Near you**
+
+- **A "near you" distance** in the warnings settings, 5 to 40 km (10 km, as before, until you change it): how far power cuts and water supply reports are listed. It doesn't change what's a warning: a power cut within 2 km, or a supply problem the water company says is yours. Floods and fires keep their own distances. Changing it checks again straight away.
+- The app's warnings (in `GET /api/state`) have `affecting` (`yours`, `near` and `near_count`), `live_layout` (`attention` and `groups`), and `near_km` in `config`.
+
 ## 1.17.0
 
 **Trends in the wider picture**

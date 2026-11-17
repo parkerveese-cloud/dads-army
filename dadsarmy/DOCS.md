@@ -392,7 +392,7 @@ Switched on with the warnings, and listed under **Live information** in the warn
 | Feed | What you get | Warns when |
 |---|---|---|
 | River levels (Environment Agency, England; SEPA, Scotland) | The river gauges within 10 km, against their usual range, and whether each is rising or falling | A river is above its usual range, or above its highest in recent years |
-| Power cuts (UK Power Networks, National Grid, SSEN, Northern Powergrid; Electricity North West and NIE Networks near their networks) | Power cuts and planned work within 10 km | A power cut within 2 km, or planned work there |
+| Power cuts (UK Power Networks, National Grid, SSEN, Northern Powergrid; Electricity North West and NIE Networks near their networks) | Power cuts and planned work within your near you distance (10 km unless you change it) | A power cut within 2 km, or planned work there |
 | The electricity grid (NESO, through Elexon) | Electricity margin and capacity market notices | A notice is in force; a warning of planned rota power cuts counts as serious |
 | Gas storage (National Gas) | How full Great Britain's gas storage is, against a year ago | It's emptying much faster than a year ago over two weeks, or it's nearly empty in winter |
 | Air quality (Defra UK-AIR) | The Daily Air Quality Index at the nearest monitoring site, and the forecast | It's high (7 or more) now or in the next two days |
@@ -406,6 +406,17 @@ Switched on with the warnings, and listed under **Live information** in the warn
 
 Sources: Environment Agency flood and river level data from the real-time data API (Beta), SEPA's water levels and Defra's UK-AIR, under the Open Government Licence; power cut data from UK Power Networks, National Grid Electricity Distribution, SSEN and Northern Powergrid under their open data licences, and from Electricity North West's and NIE Networks' power cut maps; system warnings from Elexon's BMRS; National Gas's data portal; NOAA's Space Weather Prediction Center; and the Bank of England's database, under the Open Government Licence.
 
+### Affecting you, and the lines in groups (1.18.0)
+
+On the Sitrep, the wider picture starts with what's affecting home:
+
+- **Affecting you:** each warning in force from the sources that touch daily life (water supply, power cuts, flood warnings, Met Office warnings, Emergency Alerts, high rivers, possible fires, heavy rain, the flood risk forecast, air quality and drought), worst first, then nearest. Each line says how serious it is, how far away, the postcodes a power cut covers, when it started or when power's expected back, and the first sentence of the details, with a colour down its left side for how serious it is. Tap it for that source's details, or the warning itself.
+- It's exactly the warnings that turn a line amber or red, so a line never says all's well while Affecting you lists something from it. When there's nothing, one line says *Nothing affecting you*.
+- **Nearby, not in your area:** power cuts and water supply reports within your near you distance that aren't warnings (a power cut more than 2 km away; a supply problem the water company doesn't say is yours, and that isn't close enough to count). The nearest three, and how many more. Planned work isn't listed here.
+- **Then the lines:** those that need attention first, worst first (or *Nothing needs attention*), and the rest under Water and weather, Power and energy, Home, and The wider world.
+
+**Near you** in the warnings settings (5 to 40 km, 10 km to start with) is how far power cuts and water supply reports are listed. It doesn't change what's a warning, and flood warnings and fires keep their own distances. River gauges are always within 10 km, as a high river near home is a warning.
+
 ### More of the wider picture (1.15.0)
 
 Under **More of the wider picture** in the warnings settings. All public; the rain gauges and boreholes are the whole national list, and Dads Army picks the nearest itself.
@@ -416,7 +427,7 @@ Under **More of the wider picture** in the warnings settings. All public; the ra
 | Cyber security (NCSC) | The NCSC's news from the last two weeks | A critical flaw or live attack in the last three days |
 | Travel advice (FCDO) | Countries whose advice changed in the last three days | Shown, but not a warning |
 | Drought, reservoirs and hosepipe bans (Environment Agency, England) | Reservoir storage, your area's drought status, your water company's hosepipe ban | Your area is in drought, or your water company has a hosepipe ban |
-| Water supply problems (six water companies) | Supply reports within 10 km | A supply problem that's yours: the company says your area is affected, or two are reported within 3 km, or one within 1 km |
+| Water supply problems (six water companies) | Supply reports within your near you distance (10 km unless you change it) | A supply problem that's yours: the company says your area is affected, or two are reported within 3 km, or one within 1 km |
 | Flood risk forecast (Flood Forecasting Centre's outlook for England, five days, from Check for flooding; Scottish Flood Forecast, three days) | The risk where you live, which day, and whether it's rising | Medium or high (in Scotland: flooding possible, or significant flooding possible) |
 | Rainfall near you (Environment Agency, SEPA, Natural Resources Wales) | Rain in 24 hours and 7 days at the nearest gauges (within 25 km) | 30 mm or more in a day |
 | Groundwater near you (Environment Agency, England) | The nearest boreholes (within 30 km) against the time of year; a deep borehole below sea level is marked, as it follows decades rather than this year's rain | Shown, but not a warning |
@@ -435,7 +446,7 @@ Each warnings check keeps a few counts, one a day for two weeks (the day's highe
 
 | Count | From |
 |---|---|
-| Power cuts near you (within 10 km), and across the networks (every live power cut on the networks checked) | Power cuts |
+| Power cuts near you (within your near you distance), and across the networks (every live power cut on the networks checked) | Power cuts |
 | Flood warnings and alerts near you (within your flood distance), and across England | Flood warnings |
 | Rivers above their usual range near you | River levels |
 | Possible fires near you | NASA satellites |
@@ -448,7 +459,7 @@ Each warnings check keeps a few counts, one a day for two weeks (the day's highe
 
 ### The rest of the UK
 
-England's feeds stop at its borders. Where they don't reach, Scotland's, Wales' and Northern Ireland's own take over, and so do the electricity networks and water companies that cover home. Each is asked only for homes it covers: in its nation or network, or near enough to the border to matter (flood warnings within your flood distance, river gauges within 30 km, rain gauges within 25 km, power cuts within 10 km). Each is the provider's whole list, picked through on your own machine. If a neighbour's feed fails, home's own still shows; if home's own fails, the source keeps its last good result, as the others do.
+England's feeds stop at its borders. Where they don't reach, Scotland's, Wales' and Northern Ireland's own take over, and so do the electricity networks and water companies that cover home. Each is asked only for homes it covers: in its nation or network, or near enough to the border to matter (flood warnings within your flood distance, river gauges within 30 km, rain gauges within 25 km, power cuts within your near you distance). Each is the provider's whole list, picked through on your own machine. If a neighbour's feed fails, home's own still shows; if home's own fails, the source keeps its last good result, as the others do.
 
 | Source | Provider and feed | Licence | Covers |
 |---|---|---|---|

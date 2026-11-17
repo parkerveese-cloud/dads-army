@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.17.0"
+VERSION = "1.18.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -5949,6 +5949,7 @@ MET_REGIONS = [  # code, name, rough middle (to guess yours from Home Assistant'
 MET_NAME = {c: n for c, n, _, _ in MET_REGIONS}
 WARN_DEFAULTS = {"on": False, "sources": {k: d for k, _, d in WARN_SOURCES}, "region": "", "lat": None, "lon": None,
                  "flood_km": 20, "gdacs_km": 1000, "fire_km": 10,
+                 "near_km": 10,   # 1.18.0: how far power cuts and water reports are listed, as "nearby"
                  "ea_area": "", "water_co": ""}   # 1.15.0: for drought status and hosepipe bans
 WARN_EVERY = 15 * 60      # seconds between checks
 FLOOD_LOOKUPS = 80        # flood areas to look up per check (they're kept once found)
@@ -5982,7 +5983,7 @@ def warn_cfg():
             cfg[k] = float(v)
     if cfg["lat"] is None or cfg["lon"] is None:
         cfg["lat"] = cfg["lon"] = None
-    for k, lo, hi in (("flood_km", 1, 200), ("gdacs_km", 50, 5000), ("fire_km", 2, 50)):
+    for k, lo, hi in (("flood_km", 1, 200), ("gdacs_km", 50, 5000), ("fire_km", 2, 50), ("near_km", NEAR_KM_MIN, NEAR_KM_MAX)):
         v = raw.get(k)
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             cfg[k] = int(min(hi, max(lo, v)))
@@ -7062,8 +7063,9 @@ LIVE_CREDIT = {
 }
 RIVER_KM = 10          # rivers this close count as near home
 RIVER_KEEP_KM = 30     # station details kept for this far, so a small move of home doesn't need a refetch
-POWER_KM = 10          # power cuts listed this far away
+POWER_KM = 10          # power cuts listed this far away (the "near you" distance in the warnings settings, 1.18.0)...
 POWER_NEAR_KM = 2      # ...and a warning this close
+NEAR_KM_MIN, NEAR_KM_MAX = 5, 40   # the "near you" distance: under 5 km would hide cuts round the corner, over 40 isn't near
 AIR_KM = 40
 DAQI_BANDS = [(3, "Low"), (6, "Moderate"), (9, "High"), (10, "Very high")]
 G_WORDS = {0: "Quiet", 1: "Minor storm (G1)", 2: "Moderate storm (G2)", 3: "Strong storm (G3)",
@@ -7446,16 +7448,17 @@ def when_words(s):
         local.day, local.strftime("%b"), local.strftime("%H:%M"))
 
 
-def power_live(cuts, home, failed=(), no_feed=""):
+def power_live(cuts, home, failed=(), no_feed="", km=POWER_KM):
     """failed: networks whose feed didn't come through this time (the others still show). no_feed: home's own network,
-    if it doesn't publish its live power cuts."""
+    if it doesn't publish its live power cuts. km: how far they're listed (the "near you" distance); only one within
+    POWER_NEAR_KM is a warning, whatever that is."""
     rows, items = [], []
     for c in cuts:
         if c.get("spots"):   # a cut with a spot for each postcode: how near is the nearest of them
             c = dict(c)
             c["lat"], c["lon"] = min(c.pop("spots"), key=lambda p: km_between(home["lat"], home["lon"], p[0], p[1]))
         d = km_between(home["lat"], home["lon"], c["lat"], c["lon"])
-        if d > POWER_KM:
+        if d > km:
             continue
         c = dict(c, km=round(d, 1), dir=DIR_SHORT.get(compass(home["lat"], home["lon"], c["lat"], c["lon"]), ""))
         c["text"] = "%s%s, %s %s%s" % ("Planned: " if c["planned"] else "", c["where"] or c["dno"], _km_words(d), c["dir"],
@@ -7475,14 +7478,14 @@ def power_live(cuts, home, failed=(), no_feed=""):
             items.append({"id": "power:%s:%s" % (c["dno"], c["ref"]), "source": "power", "kind": "power",
                           "severity": 1 if c["planned"] else 2, "level": "Planned" if c["planned"] else "Power cut",
                           "title": title, "text": text, "area": c["where"], "distance_km": int(round(d)),
-                          "when": "", "url": "https://www.powercut105.com/", "issued": iso_utc(parse_when(c["started"]) or dt.datetime.now(dt.timezone.utc))})
+                          "back_by": when_words(c["etr"]) if c["etr"] and not c["planned"] else "", "when": "", "url": "https://www.powercut105.com/", "issued": iso_utc(parse_when(c["started"]) or dt.datetime.now(dt.timezone.utc))})
     rows.sort(key=lambda r: r["km"])
     unplanned = [r for r in rows if not r["planned"]]
     return items, {"cuts": rows[:6], "count": len(unplanned), "planned": len(rows) - len(unplanned),
                    # every power cut on the networks checked, near or not: for the trends (1.17.0)
                    "networks": sum(1 for c in cuts if not c.get("planned")),
                    "homes": sum(r["customers"] for r in unplanned), "near": sum(1 for r in unplanned if r["km"] <= POWER_NEAR_KM),
-                   "failed": list(failed), "no_feed": no_feed, "no_feed_url": NO_LIVE_FEED.get(no_feed, "")}
+                   "failed": list(failed), "no_feed": no_feed, "no_feed_url": NO_LIVE_FEED.get(no_feed, ""), "within_km": km}
 
 
 # -- The electricity grid -----------------------------------------------------------------------
@@ -8572,7 +8575,7 @@ WATER_PAGES = {"Cambridge Water": "https://www.cambridge-water.co.uk/incidents/i
 WATER_REGIONS = {"Cambridge Water": "C", "South Staffs Water": "S"}   # on the one ArcGIS layer
 WATER_CLOSE_KM = 3     # two or more supply problems this close are probably yours...
 WATER_SURE_KM = 1      # ...or one this close (one a couple of km off could be another street's burst main)
-WATER_NEAR_KM = 10     # ...and these are listed
+WATER_NEAR_KM = 10     # ...and these are listed (the "near you" distance in the warnings settings, 1.18.0)
 WATER_ONLY = "Only covers " + ", ".join(list(WATER_PAGES)[:-1]) + " and " + list(WATER_PAGES)[-1] + " customers"
 WATER_CHOOSE = "Choose your water company under Where you are"
 WATER_SEVERE = re.compile(r"do not drink|don't drink|boil (your )?water|boil notice|do not use|no water|without water|"
@@ -8745,7 +8748,7 @@ def water_reports(co, now):
     return []
 
 
-def water_live(reports, co, home, now):
+def water_live(reports, co, home, now, km=WATER_NEAR_KM):
     """A supply problem is yours when the company says home's area is affected (its outline or reach takes home in),
     or two or more are reported within 3 km, or one within 1 km. One further off is listed, and worth watching, but
     it isn't a warning: it may be another street's burst main."""
@@ -8753,11 +8756,11 @@ def water_live(reports, co, home, now):
     for r in reports:
         if r["lat"] is None or r["lon"] is None:
             continue
-        km = km_between(home["lat"], home["lon"], r["lat"], r["lon"])
-        if km > WATER_NEAR_KM:
+        d = km_between(home["lat"], home["lon"], r["lat"], r["lon"])
+        if d > km:
             continue
-        said = bool(r["rings"] and in_rings(r["rings"], home["lat"], home["lon"])) or bool(r["reach_km"] and km <= r["reach_km"])
-        near.append(dict(r, km=round(km, 1), said=said))
+        said = bool(r["rings"] and in_rings(r["rings"], home["lat"], home["lon"])) or bool(r["reach_km"] and d <= r["reach_km"])
+        near.append(dict(r, km=round(d, 1), said=said))
     near.sort(key=lambda x: x["km"])
     close = sum(1 for x in near if x["group"] in ("supply", "quality") and x["km"] <= WATER_CLOSE_KM)
     items, rows = [], []
@@ -8778,7 +8781,9 @@ def water_live(reports, co, home, now):
                      "url": x["url"]})
     supply = [x for x in near if x["group"] in ("supply", "quality")]
     return items, {"company": co, "reports": rows[:10], "supply": len(supply), "url": WATER_PAGES[co],
-                   "close": sum(1 for x in supply if x["km"] <= WATER_CLOSE_KM),
+                   "close": sum(1 for x in supply if x["km"] <= WATER_CLOSE_KM), "within_km": km,
+                   # supply problems that are yours (the warnings), so the rest can be listed as nearby (1.18.0)
+                   "mine": len(items),
                    "planned_here": sum(1 for x in near if x["group"] == "planned" and x["said"])}
 
 
@@ -8831,11 +8836,11 @@ def live_rows(live, items, trends=()):
         elif key == "power":
             if r["count"]:
                 c = [x for x in r["cuts"] if not x["planned"]][0] if any(not x["planned"] for x in r["cuts"]) else None
-                text = "%d power cut%s within %d km%s" % (r["count"], "" if r["count"] == 1 else "s", POWER_KM,
+                text = "%d power cut%s within %d km%s" % (r["count"], "" if r["count"] == 1 else "s", r.get("within_km", POWER_KM),
                                                           (", nearest %s %s" % (_km_words(c["km"]), c["dir"])) if c else "")
                 state = "warn"
             else:
-                text = "None within %d km" % POWER_KM
+                text = "None within %d km" % r.get("within_km", POWER_KM)
             if r.get("planned"):
                 text += " · %d planned" % r["planned"]
             brief = re.sub(r", nearest [^·]*?(?= ·|$)", "", text)   # how far the nearest is says where home is
@@ -8901,8 +8906,9 @@ def live_rows(live, items, trends=()):
             if r.get("stale"):
                 text = "No report since %s" % r.get("week")
         elif key == "water":
-            text = ("%d supply report%s within %d km" % (r["supply"], "" if r["supply"] == 1 else "s", WATER_NEAR_KM)
-                    if r["supply"] else "No supply problems reported within %d km" % WATER_NEAR_KM) + " · " + r["company"]
+            wk = r.get("within_km", WATER_NEAR_KM)
+            text = ("%d supply report%s within %d km" % (r["supply"], "" if r["supply"] == 1 else "s", wk)
+                    if r["supply"] else "No supply problems reported within %d km" % wk) + " · " + r["company"]
             if r.get("close"):   # within 3 km: maybe yours (a warning when it's sure)
                 state = "warn"
             if r.get("planned_here"):
@@ -8944,6 +8950,85 @@ def live_rows(live, items, trends=()):
             row["trend"] = rising[key]["title"]
         rows.append(row)
     return rows
+
+
+# -- Affecting you, and the wider picture in groups (1.18.0) -----------------------------------------
+# The sources that touch daily life at home: water off, a power cut, a flood, severe weather. The rest of the wider
+# picture (the pound, the threat level, the grid's margin) matters, but it isn't "affecting you" today.
+AFFECT_SOURCES = ("water", "power", "floods", "metoffice", "govalerts", "rivers", "fires", "rain", "floodrisk", "air",
+                  "drought")
+AFFECT_STARTED = ("water", "power", "floods", "govalerts")   # where "issued" is when the trouble started
+KM_AWAY = re.compile(r"\s*(?:·\s*)?[\d.]+ km away\s*$")
+LIVE_GROUPS = [   # the wider picture's lines that need no attention, under these headings, in this order
+    ("Water and weather", ("rivers", "floodrisk", "rain", "ground", "drought")),
+    ("Power and energy", ("power", "grid", "gridnow", "gridstress", "gas")),
+    ("Home", ("water", "air")),
+    ("The wider world", ("threat", "cyber", "travel", "space", "pound")),
+]
+STATE_RANK = {"bad": 2, "warn": 1, "good": 0}
+
+
+def first_sentence(text, most=90):
+    """The first sentence, without its full stop, for a one-line summary."""
+    t = re.split(r"(?<=[.!?])\s", (text or "").strip(), maxsplit=1)[0].rstrip(".")
+    return t if len(t) <= most else t[:most - 1].rstrip() + "…"
+
+
+def affecting(items, live):
+    """What's touching daily life at home, item by item, for the top of the wider picture.
+
+    "Yours" is exactly the warnings in force from the practical sources: the same items that turn a source's line amber
+    or red in live_rows (its worst severity), so Affecting you never lists something while that line says all's well.
+    A power cut within 2 km is yours; one further out, but within the near distance, is listed but isn't a warning, so
+    it goes under "Nearby, not in your area" with another street's burst main. A warning is never in both lists."""
+    yours = []
+    for n, i in enumerate(items):
+        if i.get("source") not in AFFECT_SOURCES or (i.get("severity") or 0) < 1 or i.get("kind") == "news":
+            continue
+        if i["source"] == "govalerts" and i["severity"] < 2:   # a test, or one that's finished: as the Sitrep's card
+            continue
+        yours.append({"source": i["source"], "kind": i.get("kind") or "", "i": n,
+                      "key": i["source"] if i["source"] in LIVE_KEYS else "",
+                      "title": KM_AWAY.sub("", i.get("title") or ""), "severity": i["severity"],
+                      "level": i.get("level") or "", "distance_km": i.get("distance_km"),
+                      "postcodes": i.get("area") or "" if i["source"] == "power" else "",
+                      "back_by": i.get("back_by") or "", "when": i.get("when") or "",
+                      "started": i.get("issued") or "" if i["source"] in AFFECT_STARTED else "",
+                      "detail": first_sentence(i.get("text"))})
+    yours.sort(key=lambda x: (-x["severity"], x["distance_km"] if x["distance_km"] is not None else 1e9))
+    near, more = [], 0
+    p = live.get("power")
+    if p:
+        cuts = [c for c in p.get("cuts") or [] if not c.get("planned") and c["km"] > POWER_NEAR_KM]
+        more += max(len(cuts), (p.get("count") or 0) - (p.get("near") or 0))   # only the nearest six are kept
+        near += [{"source": "power", "kind": "power", "key": "power", "title": "Power cut", "severity": 0, "level": "",
+                  "distance_km": c["km"], "postcodes": c.get("where") or "",
+                  "back_by": when_words(c["etr"]) if c.get("etr") else "", "when": "",
+                  "started": iso_utc(parse_when(c.get("started"))) or "", "detail": c.get("dno") or ""} for c in cuts]
+    w = live.get("water")
+    if w:
+        reps = [r for r in w.get("reports") or [] if not r.get("yours") and r.get("group") in ("Supply", "Water quality")]
+        mine = w["mine"] if w.get("mine") is not None else sum(1 for i in items if i.get("source") == "water")
+        more += max(len(reps), (w.get("supply") or 0) - mine)
+        near += [{"source": "water", "kind": "water", "key": "water", "title": r.get("kind") or "Water supply problem",
+                  "severity": 0, "level": "", "distance_km": r["km"], "postcodes": "", "back_by": "", "when": "",
+                  "started": r.get("issued") or "", "detail": r.get("where") or w.get("company") or ""} for r in reps]
+    near.sort(key=lambda x: x["distance_km"])
+    return {"yours": yours, "near": near, "near_count": more}
+
+
+def live_layout(rows):
+    """The wider picture's lines in order: those needing attention first, worst first, then the rest under their
+    headings. Anything not in a group (a source added later) goes under "Other", so a line is never lost."""
+    att = sorted([r for r in rows if r["state"] != "good"], key=lambda r: -STATE_RANK.get(r["state"], 0))
+    rest = [r["key"] for r in rows if r["state"] == "good"]
+    groups, placed = [], set()
+    for name, keys in LIVE_GROUPS + [("Other", tuple(rest))]:
+        got = [k for k in keys if k in rest and k not in placed]
+        placed.update(got)
+        if got:
+            groups.append({"name": name, "keys": got})
+    return {"attention": [r["key"] for r in att], "groups": groups}
 
 
 def fetch_live(key, cfg, home, mem, now):
@@ -9001,7 +9086,7 @@ def fetch_live(key, cfg, home, mem, now):
     if key == "power":
         cuts, worked, err, failed = [], 0, None, []
         for url_key, kind, areas in POWER_FEEDS:
-            if not FEED_URLS.get(url_key) or (areas and not dno_covers(home, areas, POWER_KM)):
+            if not FEED_URLS.get(url_key) or (areas and not dno_covers(home, areas, cfg["near_km"])):
                 continue
             try:
                 data = http_get(FEED_URLS[url_key], timeout=30)
@@ -9014,7 +9099,7 @@ def fetch_live(key, cfg, home, mem, now):
         if not worked and err:
             raise err
         mine = DNO_NAMES.get(dno_area(home["lat"], home["lon"]))
-        return power_live(cuts, home, failed, mine if mine in NO_LIVE_FEED else "")
+        return power_live(cuts, home, failed, mine if mine in NO_LIVE_FEED else "", cfg["near_km"])
     if key == "air":
         sites = parse_air_sites(http_get(FEED_URLS["air"]))
         fc = mem["air_forecast"]
@@ -9028,7 +9113,7 @@ def fetch_live(key, cfg, home, mem, now):
         return air_live(sites, fc.get("fc"), home, now)
     if key == "water":
         co = water_company(cfg, home)
-        return water_live(water_reports(co, now), co, home, now)
+        return water_live(water_reports(co, now), co, home, now, cfg["near_km"])
     if key == "rain":
         return fetch_rain(home, mem, now)
     if key == "ground":
@@ -9104,7 +9189,7 @@ def warnings_run():
         old = prev["sources"].get(key) or {}
         # Live feeds change slowly (gas storage once a day): don't fetch them more often than that.
         if key in LIVE_EVERY and old.get("ok") and key in live and time.time() - (old.get("t") or 0) < LIVE_EVERY[key] \
-                and (old.get("home") == home_key(home)):
+                and (old.get("home") == home_key(home)) and old.get("near_km", 10) == cfg["near_km"]:
             statuses[key] = old
             any_ok = True
             continue
@@ -9112,7 +9197,7 @@ def warnings_run():
             got = fetch_source(key, cfg, home, region, mem, now)
             by_src[key] = got
             statuses[key] = {"ok": True, "error": "", "checked_at": now_iso(), "count": len(got), "t": time.time(),
-                             "home": home_key(home)}
+                             "home": home_key(home), "near_km": cfg["near_km"]}   # a new near distance fetches again
             any_ok = True
         except NeedLocation:
             by_src[key] = []
@@ -9372,8 +9457,10 @@ def warn_public():
     if unavailable:
         st["items"] = [i for i in st["items"] if i.get("source") not in unavailable]
     trends = find_trends(set(k for k, v in cfg["sources"].items() if v and k not in unavailable)) if on else []
-    return {"config": cfg, "on": on, "live": live, "live_rows": live_rows(live, st["items"] if on else [], trends),
-            "trends": trends,
+    rows = live_rows(live, st["items"] if on else [], trends)
+    return {"config": cfg, "on": on, "live": live, "live_rows": rows, "trends": trends,
+            # 1.18.0: what's affecting home and what's nearby, and the lines in their groups
+            "affecting": affecting(st["items"] if on else [], live), "live_layout": live_layout(rows),
             "items": st["items"] if on else [], "news": st["news"] if on else [],
             "sources": st["sources"] if on else {}, "checked_at": st["checked_at"] if on else None,
             "location": loc, "region": cfg["region"] or guess_region(loc) or "UK", "region_guessed": not cfg["region"],
@@ -9426,9 +9513,12 @@ def api_warnings_set(body, query):
                 if not -lim <= float(body.get(k)) <= lim:
                     raise ApiError(400, "%s must be between -%d and %d" % (label, lim, lim))
     for k, lo, hi, label in (("flood_km", 1, 200, "Flood distance"), ("gdacs_km", 50, 5000, "Disaster distance"),
-                             ("fire_km", 2, 50, "Fire distance")):
+                             ("fire_km", 2, 50, "Fire distance"), ("near_km", NEAR_KM_MIN, NEAR_KM_MAX, "Near you distance")):
         if k in body:
-            cur[k] = int(clean_num(body.get(k), cur[k], lo, hi, label))
+            v = clean_num(body.get(k), cur[k], lo, hi, label)
+            if v != int(v):
+                raise ApiError(400, "%s must be a whole number of km" % label)
+            cur[k] = int(v)
     for k, allowed in (("ea_area", EA_AREAS), ("water_co", WATER_COS)):
         if k in body:
             v = str(body.get(k) or "")

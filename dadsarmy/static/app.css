@@ -1088,3 +1088,31 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
 /* Things to watch (1.17.0): trends on the Sitrep, and the counts behind them in the wider picture. */
 .watch-card { border-left: 4px solid var(--warn); }
 .live-block .count-h { margin: 12px 0 2px; font-size: 14px; font-weight: 650; color: var(--ink-2); }
+
+/* Affecting you (1.18.0): what's touching home, item by item, at the top of the wider picture, coloured on the left
+   by how serious it is; then "Nearby, not in your area", quieter. The lines below are grouped under headings. */
+.live-card .group-head { padding: 14px 16px 6px; font-size: 12px; }
+.live-card .group-head .n { color: var(--muted); font-weight: 600; }
+.live-card .group-head + .list .li:first-child { border-top: 0; }
+.affect { padding: 0 16px 4px; }
+.affect .group-head { padding-left: 0; padding-right: 0; }
+.affect.calm { display: flex; gap: 12px; align-items: center; margin: 12px 16px 4px; padding: 10px 12px;
+  border-radius: 10px; background: var(--surface-2); }
+.ia-row {
+  display: flex; gap: 12px; align-items: center; width: 100%; min-height: 56px; margin-top: 6px; padding: 10px 12px;
+  text-align: left; font: inherit; color: inherit; cursor: pointer;
+  background: var(--surface-2); border: 1px solid var(--line); border-left: 5px solid var(--yel); border-radius: 10px;
+}
+.ia-row.sev2 { border-left-color: var(--warn); }
+.ia-row.sev3 { border-left-color: var(--bad); }
+.ia-row.near { border-left-color: var(--line); background: none; }
+.ia-ico { font-size: 22px; width: 30px; text-align: center; flex: none; line-height: 1; }
+.ia-row.near .ia-ico { font-size: 18px; }
+.ia-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.ia-title { font-weight: 650; overflow-wrap: anywhere; }
+.ia-row.near .ia-title { font-weight: 600; }
+.ia-sub { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.ia-more { background: none; border: 0; padding: 8px 0 4px; font: inherit; font-size: 14px; font-weight: 600;
+  color: var(--olive); cursor: pointer; }
+.live-calm { margin: 0; border-top: 0; }
+.live-calm .li-main { display: flex; flex-direction: column; }
