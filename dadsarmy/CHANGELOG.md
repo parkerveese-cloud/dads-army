@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.14.0
+
+**Stores review**
+
+- **Would your food feed you with no mains water, power, gas or fridge?** A new card on the Sitrep asks the AI to look at what's in the stores and who it's for: can it be eaten cold or with a little heat from what's stored, does it need water to cook, will it keep once opened without a fridge (or is a tin too big for one meal), is it a balanced diet (not 100 tins of tuna), and will it keep. Then a line on the rest of the stores. It suggests up to six things to add, food first, each one tap onto the supply run. Only item names and amounts are sent, and only when you tap **Review my stores**. About 0.3p a go.
+
+**Cupboard, fridge or freezer**
+
+- **Kept before opening:** food, drinks and pet food say whether they're kept in the cupboard, the fridge or the freezer. Scans fill it in from Open Food Facts' storage instructions and categories, the label reader from the pack, and **Fill in missing details** estimates it for what you already have (marked "AI estimate"). Fridge and freezer items show ❄️ or 🧊 in **Stores**. New food, drinks and pet food (the starter list too) are cupboard food unless the barcode, the label photo or you say fridge or freezer.
+- **The Sitrep** says how many days of the food needs a fridge or freezer, to eat first in a power cut (`cold_food_days` in `/api/summary`).
+- **The stores review trusts it:** a tinned curry kept in the cupboard isn't said to need chilling, and fridge and freezer food counts as the first meals of a power cut, not as stores. Where it isn't recorded, the review goes by the name and unit (a tin is ambient).
+
+**Photos fill in everything they show**
+
+- **Reading a label** now gives what the pack is (jar, carton, box, tin...), its size, calories, best before date and "once opened" days, not just the name. **📷 Add another photo** (the back, the nutrition panel, the date) adds to what's already been read.
+- Where no calories or "once opened" days are printed, the AI estimates them for that kind of product, marked **AI estimate** until you change them.
+- Open Food Facts results say what the pack is too, where it knows.
+
+**Barcodes that won't scan**
+
+- **Each barcode photo is read six ways** (whole, the middle, smaller, turned), using the phone's own barcode reader first where it has one (Android).
+- If Open Food Facts doesn't know the product, or is missing its calories or size, **the same photo is read by the AI** for the rest.
+- **The other ways to add something** under the live camera (take a photo, read the label, type the number, pick from the stores) are a tidy grid of buttons, rather than a row that ran off a phone's screen.
+- **No barcode found** now lists the usual causes (too far away or blurred, glare, creased) and what to do. The live camera says so after a few seconds if it isn't picking anything up.
+- How each scan went (found, not in Open Food Facts, no barcode in the photo, camera not allowed) is written to the add-on's log, to help work out why one didn't work.
+
+**Water**
+
+- **Litres come from the pack size** when "litres in one" isn't set: a 5000 ml (or 5000 g) bottle of water is 5 litres.
+- **Juice, milk and other drinks stand in for drinking water only:** up to 1.5 litres a person a day, but cooking, washing and the pets' water have to come from plain water. Water days are worked out a day at a time on that basis, so drinks stretch the water without ever replacing it. Drinks have a "litres in one" field, and the Sitrep's water note says how much there is. `/api/summary` has `water_litres` (plain water), `drink_litres` and `drink_cap_litres`.
+
+**No AI, no AI buttons**
+
+- Without an AI (an API key, or a Home Assistant AI Task), the buttons that need one (read the label, the nutrition label or the date, add another photo, match the date, fill in, stores review) are hidden, and adding an item shows a hint saying what an AI would add.
+
+**Also**
+
+- Item names in **Stores** are shown in full, wrapping onto a second line, not cut off.
+
 ## 1.13.0
 
 **How long the food lasts**

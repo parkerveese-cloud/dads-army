@@ -280,6 +280,21 @@
   }
   // Food and drinks feed the household (juice and milk count as food, not drinking water).
   function kcalCat(c) { return c === 'food' || c === 'drinks'; }
+  // Drinkable litres in one: "litres per unit" if set, else the pack size (5000 g or ml of water is 5 L).
+  function itemLitres(it) {
+    if (it.category !== 'water' && it.category !== 'drinks') return 0;
+    if (it.litres_per_unit > 0) return it.litres_per_unit;
+    var u = (it.pack_unit || '').toLowerCase(), n = +it.pack_size || 0;
+    var solid = it.category === 'water';   // a 5000 g bottle of water is 5 L; a 250 g "drink" is probably rice
+    return u === 'ml' || (solid && u === 'g') ? n / 1000 : u === 'l' || (solid && u === 'kg') ? n : 0;
+  }
+  // Is an AI set up (an API key, or Home Assistant's AI Task)? Without one, the AI buttons are hidden
+  // (html.no-ai in the CSS) and a hint says what adding one would do.
+  function aiOn() { return !!(S && S.ai_ready); }
+  function aiHint() {
+    return aiOn() ? '' : '<p class="small muted ai-hint">💡 Add an AI in <b>HQ → Scanning</b> (an API key, or Home Assistant\'s AI Task) and Dads Army can also ' +
+      'read labels, best before dates and calories from photos, and fill in what\'s missing.</p>';
+  }
   function srN(n, one, many) { return n + ' ' + (n === 1 ? one : many); }
   // Under the calories box: what that is in a person's day, so a per-serving figure stands out.
   function kcalHint(k, unit) {
@@ -307,29 +322,68 @@
       });
     return { days: t, wasted: wasted };
   }
+  // Water, a day at a time: drinks can cover up to `cap` litres of each day (the drinking), plain water the rest
+  // (cooking, washing, pets), using whatever goes off first. Same as the Pi (water_lasts).
+  var DRINK_CAP = 1.5;
+  function waterLasts(wLots, dLots, perDay, cap) {
+    if (!(perDay > 0)) return { days: 0, wasted: 0 };
+    cap = Math.min(cap, perDay);
+    var lots = function (raw) {
+      return raw.filter(function (l) { return l[0] > 0; }).map(function (l) { return [l[0], l[1] ? daysUntil(l[1]) : null]; })
+        .sort(function (a, b) { return (a[1] === null) - (b[1] === null) || (a[1] || 0) - (b[1] || 0); });
+    };
+    var water = lots(wLots), drinks = lots(dLots), t = 0, wasted = 0;
+    var sum = function (pool) { return pool.reduce(function (a, l) { return a + l[0]; }, 0); };
+    var take = function (pool, want) {
+      var got = 0;
+      pool.forEach(function (l) { if (got >= want) return; var n = Math.min(l[0], want - got); l[0] -= n; got += n; });
+    };
+    for (var day = 0; day < 3660; day++) {
+      [water, drinks].forEach(function (pool) {
+        pool.forEach(function (l) { if (l[1] !== null && l[1] < day && l[0] > 0) { if (pool === water) wasted += l[0]; l[0] = 0; } });
+      });
+      var wAv = sum(water), dAv = sum(drinks), dUse = Math.min(cap, dAv);
+      if (wAv >= perDay - dUse - 1e-9) { take(drinks, dUse); take(water, perDay - dUse); t += 1; continue; }
+      var f = (wAv + dUse) / perDay;
+      if (perDay > cap && dAv >= cap) f = Math.min(f, wAv / (perDay - cap));
+      t += Math.max(0, Math.min(1, f));
+      break;
+    }
+    return { days: t, wasted: wasted / perDay };
+  }
   function readiness() {
     var st = S.settings;
     var people = st.adults + st.children;
     var kcalDay = st.adults * st.kcal_adult + st.children * st.kcal_child;
     var petWater = petsWater(st);
     var waterDay = people * st.water_per_person + petWater;
-    var r = { petWater: petWater, people: people, kcalDay: kcalDay, waterDay: waterDay, kcal: 0, kcalOld: 0, litres: 0, litresOld: 0, noKcal: 0 };
-    var kLots = [], wLots = [];
+    var r = { petWater: petWater, people: people, kcalDay: kcalDay, waterDay: waterDay, kcal: 0, kcalOld: 0, litres: 0, litresOld: 0, drinkLitres: 0, coldKcal: 0, noKcal: 0 };
+    var kLots = [], wLots = [], dLots = [];
     S.items.forEach(function (it) {
-      var food = kcalCat(it.category), water = it.category === 'water' && it.litres_per_unit > 0;
-      if (food && !(it.kcal_per_unit > 0)) return;
+      var food = kcalCat(it.category), lpu = itemLitres(it), water = lpu > 0;
+      if (food && !(it.kcal_per_unit > 0)) food = false;
       if (!food && !water) return;
       it.batches.forEach(function (b) {
         var old = b.expiry && daysUntil(b.expiry) < 0;
-        if (food) { if (old) r.kcalOld += b.qty * it.kcal_per_unit; else { r.kcal += b.qty * it.kcal_per_unit; kLots.push([b.qty * it.kcal_per_unit, b.expiry]); } }
-        if (water) { if (old) r.litresOld += b.qty * it.litres_per_unit; else { r.litres += b.qty * it.litres_per_unit; wLots.push([b.qty * it.litres_per_unit, b.expiry]); } }
+        if (food) {
+          if (old) r.kcalOld += b.qty * it.kcal_per_unit;
+          else {
+            r.kcal += b.qty * it.kcal_per_unit; kLots.push([b.qty * it.kcal_per_unit, b.expiry]);
+            if (it.storage === 'chilled' || it.storage === 'frozen') r.coldKcal += b.qty * it.kcal_per_unit;   // eat it first in a power cut
+          }
+        }
+        if (water) {
+          if (old) r.litresOld += b.qty * lpu;
+          else if (it.category === 'water') { r.litres += b.qty * lpu; wLots.push([b.qty * lpu, b.expiry]); }
+          else { r.drinkLitres += b.qty * lpu; dLots.push([b.qty * lpu, b.expiry]); }   // juice, milk: the drinking only
+        }
       });
     });
     r.noKcal = S.items.filter(function (it) {
       return kcalCat(it.category) && !(it.kcal_per_unit > 0) && total(it) > 0 && !/tea|coffee|salt|stock|spice|herb|water/i.test(it.name);
     }).length;
     // Eaten in date order: what goes off before you'd get to it doesn't count.
-    var fl = lastsDays(kLots, kcalDay), wl = lastsDays(wLots, waterDay);
+    var fl = lastsDays(kLots, kcalDay), wl = waterLasts(wLots, dLots, waterDay, people * Math.min(DRINK_CAP, st.water_per_person));
     r.foodDays = fl.days; r.foodWaste = fl.wasted;
     r.waterDays = wl.days; r.waterWaste = wl.wasted;
     r.foodOldDays = kcalDay > 0 ? r.kcalOld / kcalDay : 0;
@@ -392,6 +446,7 @@
     return api('GET', 'api/state').then(function (data) {
       openedDates(data);
       S = data;
+      document.documentElement.classList.toggle('no-ai', !data.ai_ready);
       updateDatalists();
       render();
       maybeOfferDashboard();
@@ -648,6 +703,29 @@
       esc(petsWords(st)) + (who ? ' · <button class="link" data-act="open" data-id="' + who.id + '">' + esc(who.name) + '</button> runs out first' : ''));
   }
 
+  // Is the food a balanced diet, and what's missing? Asked for with a button; the last answer is kept.
+  function reviewCard() {
+    if (!aiOn() || !S.items.some(function (it) { return total(it) > 0; })) return '';   // no AI set up: no review
+    var v = S.stock_review, words = ['', 'Would not do', 'Big gaps', 'Some gaps', 'Good', 'Would feed you well'];
+    var head = '<div class="card-head"><h2>Stores review</h2>' + (v && v.score ? pill(v.score >= 4 ? 'good' : v.score === 3 ? 'warn' : 'bad', words[v.score]) : '') + '</div>';
+    if (!v) {
+      return '<section class="card review-card">' + head + '<p class="small muted">The AI checks whether your food would feed the household with no mains water, power, gas or fridge: ' +
+        'can it be eaten cold or with a little heat, will it keep once opened, and is it a balanced diet (not 100 tins of tuna)? Then, briefly, the rest of the stores. ' +
+        'Only item names and amounts are sent. About 0.3p a go.</p>' +
+        '<div class="btn-row"><button class="btn" data-act="stock-review">🤖 Review my stores</button></div></section>';
+    }
+    var when = v.made_at ? new Date(v.made_at) : null;
+    return '<section class="card review-card">' + head + '<p class="small muted review-aim">Food with no mains water, power, gas or fridge</p>' +
+      '<p class="review-text">' + esc(v.summary) + '</p>' +
+      (v.wider ? '<p class="small"><b>The rest of the stores:</b> ' + esc(v.wider) + '</p>' : '') +
+      (v.suggestions && v.suggestions.length ? '<ul class="review-list">' + v.suggestions.map(function (g, n) {
+        return '<li><span class="review-ico" aria-hidden="true">' + cat(g.category).icon + '</span><span class="review-main"><b>' + esc(g.add) + '</b>' +
+          (g.why ? '<span class="small muted"> ' + esc(g.why) + '</span>' : '') + '</span>' +
+          '<button class="btn small" data-act="review-add" data-n="' + n + '">+ Supply run</button></li>';
+      }).join('') + '</ul>' : '') +
+      '<div class="btn-row"><button class="btn small" data-act="stock-review">🤖 Review again</button>' +
+      '<span class="small muted">' + (when ? 'Reviewed ' + esc(when.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })) + ' · ' : '') + srN(v.items || 0, 'item', 'items') + ' looked at</span></div></section>';
+  }
   function renderSitrep(el) {
     if (!S.items.length) { el.innerHTML = levelCard() + warnCard(false) + liveCard() + emptyCard() + resilienceCard(); return; }
     var st = S.settings, r = readiness(), target = st.target_days;
@@ -662,11 +740,13 @@
       var foodNote = nf0.format(r.kcal) + ' kcal stored · ' + nf0.format(r.kcalDay) + ' needed a day';
       if (r.foodOldDays >= 0.1) foodNote += ' · +' + fmtDays(r.foodOldDays) + ' days in expired stock';
       if (r.foodWaste >= 0.5) foodNote += ' · ' + fmtDays(r.foodWaste) + ' days\' worth goes off before you\'d get to it';
+      if (r.kcalDay > 0 && r.coldKcal / r.kcalDay >= 0.1) foodNote += ' · ' + fmtDays(r.coldKcal / r.kcalDay) + ' days of the food needs a fridge or freezer: eat it first in a power cut';
       if (r.noKcal) foodNote += ' · ' + r.noKcal + ' item' + (r.noKcal === 1 ? '' : 's') + ' with no calories set <button class="link" data-act="ai-fill">Fill in with AI</button>';
       var waterNote = fq(Math.round(r.litres * 10) / 10) + ' L stored · ' + fq(Math.round(r.waterDay * 10) / 10) + ' L needed a day' +
         (r.petWater > 0 ? ' (' + fq(Math.round(r.petWater * 10) / 10) + ' L for the pets)' : '');
       if (r.waterOldDays >= 0.1) waterNote += ' · +' + fmtDays(r.waterOldDays) + ' days past best-before';
       if (r.waterWaste >= 0.5) waterNote += ' · ' + fmtDays(r.waterWaste) + ' days\' worth passes its date first';
+      if (r.drinkLitres >= 0.5) waterNote += ' · plus ' + fq(Math.round(r.drinkLitres * 10) / 10) + ' L of juice, milk and other drinks, counted for drinking only (up to ' + fq(DRINK_CAP) + ' L a person a day), not cooking or washing';
       var sup = r.supplies[0], supNote = '';
       if (sup) {
         supNote = '<button class="link" data-act="open" data-id="' + sup.it.id + '">' + esc(sup.it.name) + '</button> ' +
@@ -719,6 +799,8 @@
       });
       html += '</div></section>';
     }
+
+    html += reviewCard();
 
     // Routine checks that are due, or due within a week
     var due = sortedChecks().filter(function (x) { return x.i.days === null || x.i.days <= 7; });
@@ -862,7 +944,8 @@
     var left = daysLeft(it);
     var lasts = left > 0 ? '<span>· lasts ' + esc(lastsWords(left)) + '</span>' : '';
     var body = (showIcon ? '<span class="row-ico">' + cat(it.category).icon + '</span>' : '') +
-      '<span class="row-text"><span class="row-name">' + esc(it.name) + '</span>' +
+      '<span class="row-text"><span class="row-name">' + esc(it.name) +
+      (it.storage === 'chilled' || it.storage === 'frozen' ? ' <span class="st-cold" title="' + (it.storage === 'chilled' ? 'Kept in the fridge' : 'Kept in the freezer') + '">' + (it.storage === 'chilled' ? '❄️' : '🧊') + '</span>' : '') + '</span>' +
       '<span class="row-sub"><span>' + amount + '</span>' + (where ? '<span>· ' + esc(where) + '</span>' : '') + lasts + badges + '</span></span>';
     if (SEL) {   // picking items to delete: the whole row is a tick box
       var on = !!SEL[it.id];
@@ -2437,6 +2520,7 @@
       if (f.kcal_per_unit) out.push(nf0.format(f.kcal_per_unit) + ' kcal per ' + (x.unit || 'one'));
       if (f.pack_size) out.push('holds ' + fq(f.pack_size) + (f.pack_unit === 'each' ? ' items' : ' ' + f.pack_unit));
       if (f.open_days) out.push('use within ' + fq(f.open_days) + ' days once opened');
+      if (f.storage) out.push(({ ambient: 'kept in the cupboard', chilled: 'kept in the fridge', frozen: 'kept in the freezer' })[f.storage]);
       return out.join(' · ');
     };
     return head + '<p class="small">Typical figures for each, from its name. Untick any that look wrong; you can change them later, and they show as "AI estimate" until you do.</p>' +
@@ -2484,8 +2568,10 @@
     if (kcalCat(it.category) && it.kcal_per_unit > 0 && r.kcalDay > 0) stats.push(stat(fmtDays(i.total * it.kcal_per_unit / r.kcalDay), 'days of food'));
     if (it.kcal_per_unit > 0) stats.push(stat(nf0.format(it.kcal_per_unit), 'kcal per ' + (it.unit || 'one') + (guessed('kcal_per_unit') ? ' · AI estimate' : '')));
     if (it.open_days > 0 && guessed('open_days')) stats.push(stat(fq(it.open_days), 'days once opened · AI estimate'));
-    if (it.category === 'water' && it.litres_per_unit > 0) {
-      stats.push(stat(fq(Math.round(i.total * it.litres_per_unit * 10) / 10) + ' L', r.waterDay > 0 ? fmtDays(i.total * it.litres_per_unit / r.waterDay) + ' days of water' : 'of water'));
+    if (it.storage) stats.push(stat(({ ambient: '🥫', chilled: '❄️', frozen: '🧊' })[it.storage],
+      ({ ambient: 'kept in the cupboard', chilled: 'kept in the fridge', frozen: 'kept in the freezer' })[it.storage] + (guessed('storage') ? ' · AI estimate' : '')));
+    if (itemLitres(it) > 0) {
+      stats.push(stat(fq(Math.round(i.total * itemLitres(it) * 10) / 10) + ' L', it.category !== 'water' ? 'to drink' : r.waterDay > 0 ? fmtDays(i.total * itemLitres(it) / r.waterDay) + ' days of water' : 'of water'));
     }
     if (it.per_day > 0) stats.push(stat(fmtDays(daysLeft(it)), 'days at ' + fq(it.per_day) + ' a day'));
     if (it.price > 0) stats.push(stat(money(i.total * it.price), 'worth, at ' + money(it.price) + ' each'));
@@ -2524,16 +2610,16 @@
     var pre = s.pre || {};
     var v = it || { name: pre.name || '', category: pre.category || s.cat || 'food', unit: pre.unit || '', kcal_per_unit: pre.kcal_per_unit || 0,
       litres_per_unit: pre.litres_per_unit || 0, target_qty: 0, per_day: 0, price: 0, notes: '',
-      pack_size: pre.count > 1 ? pre.count : (pre.grams || 0), pack_unit: pre.count > 1 ? 'each' : pre.grams ? (pre.category === 'water' || pre.category === 'drinks' ? 'ml' : 'g') : '', open_days: 0 };
+      pack_size: pre.count > 1 ? pre.count : (pre.grams || 0), pack_unit: pre.count > 1 ? 'each' : pre.grams ? (pre.category === 'water' || pre.category === 'drinks' ? 'ml' : 'g') : '', open_days: pre.open_days || 0, storage: pre.storage || 'ambient' };   // new food: the cupboard, unless the scan or label says otherwise
     var cats = CATS.map(function (c) {
       return '<label class="cat-opt"><input type="radio" name="category" value="' + c.id + '"' + (c.id === v.category ? ' checked' : '') + '>' +
         '<span><i>' + c.icon + '</i>' + esc(c.short || c.label) + '</span></label>';
     }).join('');
     return sheetHead(it ? 'Edit item' : 'New item', it ? it.name : 'Add something to the stores') +
       '<form id="itemForm" data-cat="' + esc(v.category) + '" data-id="' + (it ? it.id : '') + '"' +
-      (s.code ? ' data-barcode="' + esc(s.code) + '" data-product="' + esc(pre.name || '') + '"' : '') + ' novalidate>' +
+      (s.code ? ' data-barcode="' + esc(s.code) + '" data-product="' + esc(pre.name || '') + '"' : '') + (!it && pre.ai_guessed ? ' data-guessed="' + esc(pre.ai_guessed) + '"' : '') + ' novalidate>' +
       (!it && !s.code && !pre.from_ai ? '<div class="btn-row add-ways"><button type="button" class="btn small" data-act="scan">📷 Scan a barcode</button>' +
-        '<button type="button" class="btn small" data-act="scan-label">🤖 Read the label</button><span class="small muted">or type it in below</span></div>' : '') +
+        '<button type="button" class="btn small" data-act="scan-label">🤖 Read the label</button><span class="small muted">or type it in below</span></div>' + aiHint() : '') +
       (s.code ? '<p class="callout info small">Barcode ' + esc(s.code) + (pre.name ? ': details from Open Food Facts. Check them, then add.' : ': not in Open Food Facts, so fill it in once and it\'s remembered.') + '</p>'
         : pre.from_ai ? '<p class="callout info small">Read from the label by the AI. Check the details and the date, then add.</p>' : '') +
       '<label class="field"><span>Name</span><input type="text" name="name" value="' + esc(v.name) + '" maxlength="120" placeholder="e.g. Baked beans (415g)" autocomplete="off"' + (it ? '' : ' data-autofocus') + '>' +
@@ -2556,10 +2642,14 @@
       '<select name="pack_unit" aria-label="Pack size unit">' + [['g', 'g'], ['kg', 'kg'], ['ml', 'ml'], ['l', 'l'], ['oz', 'oz'], ['lb', 'lb'], ['each', 'items (a multipack)']].map(function (u) {
         return '<option value="' + u[0] + '"' + ((v.pack_unit || 'g') === u[0] ? ' selected' : '') + '>' + u[1] + '</option>';
       }).join('') + '</select></div><div class="hint">Lets you use part of one: 200 g of a 500 g bag, 1 can from a 6-pack, or say what\'s left in the open one.</div></div>' +
+      '<fieldset class="field only-food"><legend>Kept before opening</legend><div class="use-mode" role="radiogroup" aria-label="Kept before opening">' +
+      [['ambient', '🥫 Cupboard'], ['chilled', '❄️ Fridge'], ['frozen', '🧊 Freezer']].map(function (o) {
+        return '<label class="seg-opt"><input type="radio" name="storage" value="' + o[0] + '"' + (v.storage === o[0] ? ' checked' : '') + '><span>' + o[1] + '</span></label>';
+      }).join('') + '</div><div class="hint">Cupboard: tins, jars, dried and long-life food. Fridge and freezer food only lasts a day or two in a power cut.</div></fieldset>' +
       '<label class="field"><span>Once opened, use within (days)</span><input type="number" name="open_days" value="' + (v.open_days || '') + '" inputmode="numeric" min="0" step="1" placeholder="Optional, e.g. 3">' +
       '<div class="hint">An open tin of beans keeps about 3 days in the fridge. Once you\'ve used part of one, the rest goes off then, even if its best before is later.</div></label>' +
-      '<label class="field only-water"><span>Litres per unit</span><input type="number" name="litres_per_unit" value="' + (v.litres_per_unit || '') + '" inputmode="decimal" min="0" step="any" placeholder="e.g. 5">' +
-      '<div class="hint">Drinkable water only. Leave empty for filters, tablets and containers.</div></label>' +
+      '<label class="field only-water"><span>Litres in one</span><input type="number" name="litres_per_unit" value="' + (v.litres_per_unit || '') + '" inputmode="decimal" min="0" step="any" placeholder="e.g. 5">' +
+      '<div class="hint">What you can drink. Left empty, it comes from "Each one holds" (5000 ml is 5 litres). Juice and milk count as food, and can stand in for drinking water (up to ' + fq(DRINK_CAP) + ' L a person a day), but not for cooking or washing.</div></label>' +
       (it ? '' : '<h3>Opening stock</h3><div class="field"><span>How many?</span>' + stepperHtml('qty', 1, 'Quantity') + '</div>' +
         expiryField(pre.expiry || '') + locationField(lastLocation(lastTouched()))) +
       '<label class="field"><span>Notes</span><textarea name="notes" rows="2" maxlength="2000" placeholder="Optional">' + esc(v.notes) + '</textarea></label>' +
@@ -2713,17 +2803,51 @@
     hints.set(Z.DecodeHintType.TRY_HARDER, true);
     return hints;
   }
+  // A photo, redrawn: cropped to the middle, shrunk, or turned, as ZXing often misses a barcode that's small,
+  // large or sideways in a big photo.
+  function photoVariant(img, crop, max, turn) {
+    var w = img.naturalWidth * crop, h = img.naturalHeight * crop, k = Math.min(1, max / Math.max(w, h));
+    var c = document.createElement('canvas'), x = c.getContext('2d');
+    c.width = Math.round((turn ? h : w) * k); c.height = Math.round((turn ? w : h) * k);
+    if (turn) { x.translate(c.width, 0); x.rotate(Math.PI / 2); }
+    x.drawImage(img, (img.naturalWidth - w) / 2, (img.naturalHeight - h) / 2, w, h, 0, 0, Math.round(w * k), Math.round(h * k));
+    return c.toDataURL('image/jpeg', 0.9);
+  }
+  function readCode(Z, dataUrl) {
+    return new Promise(function (ok) {
+      var img = new Image();
+      img.onload = function () { ok(img); };
+      img.onerror = function () { ok(null); };
+      img.src = dataUrl;
+    }).then(function (img) {
+      if (!img) return null;
+      // The phone's own reader first, where there is one (Android Chrome): it's quicker and copes with more.
+      var native = window.BarcodeDetector ? new window.BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'itf'] })
+        .detect(img).then(function (r) { return r && r[0] ? r[0].rawValue : null; }, function () { return null; }) : Promise.resolve(null);
+      return native.then(function (code) {
+        if (code) return code;
+        var hints = barcodeHints(Z);
+        var tries = [[1, 1600, false], [0.6, 1200, false], [1, 900, false], [1, 1600, true], [0.6, 1200, true], [0.4, 900, false]];
+        var go = function (n) {
+          if (n >= tries.length) return null;
+          var t = tries[n];
+          return new Z.BrowserMultiFormatReader(hints).decodeFromImageUrl(n ? photoVariant(img, t[0], t[1], t[2]) : dataUrl)
+            .then(function (res) { return res.getText(); }, function () { return go(n + 1); });
+        };
+        return go(0);
+      });
+    });
+  }
   function scanBarcode(btn) {
     return takePhoto().then(function (file) {
       if (!file) return;
       return run(function () {
-        return Promise.all([loadZXing(), shrinkPhoto(file, 1600)]).then(function (r) {
-          var hints = barcodeHints(r[0]);
-          hints.set(r[0].DecodeHintType.TRY_HARDER, true);
-          return new r[0].BrowserMultiFormatReader(hints).decodeFromImageUrl(r[1]).then(function (res) {
-            return lookupBarcode(res.getText(), btn);
-          }, function () {
-            return openSheet({ type: 'scanfail', img: r[1] });   // no barcode in it: the AI can read the label
+        toast('Looking for the barcode…');
+        return Promise.all([loadZXing(), shrinkPhoto(file, 2000)]).then(function (r) {
+          return readCode(r[0], r[1]).then(function (code) {
+            if (code) return lookupBarcode(code, btn, r[1]);
+            scanNote('photo-nobarcode');
+            return openSheet({ type: 'scanfail', img: r[1] });
           });
         });
       }, btn);
@@ -2737,13 +2861,33 @@
     if (/^\d{14}$/.test(t) && t.charAt(0) === '0') t = t.slice(1);
     return t;
   }
-  function lookupBarcode(code, btn) {
+  // Tell the Pi how a scan went, so its log says why one didn't work (camera refused, no barcode found...).
+  function scanNote(what, detail) {
+    try { api('POST', 'api/scan/note', { what: what, detail: detail || '' }).catch(function () { /* fine */ }); } catch (e) { /* fine */ }
+  }
+  // Not in Open Food Facts, or it doesn't know the calories or size: read the rest from the photo, if there is one.
+  function needsLabel(p, code) {
+    if (!p || !p.name || p.name === code) return true;
+    return (p.category === 'food' || p.category === 'drinks') && (!p.kcal_per_unit || !p.grams);
+  }
+  function lookupBarcode(code, btn, img) {
+    var raw = code;
     code = productCode(code);
-    if (!/^[0-9]{6,14}$/.test(code || '')) { toast('That isn\'t a product barcode. Try another, read the label, or choose from your stores.', { error: true }); return; }
+    if (!/^[0-9]{6,14}$/.test(code || '')) { scanNote('not-product', String(raw || '').slice(0, 30)); toast('That isn\'t a product barcode. Try another, read the label, or choose from your stores.', { error: true }); return; }
     return run(function () {
       return api('GET', 'api/scan/barcode?code=' + encodeURIComponent(code)).then(function (r) {
         if (stack.length && stack[stack.length - 1].type === 'scancode') closeSheet();
         if (r.item_id && byId(r.item_id)) return openSheet({ type: 'scanhit', id: r.item_id });
+        if (r.product && (!r.product.name || r.product.name === code)) r.product = null;   // known, but with no name
+        if (img && aiOn() && needsLabel(r.product, code)) {
+          toast(r.product ? 'Open Food Facts is missing some details: reading the rest from your photo…' : 'Not in Open Food Facts: reading the label in your photo…');
+          return api('POST', 'api/scan/label', { image: img, known: Object.assign({ code: code }, r.product || {}) }).then(function (x) {
+            SCAN_AI = null;
+            return openSheet({ type: 'scanned', code: code, product: x.product, fromPhoto: true });
+          }, function () {
+            return openSheet({ type: 'scanned', code: code, product: r.product, lookupError: r.lookup_error });
+          });
+        }
         return openSheet({ type: 'scanned', code: code, product: r.product, lookupError: r.lookup_error });
       });
     }, btn);
@@ -2776,11 +2920,15 @@
         '<span class="li-title">' + esc(it.name) + '</span><span class="li-sub">' + esc(qu(info(it).total, it.unit)) + ' in stock</span></span>' + ICON.chev + '</button>';
     };
     return sheetHead(p && p.name ? p.name : 'New barcode', s.code ? 'Barcode ' + s.code : 'Read from the label by the AI: check it', s.code ? '📦' : '🤖') +
-      (p ? '<p class="small">' + esc([p.quantity, p.kcal_per_unit ? p.kcal_per_unit + ' kcal for the whole ' + (p.unit || 'pack') : '', p.brand, p.expiry ? 'best before ' + fmtDate(p.expiry) : ''].filter(Boolean).join(' · ')) + '</p>' +
+      (p ? '<p class="small">' + esc([p.unit && p.unit !== 'pack' ? 'A ' + p.unit : '', p.quantity, p.kcal_per_unit ? p.kcal_per_unit + ' kcal for the whole ' + (p.unit || 'pack') : '', p.brand,
+            p.open_days ? 'once opened, ' + p.open_days + ' days' : '', p.storage === 'chilled' ? 'kept in the fridge' : p.storage === 'frozen' ? 'kept in the freezer' : '',
+            p.expiry ? 'best before ' + fmtDate(p.expiry) : ''].filter(Boolean).join(' · ')) + '</p>' +
+          (p.ai_guessed ? '<p class="small muted">' + esc((p.ai_guessed.indexOf('kcal') >= 0 ? 'No calories printed in the photo, so they\'re the AI\'s estimate for this kind of product' : 'The days once opened are the AI\'s estimate')) + ': marked "AI estimate" until you change them.</p>' : '') +
+          '<button class="btn block" data-act="scan-label-more" style="margin-bottom:10px">📷 Add another photo (back, nutrition, date)</button>' +
           (p.how ? '<p class="small muted">From the label: ' + esc(p.how) + '</p>' : '') +
           ((p.category === 'food' || p.category === 'drinks' || p.category === 'pets') && !p.kcal_per_unit
             ? '<p class="small muted">No calories in Open Food Facts for this one.</p><button class="btn block" data-act="scan-nutrition" style="margin-bottom:10px">📷 Read the nutrition label</button>' : '')
-        : '<p class="small muted">' + (s.lookupError ? 'Couldn\'t reach Open Food Facts just now.' : 'Not in Open Food Facts.') + ' The AI can read the label instead, or type it in.</p>' +
+        : '<p class="small muted">' + (s.lookupError ? 'Couldn\'t reach Open Food Facts just now.' : 'Not in Open Food Facts.') + (aiOn() ? ' The AI can read the label instead, or type it in.' : ' Add it as a new item and type in the details: they\'re remembered for next time.') + '</p>' + aiHint() +
           '<button class="btn block" data-act="scan-label" data-code="' + esc(s.code || '') + '" style="margin-bottom:10px">🤖 Read the label with AI</button>') +
       '<button class="btn primary block" data-act="scan-new">' + ICON.plus + ' Add as a new item</button>' +
       (S.items.length ? '<h3>Or add it to something you already keep</h3><p class="small muted">Another brand of the same thing goes on the same line, with its own batches.' +
@@ -2791,7 +2939,12 @@
   // No barcode in the photo: the AI can read the label instead (name, size, calories, date).
   function sheetScanFail(s) {
     return sheetHead('No barcode found', 'In that photo', '🔍') +
-      '<p class="small">Some things have no barcode, or it\'s too creased or shiny to read. The AI can read the label instead: the name, size, calories and best before date.</p>' +
+      '<p class="small">The photo was read six ways (whole, middle, smaller, turned) and no barcode came out. Usually it\'s one of these:</p>' +
+      '<ul class="small scan-why"><li><b>Too far away or blurred:</b> get close enough that the barcode fills most of the photo, and hold still.</li>' +
+      '<li><b>Glare:</b> shiny wrappers and curved tins reflect the light. Tilt it a little, or turn the light off.</li>' +
+      '<li><b>Creased, torn or wrapped round a corner:</b> flatten it, or type the numbers under the bars.</li>' +
+      '<li><b>No barcode at all</b> (one can from a multipack): read the label or choose from your stores.</li></ul>' +
+      (aiOn() ? '<p class="small">The AI can read the label instead: the name, size, what it\'s in, calories and best before date.</p>' : aiHint()) +
       '<div class="scan-choice"><button class="btn primary block" data-act="scan-label-same">🤖 Read the label from this photo</button>' +
       '<button class="btn block" data-act="scan-label">📷 Take a photo of the front of the pack</button>' +
       '<button class="btn block" data-act="scan-photo">Try the barcode again</button>' +
@@ -2847,13 +3000,13 @@
       }, btn).then(function () { if (hint && hint.textContent === 'Reading the nutrition label…') hint.hidden = true; });
     });
   }
-  function readLabel(img, btn, code) {
+  function readLabel(img, btn, code, known) {
     return run(function () {
-      toast('Reading the label…');
-      return api('POST', 'api/scan/label', { image: img }).then(function (r) {
+      toast(known ? 'Adding what this photo shows…' : 'Reading the label…');
+      return api('POST', 'api/scan/label', { image: img, known: known || null }).then(function (r) {
         SCAN_AI = null;   // the spend figures have moved
         var top = stack.length && stack[stack.length - 1].type;
-        if (top === 'scanfail' || (top === 'scanned' && code)) closeSheet();
+        if (top === 'scanfail' || (top === 'scanned' && (code || known))) closeSheet();
         return openSheet({ type: 'scanned', code: code || '', product: r.product });   // a barcode stays with it
       });
     }, btn);
@@ -2928,10 +3081,10 @@
       '<div class="live-wrap"><video id="liveVideo" playsinline muted autoplay></video><div class="live-box" aria-hidden="true"></div>' +
       '<button type="button" class="btn small live-torch" data-act="scan-torch" hidden>🔦 Torch</button></div>' +
       '<p class="small muted center" id="liveStatus" role="status">Starting the camera…</p>' +
-      '<div class="btn-row live-alt"><button class="btn" data-act="scan-photo">📷 Take a photo instead</button>' +
-      '<button class="btn" data-act="scan-label">🤖 No barcode? Read the label</button>' +
-      '<button class="btn" data-act="scan-type">🔢 Type the numbers</button>' +
-      (S.items.length ? '<button class="btn" data-act="scan-pick">📋 Choose from your stores</button>' : '') + '</div>';
+      '<div class="live-alt"><button class="live-opt" data-act="scan-photo"><i aria-hidden="true">📷</i>Take a photo</button>' +
+      '<button class="live-opt" data-act="scan-label"><i aria-hidden="true">🤖</i>Read the label</button>' +
+      '<button class="live-opt" data-act="scan-type"><i aria-hidden="true">🔢</i>Type the number</button>' +
+      (S.items.length ? '<button class="live-opt" data-act="scan-pick"><i aria-hidden="true">📋</i>Pick from stores</button>' : '') + '</div>';
   }
   function liveStatus(text, bad) {
     var el = $('#liveStatus');
@@ -2966,6 +3119,9 @@
           var caps = tr && tr.getCapabilities ? tr.getCapabilities() : {};
           if (caps && caps.torch) { var tb = $('.live-torch'); if (tb) tb.hidden = false; }
           liveStatus('Point the camera at the barcode');
+          setTimeout(function () {   // still nothing: say why it might be
+            if (mine()) liveStatus('Not reading it yet. Get closer so the barcode fills the box, keep it flat and out of glare, or take a photo instead.');
+          }, 9000);
         });
     }).catch(function (e) {
       if (mine()) stopLive();
@@ -3007,7 +3163,7 @@
       Object.keys(P).map(function (k) { return '<option value="' + k + '"' + (k === prov ? ' selected' : '') + '>' + esc(P[k].name) + (k !== 'ha' && c.keys_set.indexOf(k) >= 0 ? ' (key saved)' : '') + '</option>'; }).join('') +
       '</select></div>' + keyBox +
       '<h3>Missing details</h3><p class="small">The AI can estimate calories for a whole pack, what one holds, and how long things keep once opened, from their names, for you to check.</p>' +
-      '<div class="btn-row"><button class="btn" data-act="ai-fill">🤖 Fill in missing details</button></div>' +
+      (aiOn() ? '<div class="btn-row"><button class="btn" data-act="ai-fill">🤖 Fill in missing details</button></div>' : '<p class="small muted">Set up an AI above to use this.</p>') +
       spendBox(c) + offlineBox() + '</section>';
   }
   // What the AI has cost: this month, today, what's left of the limit, and the last few calls.
@@ -3034,6 +3190,7 @@
         st.tasks.dates ? st.tasks.dates + ' best before date' + (st.tasks.dates === 1 ? '' : 's') : '',
         st.tasks.labels ? st.tasks.labels + ' label' + (st.tasks.labels === 1 ? '' : 's') : '',
         st.tasks.filled ? st.tasks.filled + ' fill-in' + (st.tasks.filled === 1 ? '' : 's') : '',
+        st.tasks.review ? st.tasks.review + ' stores review' + (st.tasks.review === 1 ? '' : 's') : '',
         st.tasks.other ? st.tasks.other + ' other (names translated)' : '',
         st.failed ? st.failed + ' failed' : '',
         st.avg_usd != null ? 'about ' + usd(st.avg_usd) + ' each' : '',
@@ -3316,6 +3473,25 @@
       }
       case 'scan-nutrition':
         return readNutrition(a);
+      case 'scan-label-more': {
+        var lm = stack[stack.length - 1];
+        return takePhoto().then(function (file) {
+          if (!file) return;
+          return shrinkPhoto(file, 1600).then(function (img) { return readLabel(img, a, lm.code || '', Object.assign({}, lm.product || {})); });
+        });
+      }
+      case 'stock-review':
+        return run(function () {
+          toast('Reviewing your stores…');
+          return api('POST', 'api/ai/review', {}).then(function (r) { S.stock_review = r.review; SCAN_AI = null; render(); });
+        }, a);
+      case 'review-add': {
+        var rv = (S.stock_review || {}).suggestions || [], one = rv[+a.dataset.n];
+        if (!one) return;
+        return run(function () {
+          return api('POST', 'api/shopping', { text: one.add }).then(function () { a.textContent = '✓ On the list'; a.disabled = true; toast(one.add + ' added to the supply run'); });
+        }, a);
+      }
       case 'scan-label-same':
         return readLabel(stack[stack.length - 1].img, a);
       case 'scan-date':
@@ -3732,11 +3908,13 @@
         name: d.name, category: d.category || 'other', unit: d.unit || '', notes: d.notes || '',
         target_qty: num(d.target_qty), kcal_per_unit: num(d.kcal_per_unit), litres_per_unit: num(d.litres_per_unit),
         per_day: num(d.per_day), price: num(d.price),
-        pack_size: num(d.pack_size), pack_unit: num(d.pack_size) ? (d.pack_unit || 'g') : '', open_days: num(d.open_days)
+        pack_size: num(d.pack_size), pack_unit: num(d.pack_size) ? (d.pack_unit || 'g') : '', open_days: num(d.open_days),
+        storage: d.storage || ''
       };
       var id = f.dataset.id;
       if (!id) { body.qty = num(d.qty); body.expiry = d.expiry || null; body.location = d.location || ''; }
       if (!id && f.dataset.barcode) { body.barcode = f.dataset.barcode; body.product = f.dataset.product || ''; }
+      if (!id && f.dataset.guessed) body.ai_guessed = f.dataset.guessed;
       return run(function () {
         return api(id ? 'PUT' : 'POST', id ? 'api/items/' + id : 'api/items', body).then(function () {
           doneSheet();
