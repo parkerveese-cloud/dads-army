@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.16.0
+
+**Supply run**
+
+- **Change an extra.** Tap ✏️ beside anything on the "Also get" list to change what it says. Blank isn't allowed: remove it instead.
+- **Got it for extras too.** It opens a new item with the extra's words as the name. Add the amount and best-before date, and once it's saved the extra comes off the list.
+
+**Restore an automatic copy**
+
+- **HQ → Restore an automatic copy** lists the daily copies the Pi keeps, and the ones saved just before a restore, newest first, with the date and how many items each has. Pick one to put the stores back as they were. It goes through the same checks as restoring a file: a copy of what you have is saved first, and it asks before restoring one with nothing in it. A damaged copy is listed so you know it's there, but can't be picked. `GET /api/backups`, `POST /api/backups/restore`.
+
+**Expiry timeline**
+
+- **On the Sitrep**, the batches in stock by the month they go out of date, for the next twelve months, after a column for what already has. Red is out of date, amber expiring soon, green fine. Tap a month to see the stores soonest first.
+
+**Home Assistant**
+
+- `sensor.dads_army_expiring_soon` has a new attribute, `expires_in_7_days`: what goes out of date in exactly a week, beside `expires_today`, for a reminder with time to use it up. Every batch a week away counts, not only each item's soonest.
+
 ## 1.15.0
 
 **The daily briefing**

@@ -1067,3 +1067,20 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
 .brief-src li { margin: 3px 0; overflow-wrap: anywhere; }
 .brief-foot { margin-bottom: 0; }
 .opt.is-off > span { opacity: .65; }
+
+/* Expiry timeline (1.16.0): a column a month, stacked out of date / expiring soon / fine */
+.tl-cols { display: grid; grid-template-columns: repeat(13, minmax(0, 1fr)); gap: 4px; align-items: end; margin: 10px 0 8px; }
+.tl-col { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 0; border: 0; background: none;
+  color: inherit; font: inherit; cursor: pointer; min-width: 0; }
+.tl-n { font-size: 11px; color: var(--ink-2); min-height: 14px; line-height: 14px; }
+.tl-bar { display: flex; flex-direction: column-reverse; width: 100%; max-width: 26px; height: 110px;
+  border-radius: 4px; background: var(--surface-2); overflow: hidden; }
+.tl-bar i { display: block; width: 100%; flex: none; }
+.tl-lab { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: clip; max-width: 100%; }
+.tl-col:first-child .tl-lab { font-weight: 650; color: var(--bad-ink); }
+.tl-col:active .tl-bar { transform: scale(.97); }
+.tl-ok { background: var(--good); }
+.tl-warn { background: var(--warn); }
+.tl-bad { background: var(--bad); }
+.timeline-card .legend i { height: 10px; width: 10px; border-radius: 2px; }
+.timeline-card .legend .muted { color: var(--muted); }

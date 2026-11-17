@@ -902,6 +902,7 @@
       html += '</div></section>';
     }
 
+    html += timelineCard();
     html += reviewCard();
 
     // Routine checks that are due, or due within a week
@@ -941,6 +942,49 @@
     }
     html += '<p class="tagline">Don\'t panic · stay supplied</p>';
     el.innerHTML = html;
+  }
+
+  // Expiry timeline: batches in stock by the month they go out of date, for a year, after a column for what
+  // already has. Spots a month where a lot goes at once, in time to use it or swap it out.
+  function timelineCard() {
+    var now = new Date(), y = now.getFullYear(), m = now.getMonth(), cols = [], later = 0, k;
+    cols.push({ label: 'Past', long: 'Already out of date', bad: 0, warn: 0, ok: 0, show: 'expired' });
+    for (k = 0; k < 12; k++) {
+      var md = new Date(y, m + k, 1);
+      cols.push({ label: md.toLocaleDateString('en-GB', { month: 'short' }), long: md.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' }),
+        bad: 0, warn: 0, ok: 0, show: 'all' });
+    }
+    S.items.forEach(function (it) {
+      it.batches.forEach(function (b) {
+        if (!b.expiry || !(b.qty > 0)) return;
+        var es = expState(b.expiry, it.category);
+        if (es === 'bad') { cols[0].bad++; return; }
+        var bd = parseYmd(b.expiry), idx = (bd.getFullYear() - y) * 12 + bd.getMonth() - m;
+        if (idx >= 12) { later++; return; }
+        cols[idx + 1][es]++;
+      });
+    });
+    var sum = function (c) { return c.bad + c.warn + c.ok; };
+    var most = Math.max.apply(null, cols.map(sum));
+    if (!most) return '';   // nothing with a date in the next year: no chart to show
+    var tot = { bad: 0, warn: 0, ok: 0 };
+    var bars = cols.map(function (c) {
+      var n = sum(c);
+      tot.bad += c.bad; tot.warn += c.warn; tot.ok += c.ok;
+      // Each part's height is its share of the busiest month, so the months can be compared by eye.
+      var part = function (state, v) { return v ? '<i class="tl-' + state + '" style="height:' + (v / most * 100).toFixed(1) + '%"></i>' : ''; };
+      var lab = c.long + ': ' + (n ? srN(n, 'batch', 'batches') + (c.warn && c.ok ? ', ' + c.warn + ' expiring soon' : '') : 'nothing') + '. Open the stores, soonest first';
+      return '<button class="tl-col" data-act="go" data-show="' + c.show + '" data-sort="expiry" aria-label="' + esc(lab) + '">' +
+        '<span class="tl-n">' + (n || '') + '</span><span class="tl-bar">' + part('ok', c.ok) + part('warn', c.warn) + part('bad', c.bad) + '</span>' +
+        '<span class="tl-lab">' + esc(c.label) + '</span></button>';
+    }).join('');
+    return '<section class="card timeline-card"><div class="card-head"><h2>Expiry timeline</h2>' +
+      '<button class="link" data-act="go" data-show="all" data-sort="expiry">Soonest first</button></div>' +
+      '<p class="small muted">Batches in stock by the month they go out of date, to ' + esc(cols[12].long) + '.</p>' +
+      '<div class="tl-cols">' + bars + '</div>' +
+      '<div class="legend"><span><i class="tl-bad"></i>Out of date (' + tot.bad + ')</span><span><i class="tl-warn"></i>Expiring soon (' + tot.warn + ')</span>' +
+      '<span><i class="tl-ok"></i>Fine (' + tot.ok + ')</span>' + (later ? '<span class="muted">+ ' + srN(later, 'batch', 'batches') + ' after that</span>' : '') +
+      '</div></section>';
   }
 
   var LOG_VERB = { added: 'Added', stocked: 'Stocked', used: 'Used', adjusted: 'Adjusted', edited: 'Edited', removed: 'Deleted',
@@ -1233,7 +1277,8 @@
     var cost = supplyCost(short);
     var html = '<section class="card"><div class="card-head"><h2>Supply run</h2><span class="small muted">' + (short.length + todo) + ' to get' +
       (cost.priced ? ' · about ' + esc(money(cost.sum)) : '') + '</span></div>' +
-      '<p class="small muted">Everything below target, plus anything you add. Back from the shops? Tap <b>Got it</b> to put it in the stores.' +
+      '<p class="small muted">Everything below target, plus anything you add. Back from the shops? Tap <b>Got it</b> to put it in the stores ' +
+      '(for something you added, that makes it a new item and takes it off the list).' +
       (ha ? ' It\'s also on your Home Assistant list <b>' + esc(ha.todo_name) + '</b>.' : '') + '</p>' +
       '<div class="btn-row"><button class="btn" data-act="copy-list">' + ICON.copy + ' Copy list</button>' +
       '<button class="btn" data-act="print-list">' + ICON.print + ' Print</button></div></section>';
@@ -1265,6 +1310,8 @@
     S.shopping.forEach(function (s) {
       html += '<div class="li"><button class="check" role="checkbox" aria-checked="' + (s.done ? 'true' : 'false') + '" data-act="shop-toggle" data-id="' + s.id + '">' +
         '<span class="box">' + ICON.check + '</span><span class="li-title">' + esc(s.text) + '</span></button>' +
+        (s.done ? '' : '<button class="btn small" data-act="shop-got" data-id="' + s.id + '" aria-label="Got it: add ' + esc(s.text) + ' to the stores">Got it</button>') +
+        '<button class="icon-btn" data-act="shop-edit" data-id="' + s.id + '" aria-label="Change ' + esc(s.text) + '">' + ICON.edit + '</button>' +
         '<button class="icon-btn" data-act="shop-del" data-id="' + s.id + '" aria-label="Remove ' + esc(s.text) + '">' + ICON.close + '</button></div>';
     });
     html += '</div></section>';
@@ -2420,7 +2467,8 @@
       '<button class="btn block" data-act="print-plan">' + ICON.print + ' Print emergency plan &amp; checks</button>' +
       '<a class="btn block" href="api/backup.json" download>' + ICON.download + ' Download backup</a>' +
       '<a class="btn block" href="api/export.csv" download>' + ICON.download + ' Export spreadsheet (CSV)</a>' +
-      '<button class="btn block" data-act="restore">' + ICON.upload + ' Restore from a backup…</button></div>' +
+      '<button class="btn block" data-act="restore">' + ICON.upload + ' Restore from a backup…</button>' +
+      '<button class="btn block" data-act="backups">' + ICON.upload + ' Restore an automatic copy…</button></div>' +
       '<p class="small muted" style="margin:10px 0 0">The Pi also saves its own copy every day' +
       (S.server.last_backup ? ' (last one ' + esc(ago(S.server.last_backup)) + ')' : '') + '.</p></section>';
 
@@ -2676,7 +2724,7 @@
       level: sheetLevel, levelhelp: sheetLevelHelp, homesensors: sheetHomeSensors, area: sheetArea, resall: sheetResAll,
       place: sheetPlace, live: sheetLive, scanned: sheetScanned, scancode: sheetScanCode, scanhit: sheetScanHit,
       livescan: sheetLiveScan, scanfail: sheetScanFail, scanpick: sheetScanPick, aifill: sheetAiFill,
-      credits: sheetCredits
+      credits: sheetCredits, shoptext: sheetShopText, backups: sheetBackups
     }[s.type](s);
     if (html === null) {   // the item was deleted elsewhere
       closeSheet();
@@ -2805,7 +2853,8 @@
     }).join('');
     return sheetHead(it ? 'Edit item' : 'New item', it ? it.name : 'Add something to the stores') +
       '<form id="itemForm" data-cat="' + esc(v.category) + '" data-id="' + (it ? it.id : '') + '"' +
-      (s.code ? ' data-barcode="' + esc(s.code) + '" data-product="' + esc(pre.name || '') + '"' : '') + (!it && pre.ai_guessed ? ' data-guessed="' + esc(pre.ai_guessed) + '"' : '') + ' novalidate>' +
+      (s.code ? ' data-barcode="' + esc(s.code) + '" data-product="' + esc(pre.name || '') + '"' : '') +
+      (!it && s.shop ? ' data-shop="' + esc(s.shop) + '"' : '') + (!it && pre.ai_guessed ? ' data-guessed="' + esc(pre.ai_guessed) + '"' : '') + ' novalidate>' +
       (!it && !s.code && !pre.from_ai ? '<div class="btn-row add-ways"><button type="button" class="btn small" data-act="scan">📷 Scan a barcode</button>' +
         '<button type="button" class="btn small" data-act="scan-label">🤖 Read the label</button><span class="small muted">or type it in below</span></div>' + aiHint() : '') +
       (s.code ? '<p class="callout info small">Barcode ' + esc(s.code) + (pre.name ? ': details from Open Food Facts. Check them, then add.' : ': not in Open Food Facts, so fill it in once and it\'s remembered.') + '</p>'
@@ -3451,6 +3500,37 @@
       '<textarea readonly rows="12" style="font-family:ui-monospace,monospace;font-size:14px">' + esc(s.text) + '</textarea>';
   }
 
+  function sheetShopText(s) {
+    var x = S.shopping.filter(function (r) { return r.id === s.id; })[0];
+    if (!x) return null;
+    return sheetHead('Change it', 'Also get on the supply run', '📝') +
+      '<form id="shopEditForm" data-id="' + x.id + '" novalidate autocomplete="off">' +
+      '<label class="field"><span>What to get</span><input type="text" name="text" value="' + esc(x.text) + '" maxlength="200" data-autofocus></label>' +
+      '<div class="sheet-actions"><button class="btn primary block" type="submit">Save</button></div></form>';
+  }
+
+  // The Pi's own daily copies, newest first. A damaged one is listed so you know it's there, but can't be picked.
+  function sheetBackups(s) {
+    var d = s.data, body;
+    if (!d) body = '<p class="small muted">Looking for them…</p>';
+    else if (d.error) body = '<p class="err">' + esc(d.error) + '</p>';
+    else if (!d.backups.length) body = '<p class="small muted">There aren\'t any yet. The Pi makes one each day.</p>';
+    else {
+      body = '<p class="small muted">The Pi keeps a copy from each of the last ' + esc(d.keep) + ' days, and one from just before each restore. ' +
+        'Restoring one replaces everything in the stores, but a copy of what\'s there now is kept first.</p><div class="list">' +
+        d.backups.map(function (b) {
+          var when = new Date(String(b.at).replace(' ', 'T'));
+          var label = isNaN(when) ? b.at : when.toLocaleString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+          var what = b.items === null ? 'Damaged: can\'t be restored' : srN(b.items, 'item', 'items');
+          return '<div class="li"><button class="li-main" data-act="backup-use" data-name="' + esc(b.name) + '" data-when="' + esc(label) + '"' +
+            (b.items === null ? ' disabled' : '') + ' aria-label="' + esc('Restore the copy from ' + label + ', ' + what) + '">' +
+            '<span class="li-title">' + esc(label) + '</span><span class="li-sub">' + esc(what) +
+            (b.kind === 'pre-restore' ? ' · saved before a restore' : '') + '</span></button></div>';
+        }).join('') + '</div>';
+    }
+    return sheetHead('Automatic copies', 'Saved on the Pi each day', '🗄️') + body;
+  }
+
   function sheetHaLists(s) {
     var d = s.data, body, checks = s.target === 'checks';
     var ha = S.server.ha || {};
@@ -4029,6 +4109,37 @@
         a.setAttribute('aria-checked', s.done ? 'true' : 'false');
         return run(function () { return api('PUT', 'api/shopping/' + id, { done: !!s.done }).then(refresh); });
       }
+      case 'shop-edit':
+        return openSheet({ type: 'shoptext', id: id });
+      case 'shop-got': {
+        // A new item with the extra's words as its name; saving it takes the extra off the list.
+        var x = S.shopping.filter(function (r) { return r.id === id; })[0];
+        if (!x) return;
+        return openSheet({ type: 'edit', id: null, cat: 'other', pre: { name: x.text }, shop: x.id });
+      }
+      case 'backups': {
+        var bs = { type: 'backups', data: null };
+        openSheet(bs);
+        return api('GET', 'api/backups').then(function (d) { bs.data = d; }, function (e) {
+          bs.data = { error: e.message, backups: [] };
+        }).then(function () { if (stack[stack.length - 1] === bs) renderSheet(); });
+      }
+      case 'backup-use': {
+        var label = a.dataset.when, name = a.dataset.name;
+        if (!confirm('Restore the copy from ' + label + '?\n\nThis REPLACES everything currently in the stores. The Pi keeps a copy of the current data first, just in case.')) return;
+        // The same as restoring a file: an empty copy is only restored once you've said so.
+        return run(function () {
+          return api('POST', 'api/backups/restore', { name: name }).catch(function (err) {
+            if (err.code !== 'empty_backup') throw err;
+            if (!confirm(err.message + '\n\nRestore it anyway?')) return null;
+            return api('POST', 'api/backups/restore', { name: name, confirm_empty: true });
+          }).then(function (res) {
+            if (!res) return;
+            closeSheet();
+            return refresh().then(function () { toast('Restored ' + srN(res.items, 'item', 'items') + ' from ' + label); });
+          });
+        }, a);
+      }
       case 'shop-del':
         return run(function () { return api('DELETE', 'api/shopping/' + id).then(refresh); }, a);
       case 'shop-clear':
@@ -4112,12 +4223,15 @@
         // Cupboard, fridge or freezer is only asked about food, drinks and pet food (the choice is hidden for the rest).
         storage: storedCat(d.category) ? (d.storage || '') : ''
       };
-      var id = f.dataset.id;
+      var id = f.dataset.id, shop = f.dataset.shop;
       if (!id) { body.qty = num(d.qty); body.expiry = d.expiry || null; body.location = d.location || ''; }
       if (!id && f.dataset.barcode) { body.barcode = f.dataset.barcode; body.product = f.dataset.product || ''; }
       if (!id && f.dataset.guessed) body.ai_guessed = f.dataset.guessed;
       return run(function () {
         return api(id ? 'PUT' : 'POST', id ? 'api/items/' + id : 'api/items', body).then(function () {
+          // Bought from the "Also get" list: it's in the stores now, so it comes off the list.
+          return shop ? api('DELETE', 'api/shopping/' + shop).catch(function () { /* already gone */ }) : null;
+        }).then(function () {
           doneSheet();
           return refresh().then(function () { toast(id ? 'Saved' : body.name + ' added to the stores'); });
         });
@@ -4236,6 +4350,15 @@
           closeSheet();
           if (!wbody.on) return refresh().then(function () { toast('Warnings switched off'); });
           return checkWarnings(null);
+        });
+      }, btn);
+    }
+    if (f.id === 'shopEditForm') {
+      if (!d.text) { toast('Type what to get, or remove it from the list instead', { error: true }); f.elements.text.focus(); return; }
+      return run(function () {
+        return api('PUT', 'api/shopping/' + f.dataset.id, { text: d.text }).then(function () {
+          closeSheet();
+          return refresh().then(function () { toast('Saved'); });
         });
       }, btn);
     }

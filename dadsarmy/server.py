@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -938,6 +938,7 @@ def summary():
     value = cost = 0.0
     priced = 0
     low, out, expired, soon, upcoming, supplies = [], [], [], [], [], []
+    week = []   # batches with exactly a week to go, for a reminder that leaves time to use them
 
     for it in items:
         unit, cat = it["unit"] or "", it["category"]
@@ -1004,6 +1005,17 @@ def summary():
             if price > 0:
                 entry["cost"] = round(get * price, 2)
             (out if in_date <= 0 else low).append((in_date / target, entry))
+
+        # Every batch a week from its date, not just the soonest: a tin due in three days shouldn't hide
+        # another due in seven.
+        wk = [b for d, b in dated if d == 7]
+        if wk:
+            b7 = min(wk, key=lambda b: b["id"])
+            qty = sum(b["qty"] for b in wk)
+            bits = [qu(qty, unit), expiry_words(7)] + ([b7["location"]] if b7["location"] else [])
+            week.append((7, {"name": it["name"], "category": cat, "qty": _num(qty), "unit": unit,
+                             "expiry": b7["expiry"], "days": 7, "location": b7["location"] or "",
+                             "text": " · ".join(bits)}))
 
         # Like the app, an item's expiry state comes from its soonest-dated batch.
         if dated:
@@ -1095,6 +1107,7 @@ def summary():
         # Best-before was yesterday, so it went out of date at midnight / it's the last day.
         "newly_expired": ordered([r for r in expired if r[0] == -1]),
         "expires_today": ordered([r for r in soon if r[0] == 0]),
+        "expires_in_7_days": ordered(week),
         "next_expiry": nxt,
         "supply_run": {"below_target": ordered(out) + ordered(low), "extras": extras, "cost": round(cost, 2)},
         # Things with a daily use: how long each lasts, shortest first.
@@ -3009,9 +3022,12 @@ def api_shop_update(body, query, sid):
         if "done" in body:
             db.execute("UPDATE shopping SET done = ? WHERE id = ?", (1 if body.get("done") else 0, sid))
         if "text" in body:
+            # Changing what it says: blank would leave a line with nothing on it, so say so rather than
+            # quietly keeping the old words.
             text = clean_text(body.get("text"), 200)
-            if text:
-                db.execute("UPDATE shopping SET text = ? WHERE id = ?", (text, sid))
+            if not text:
+                raise ApiError(400, "Type what to get, or remove it from the list instead")
+            db.execute("UPDATE shopping SET text = ? WHERE id = ?", (text, sid))
     return {"ok": True}
 
 
@@ -4215,6 +4231,96 @@ def make_backup(tag="auto"):
     return path
 
 
+# The names make_backup gives its copies: dadsarmy-20261114-093000-auto.db, or ...-093000a-... for a
+# second one in the same second, and -pre-restore for the copy saved just before a restore.
+BACKUP_NAME_RE = re.compile(r"dadsarmy-([0-9]{8}-[0-9]{6})[a-z]?-(auto|pre-restore)\.db")
+
+
+def backup_info(name):
+    """One copy for the list in HQ: when, which kind and how many items. A damaged one is listed (so you
+    can see it's there) with items None, and can't be restored."""
+    m = BACKUP_NAME_RE.fullmatch(name)
+    at = dt.datetime.strptime(m.group(1), "%Y%m%d-%H%M%S").isoformat(sep=" ")
+    out = {"name": name, "at": at, "kind": m.group(2), "items": None, "error": ""}
+    try:
+        out["items"] = check_backup(os.path.join(BACKUP_DIR, name))
+    except BackupError as e:
+        out["error"] = str(e)
+    return out
+
+
+def read_backup_db(path):
+    """An automatic copy in the shape of a downloaded backup file, so it restores through api_restore and
+    gets the same checks, the copy of what you have first and the question before an empty one."""
+    con = sqlite3.connect("file:%s?mode=ro" % path.replace("?", "%3f").replace("#", "%23"), uri=True)
+    con.row_factory = sqlite3.Row
+
+    def rows(sql):   # a copy made by an older version may not have every table yet
+        try:
+            return [dict(r) for r in con.execute(sql)]
+        except sqlite3.OperationalError:
+            return None
+
+    try:
+        raw = {}
+        for r in con.execute("SELECT key, value FROM settings"):
+            try:
+                raw[r["key"]] = json.loads(r["value"])
+            except (ValueError, TypeError):
+                pass
+        items = rows("SELECT * FROM items ORDER BY id") or []
+        by_item = {}
+        for b in rows("SELECT * FROM batches ORDER BY id") or []:
+            by_item.setdefault(b["item_id"], []).append(b)
+        used, codes = {}, {}
+        for u in rows("SELECT item_id, ts, qty FROM usage ORDER BY id") or []:
+            used.setdefault(u["item_id"], []).append([u["ts"], u["qty"]])
+        barcodes = rows("SELECT code, item_id, product FROM barcodes ORDER BY code")
+        for c in barcodes or []:
+            codes.setdefault(c["item_id"], []).append({"code": c["code"], "product": c["product"]})
+        for it in items:
+            it["batches"] = by_item.get(it["id"], [])
+            it["usage"] = used.get(it["id"], [])
+            if barcodes is not None:   # no table: keep the barcodes you have, as for an old backup file
+                it["barcodes"] = codes.get(it["id"], [])
+        payload = {"app": "dadsarmy", "items": items,
+                   "settings": dict((k, raw[k]) for k in DEFAULT_SETTINGS if k in raw),
+                   "shopping": rows("SELECT * FROM shopping ORDER BY id") or []}
+        for key, sql in (("history", "SELECT * FROM history ORDER BY day"), ("checks", "SELECT * FROM checks ORDER BY id")):
+            got = rows(sql)
+            if got is not None:
+                payload[key] = got
+        for key in ("plan", "resilience", "places"):
+            if key in raw:
+                payload[key] = raw[key]
+    finally:
+        con.close()
+    return payload
+
+
+@route("GET", "/api/backups")
+def api_backups(body, query):
+    """The automatic copies on the Pi, newest first."""
+    names = [n for n in list_backups(".db") if BACKUP_NAME_RE.fullmatch(n)]
+    names.sort(key=lambda n: BACKUP_NAME_RE.fullmatch(n).group(1), reverse=True)
+    return {"backups": [backup_info(n) for n in names], "keep": KEEP_BACKUPS}
+
+
+@route("POST", "/api/backups/restore")
+def api_backups_restore(body, query):
+    name = clean_text(body.get("name"), 80)
+    full = os.path.join(BACKUP_DIR, name)
+    if not BACKUP_NAME_RE.fullmatch(name) or not os.path.isfile(full):
+        raise ApiError(404, "That copy isn't there any more")
+    try:
+        check_backup(full)
+        payload = read_backup_db(full)
+    except (BackupError, sqlite3.Error) as e:
+        raise ApiError(400, "That copy can't be restored: %s" % e)
+    payload["confirm_empty"] = body.get("confirm_empty") is True
+    return api_restore(payload, query)
+
+
 def backup_loop():
     for f in os.listdir(BACKUP_DIR) if os.path.isdir(BACKUP_DIR) else []:
         if f.startswith(".dadsarmy-") and f.endswith(".tmp"):   # left by a power cut mid-backup
@@ -4353,7 +4459,8 @@ def ha_entities(s):
         dict(_ha_list(s["expired"]), newly_expired=s["newly_expired"][:LIST_LIMIT]))
     put("sensor.dads_army_expiring_soon", len(s["expiring_soon"]), "Dads Army expiring soon", "mdi:calendar-alert",
         "items", dict(_ha_list(s["expiring_soon"]), warn_days=s["warn_days"],
-                      expires_today=s["expires_today"][:LIST_LIMIT]))
+                      expires_today=s["expires_today"][:LIST_LIMIT],
+                      expires_in_7_days=s["expires_in_7_days"][:LIST_LIMIT]))
     nxt = s["next_expiry"]
     put("sensor.dads_army_next_expiry", nxt["date"] if nxt else "unknown", "Dads Army next to expire",
         "mdi:calendar-clock", attrs=nxt or {}, measurement=False, device_class="date")

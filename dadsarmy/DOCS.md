@@ -21,7 +21,7 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_out_of_stock` | Items with a target but none in stock that's still in date | `items` (each has `name`, `get`, `unit` and `text`), `total` |
 | `sensor.dads_army_low_stock` | Items with some stock, but below target. Out-of-date stock doesn't count towards a target, so it shows here as needing replacing. | `items` (each also has `out_of_date`), `total`, `below_target_total` |
 | `sensor.dads_army_expired` | Items with stock past its best-before date | `items` (each has `name`, `qty`, `expiry`, `days`, `location` and `text`), `total`, `newly_expired` (went out of date overnight) |
-| `sensor.dads_army_expiring_soon` | Items reaching their best-before date within your warning window (HQ), which can be earlier for some categories, such as medicines | `items`, `total`, `warn_days`, `expires_today` (on their last day) |
+| `sensor.dads_army_expiring_soon` | Items reaching their best-before date within your warning window (HQ), which can be earlier for some categories, such as medicines | `items`, `total`, `warn_days`, `expires_today` (on their last day), `expires_in_7_days` (exactly a week to go: time to use them up) |
 | `sensor.dads_army_next_expiry` | Date of the next thing to expire | `name`, `qty`, `location`, `days` |
 | `sensor.dads_army_supply_run` | Number of things on the shopping list | `items`, `extras`, `cost` (from the prices you've set, in £) |
 | `sensor.dads_army_supplies` | Days until the first thing with a daily use runs out (such as tablets or toilet roll). Unknown if nothing has a daily use set. | `items` (each has `name`, `days`, `have`, `per_day` and `text`), `runs_out_first`, `target_days` |
@@ -464,6 +464,8 @@ Every morning at 6am, Claude reads what Dads Army already knows and searches the
 
 The Sitrep's **Trends** card charts how many days the food and water would last, and the resilience score, day by day, over 30 days, 90 days, a year or everything. Point at the chart (or touch it) to see a day's figures, or open **Show as a table**.
 
+Below it, the **Expiry timeline** shows the batches in stock by the month they go out of date, for the next twelve months, after a column for what already has: red for out of date, amber for expiring soon, green for fine. A tall column is a month when a lot goes at once, in time to use it up or swap it out. Tap a month to see the stores soonest first.
+
 Dads Army records one line a day from 1.11.0, and keeps five years. When it first runs as a Home Assistant app, it fills in the days Home Assistant still remembers for the Dads Army sensors (usually the last ten).
 
 ## Scanning
@@ -520,6 +522,8 @@ The **Plan** tab in Dads Army holds two things:
 - **Routine checks:** jobs that come round regularly, such as testing the smoke alarms, charging the power banks or rotating stored water. Tap **Done** when you've done one, and Dads Army works out when it's next due. **Add suggested checks** gives you a starting set. Checks that are due show on the Sitrep, in `sensor.dads_army_checks_due`, and in the phone alerts.
 - **Emergency plan:** who to call, where to meet, how to turn off the water, gas and electricity, medical needs, pets and where the documents are. It's stored with the stores, so it works with the internet down, and it prints on a page for the grab bag. **Add UK emergency numbers** fills in 999, 111, 105 (power cuts), the gas emergency line, Floodline and 101.
 
+**Also get**, on the supply run, is for anything else you want from the shops. Tap ✏️ to change what one says. **Got it** opens a new item with its words as the name: add the amount and best-before date, and once it's saved it comes off the list.
+
 When you edit an item, **Used a day** says how many your household gets through each day (tablets, nappies, toilet roll, gas canisters). Dads Army then shows how long each one lasts, and the Sitrep's **Daily supplies** bar shows the first to run out. **Price each** adds up what the stores are worth and what the supply run will cost.
 
 Dads Army also notices how fast you actually use things. Once you've tapped **−** on something twice or more, its page says something like "You use about 2 tins a week, lasts 6 weeks", from the last three months.
@@ -550,6 +554,7 @@ Help → **Credits**, or the link at the foot of HQ, thanks the people who built
 Your data is kept in the app's own storage. It survives restarts and updates, and it's included in your Home Assistant backups. On top of that:
 
 - Dads Army saves a copy of its database every day and keeps the last 14. Each copy is checked before it's kept, and if one isn't sound, the earlier ones stay.
+- HQ → **Restore an automatic copy** lists those daily copies, and the ones saved just before a restore, newest first, with the date and how many items each has. Pick one to put the stores back as they were then. It goes through the same checks as restoring a file: a copy of what you have is saved first, and it asks before restoring one with nothing in it. A damaged copy is listed, but can't be picked.
 - Out-of-date stock doesn't count towards a target, so out-of-date tins show on the supply run as needing replacing.
 - **Restore from a backup** checks the whole file before changing anything, saves a copy of what you have first, and asks before restoring a backup with nothing in it.
 - An undo never overwrites a newer change: if someone has used or changed the same thing on another phone since, the undo says so and leaves it.
