@@ -3,7 +3,7 @@ Each feed is the whole country in one go, so nothing about where you live is sen
 import datetime as dt
 import json
 
-from feeds import FakeFeeds
+from feeds import FakeFeeds, wider_routes, wider_urls
 from support import AppTest, server
 
 HOME = {"lat": 54.486, "lon": -0.615}   # Whitby
@@ -229,7 +229,7 @@ class LiveRunTest(AppTest):
             "ukpn": (ukpn, "application/json"), "nged": (nged, "text/csv"), "ssen": (ssen, "application/json"),
             "npg": (npg, "application/json"), "grid": (syswarn, "application/json"), "gas": (gas, "text/csv"),
             "air": (lambda: AIR_SITES, "application/xml"), "airfc": (air_forecast, "application/xml"),
-            "space": (scales, "application/json"), "pound": (boe, "text/csv")})
+            "space": (scales, "application/json"), "pound": (boe, "text/csv"), **wider_routes()})
         b = self.feeds.base
         server.FEED_URLS.update(self.feeds.urls())
         server.FEED_URLS.update({"rivers": b + "rivers", "river_stations": b + "stations", "power_ukpn": b + "ukpn",
@@ -237,7 +237,9 @@ class LiveRunTest(AppTest):
                                  "grid": b + "grid?from={start}&to={end}", "gas": b + "gas?from={start}&to={end}",
                                  "air": b + "air", "air_forecast": b + "airfc", "space": b + "space",
                                  "pound": b + "pound?from={start}"})
-        server.api_warnings_set({"on": True, "lat": HOME["lat"], "lon": HOME["lon"]}, {})
+        server.FEED_URLS.update(wider_urls(b))   # 1.15.0's sources
+        server.api_warnings_set({"on": True, "lat": HOME["lat"], "lon": HOME["lon"],
+                                 "sources": {k: True for k in server.LIVE_KEYS}}, {})
 
     def tearDown(self):
         self.feeds.close()
@@ -246,7 +248,9 @@ class LiveRunTest(AppTest):
     def test_all_seven_come_through(self):
         server.warnings_run()
         w = server.warn_public()
-        self.assertEqual([r["key"] for r in w["live_rows"]], list(server.LIVE_KEYS))
+        # Water supply needs your water company choosing (it isn't guessed), so not yet.
+        self.assertEqual([r["key"] for r in w["live_rows"]], [k for k in server.LIVE_KEYS if k != "water"])
+        self.assertEqual(w["unavailable"], {"water": server.WATER_CHOOSE})
         bad = dict((k, v) for k, v in w["sources"].items() if not v["ok"])
         self.assertEqual(bad, {})
         rows = dict((r["key"], r) for r in w["live_rows"])
@@ -299,6 +303,6 @@ class LiveRunTest(AppTest):
         server.warnings_run()
         ents = server.ha_entities(server.summary())
         live = ents["sensor.dads_army_live"]
-        self.assertEqual(len(live["attributes"]["rows"]), 7)
+        self.assertEqual(len(live["attributes"]["rows"]), len(server.LIVE_KEYS) - 1)   # all but water (not chosen)
         self.assertGreaterEqual(int(live["state"]), 4)
         self.assertIn("sensor.dads_army_live", json.dumps(server.dashboard_config()))

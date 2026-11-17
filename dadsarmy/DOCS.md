@@ -248,7 +248,7 @@ The names are the UK's own five national threat levels, the nearest British equi
 | 🟨 | **MODERATE** | Something to keep an eye on: a yellow warning, a minor problem at home, or stores that wouldn't last 3 days. Stay aware. |
 | 🟧 | **SUBSTANTIAL** | Disruption is likely: an amber warning, a power cut, a leak, or a cold or hot home. Get ready. |
 | 🟥 | **SEVERE** | Disruption is highly likely or under way: a red warning, a flood warning, a long power cut, or a dangerously cold or hot home. Act now. |
-| ⬛ | **CRITICAL** | Danger to life, now or very soon: an Emergency Alert, a severe flood warning, or a gas, carbon monoxide or smoke alarm. Follow the emergency services' instructions. |
+| ⬛ | **CRITICAL** | Danger to life, now or very soon: an Emergency Alert for your area, a severe flood warning, or a gas, carbon monoxide or smoke alarm. Follow the emergency services' instructions. |
 
 It's worked out from three things:
 
@@ -357,23 +357,23 @@ Dads Army can show official warnings for where you live: on the Sitrep, on the *
 | Source | What you get |
 |---|---|
 | Met Office | Yellow, amber and red weather warnings for your region |
-| Environment Agency | Flood alerts, flood warnings and severe flood warnings near you (England only) |
-| GOV.UK Emergency Alerts | Alerts about a danger to life, while they're being sent and for 12 hours after |
-| GDACS (the UN and EU disaster alert system) | Orange and red alerts for earthquakes, floods, storms, volcanoes and tsunamis within 1,000 km |
+| Environment Agency, SEPA and Natural Resources Wales | Flood alerts, flood warnings and severe flood warnings near you: England's, Scotland's and Wales' (see [The rest of the UK](#the-rest-of-the-uk)) |
+| GOV.UK Emergency Alerts | Alerts about a danger to life, while they're being sent and for 12 hours after. Only one whose area takes in home (your district, county, region, constituency or police force area, or the whole UK, Great Britain or your nation, compared as whole names) raises your alert level; to know that, home's location rounded to about 100 m is looked up once at postcodes.io. Until it's known, every alert counts |
+| GDACS (the UN and EU disaster alert system) | Orange and red alerts for earthquakes, floods, storms, volcanoes and tsunamis within 1,000 km, and volcanoes within 2,000 km. Only one in the UK or Ireland, within 300 km, or a volcano within 2,000 km (ash closes airports) raises your alert level: an earthquake in Norway shows here but doesn't, and nor does a drought across Europe that lists Ireland among many countries |
 | NASA FIRMS (optional) | Possible fires within 10 km: hotspots seen by satellite in the last 24 hours |
 | UK Health Security Agency (optional) | Its latest news, such as cold-weather and heat-health alerts |
 | WHO (optional) | Disease outbreak news |
 
 How it works:
 
-- Dads Army checks every 15 minutes while the internet is up. It downloads the same public files for everyone and works out which warnings are near you on your own machine, so your location is never sent anywhere.
+- Dads Army checks every 15 minutes while the internet is up. It downloads the same public files for everyone and works out which warnings are near you on your own machine. Your location isn't sent with them (see [What leaves your network](#what-leaves-your-network) for the two exceptions).
 - Your location comes from Home Assistant's home location. You can set it by hand instead in the warnings settings. The Met Office region is worked out from it, and you can change that too.
 - Tap a warning for the full message, a link to the official page, what to do, and the parts of your emergency plan that matter, such as where to meet and how to turn things off.
 - If the internet goes down, everything else carries on, and the last warnings found stay on show with when they were checked.
 - Keep **Emergency Alerts** switched on in your phone's settings too. They reach the phone directly, much faster than any feed.
 - Every request carries only Dads Army's name: no cookies, no referrer and nothing about you.
 
-Flood warnings outside England come from SEPA (Scotland), Natural Resources Wales and NI Direct, which Dads Army doesn't read yet.
+Flood warnings in Scotland come from SEPA, and in Wales from Natural Resources Wales. Northern Ireland has no public flood warning feed yet, so there the source says it's not available for your area.
 
 **About possible fires.** There's no public feed of UK wildfire warnings, so this uses NASA's satellite fire detections. They're the only live source that covers the whole UK.
 - A satellite sees any large heat source. Most UK detections are controlled heather burning (allowed in autumn and winter), farm fires or industrial flares, not wildfires. That's why they show as a yellow **Possible fire**.
@@ -387,20 +387,78 @@ Switched on with the warnings, and listed under **Live information** in the warn
 
 | Feed | What you get | Warns when |
 |---|---|---|
-| River levels (Environment Agency, England) | The river gauges within 10 km, against their usual range, and whether each is rising or falling | A river is above its usual range, or above its highest in recent years |
-| Power cuts (UK Power Networks, National Grid, SSEN, Northern Powergrid) | Power cuts and planned work within 10 km | A power cut within 2 km, or planned work there |
+| River levels (Environment Agency, England; SEPA, Scotland) | The river gauges within 10 km, against their usual range, and whether each is rising or falling | A river is above its usual range, or above its highest in recent years |
+| Power cuts (UK Power Networks, National Grid, SSEN, Northern Powergrid; Electricity North West and NIE Networks near their networks) | Power cuts and planned work within 10 km | A power cut within 2 km, or planned work there |
 | The electricity grid (NESO, through Elexon) | Electricity margin and capacity market notices | A notice is in force; a warning of planned rota power cuts counts as serious |
 | Gas storage (National Gas) | How full Great Britain's gas storage is, against a year ago | It's emptying much faster than a year ago over two weeks, or it's nearly empty in winter |
 | Air quality (Defra UK-AIR) | The Daily Air Quality Index at the nearest monitoring site, and the forecast | It's high (7 or more) now or in the next two days |
 | Space weather (NOAA) | The geomagnetic storm scale, now and for the next three days | A severe storm (G4 or G5) |
 | The pound (Bank of England) | The pound against the dollar and the euro, and Bank Rate | The pound falls 3% in a week, or 5% in two weeks. A Bank Rate change shows as news. |
 
-- Like the warnings, each feed is the whole country (or a whole network) in one download, and Dads Army picks out what's near home itself. Nothing about you is sent.
+- Like the warnings, each feed is the whole country (or a whole network) in one download, and Dads Army picks out what's near home itself. Nothing about you is sent with them.
 - Slow-changing feeds are fetched less often: gas storage every three hours, the pound every six.
 - A power cut within 2 km, a high river, high air pollution, a severe solar storm or a warning of rota power cuts raises the household alert level to at least MODERATE. A very high river raises it to SUBSTANTIAL. Gas storage and the pound don't change the level.
-- Not covered yet: river levels in Scotland and Wales (SEPA and Natural Resources Wales), and power cuts from SP Energy Networks and Electricity North West, which need an account. There's no official free source for the FTSE 100, so it isn't included.
+- Not covered yet: river levels in Wales (Natural Resources Wales publishes them, but not a usual range to compare them with) and Northern Ireland, and power cuts from SP Energy Networks, which only publishes them to registered users: a home on its network gets a note saying so. There's no official free source for the FTSE 100, so it isn't included.
 
-Sources: Environment Agency flood and river level data from the real-time data API (Beta), and Defra's UK-AIR, under the Open Government Licence; power cut data from UK Power Networks, National Grid Electricity Distribution, SSEN and Northern Powergrid under their open data licences; system warnings from Elexon's BMRS; National Gas's data portal; NOAA's Space Weather Prediction Center; and the Bank of England's database, under the Open Government Licence.
+Sources: Environment Agency flood and river level data from the real-time data API (Beta), SEPA's water levels and Defra's UK-AIR, under the Open Government Licence; power cut data from UK Power Networks, National Grid Electricity Distribution, SSEN and Northern Powergrid under their open data licences, and from Electricity North West's and NIE Networks' power cut maps; system warnings from Elexon's BMRS; National Gas's data portal; NOAA's Space Weather Prediction Center; and the Bank of England's database, under the Open Government Licence.
+
+### More of the wider picture (1.15.0)
+
+Under **More of the wider picture** in the warnings settings. All public; the rain gauges and boreholes are the whole national list, and Dads Army picks the nearest itself.
+
+| Feed | What you get | Warns when |
+|---|---|---|
+| UK threat level (GOV.UK) | The national level set by the Joint Terrorism Analysis Centre and MI5, and Northern Ireland's | It goes up (for a week), or it's critical |
+| Cyber security (NCSC) | The NCSC's news from the last two weeks | A critical flaw or live attack in the last three days |
+| Travel advice (FCDO) | Countries whose advice changed in the last three days | Shown, but not a warning |
+| Drought, reservoirs and hosepipe bans (Environment Agency, England) | Reservoir storage, your area's drought status, your water company's hosepipe ban | Your area is in drought, or your water company has a hosepipe ban |
+| Water supply problems (six water companies) | Supply reports within 10 km | A supply problem that's yours: the company says your area is affected, or two are reported within 3 km, or one within 1 km |
+| Flood risk forecast (Flood Forecasting Centre's outlook for England, five days, from Check for flooding; Scottish Flood Forecast, three days) | The risk where you live, which day, and whether it's rising | Medium or high (in Scotland: flooding possible, or significant flooding possible) |
+| Rainfall near you (Environment Agency, SEPA, Natural Resources Wales) | Rain in 24 hours and 7 days at the nearest gauges (within 25 km) | 30 mm or more in a day |
+| Groundwater near you (Environment Agency, England) | The nearest boreholes (within 30 km) against the time of year; a deep borehole below sea level is marked, as it follows decades rather than this year's rain | Shown, but not a warning |
+| The grid now (NESO, Elexon) | Carbon intensity, the generation mix and the frequency | The frequency dips below 49.8 Hz |
+| Electricity margin (Elexon, NESO) | The tightest spare margin in the next 14 hours and two weeks, and Demand Flexibility Service events | The margin is under 3 GW |
+
+- Choose your **Environment Agency area** and **water company** in the warnings settings for drought status and hosepipe bans.
+- **Water supply** covers Cambridge Water, South Staffs Water, Yorkshire Water, South West Water, Bournemouth Water and NI Water customers, the companies that publish their incidents this way. Choose yours in the warnings settings: it isn't guessed from where home is (the companies' areas are too tangled for that), except in Northern Ireland, where NI Water supplies everyone. For any other company it isn't fetched or shown, and its switch says why.
+- Not included: stock markets and commodity prices, as there's no free official source.
+
+Sources: the threat level, the FCDO's travel advice and the Environment Agency's drought reports on GOV.UK; the National Cyber Security Centre; the Flood Forecasting Centre's five-day flood risk outlook (from GOV.UK's Check for flooding); Environment Agency rainfall (real-time data API) and groundwater (Hydrology API) data, all under the Open Government Licence; NESO's Carbon Intensity API (CC BY 4.0) and Data Portal; Elexon's BMRS; the regional providers below; and the water companies' public incident maps and pages.
+
+### The rest of the UK
+
+England's feeds stop at its borders. Where they don't reach, Scotland's, Wales' and Northern Ireland's own take over, and so do the electricity networks and water companies that cover home. Each is asked only for homes it covers: in its nation or network, or near enough to the border to matter (flood warnings within your flood distance, river gauges within 30 km, rain gauges within 25 km, power cuts within 10 km). Each is the provider's whole list, picked through on your own machine. If a neighbour's feed fails, home's own still shows; if home's own fails, the source keeps its last good result, as the others do.
+
+| Source | Provider and feed | Licence | Covers |
+|---|---|---|---|
+| Flood warnings | SEPA: the flood warning and flood alert area layers behind its Floodline map (ArcGIS) | Not an official data feed: SEPA's public map | Scotland |
+| Flood warnings | Natural Resources Wales: the data in its flood warning page | Not an official data feed: NRW's public page | Wales |
+| River levels | SEPA's water levels service (its usual range is the median yearly low to high) | Open Government Licence | Scotland |
+| Rainfall | SEPA's rain gauges (KiWIS time series, hourly totals) | Open Government Licence | Scotland |
+| Rainfall | Natural Resources Wales' telemetry API (15-minute totals) | Open Government Licence | Wales |
+| Flood risk forecast | The Scottish Flood Forecast's RSS feed (SEPA and the Met Office) | Public feed | Scotland |
+| Power cuts | Electricity North West: the list behind its power cut map | Not an official data feed | North West England |
+| Power cuts | NIE Networks: the list behind its PowerCheck map | Not an official data feed | Northern Ireland |
+| Power cuts | SP Energy Networks: no public live feed, so a note with its power cut map | | Central and southern Scotland, Merseyside, Cheshire and North Wales |
+| Water supply | Yorkshire Water's service events | Not an official data feed | Its customers |
+| Water supply | South West Water's and Bournemouth Water's incident feeds | Not official data feeds | Their customers |
+| Water supply | NI Water's current service updates page | Not an official data feed | Northern Ireland |
+| Which network | Great Britain's 14 electricity licence areas, from NESO's GIS boundaries (bundled, see `places/README.md`) | NESO Open Data Licence | Great Britain |
+
+- Which nation home is in comes from rough borders built in (a few km out near a border, which is why each feed reaches over it). Kintyre is Scotland.
+- **Not for your area:** a source that can't cover home isn't fetched, and its switch in the warnings settings says why, rather than showing as failing. In Northern Ireland: flood warnings, river levels, rainfall, the flood risk forecast, and the three grid sources (Northern Ireland's grid is run with Ireland's). In Wales: the flood risk forecast (there's no open one just now). Outside England: groundwater and the drought report.
+- The maps and pages that aren't official feeds could change without notice. If one does, that provider fails and says so; the others carry on.
+
+## The daily briefing
+
+Every morning at 6am, Claude reads what Dads Army already knows and searches the news, then writes one paragraph on the threats and risks to be aware of: locally, across the UK and in the world, against what's been usual over the last fortnight. It's at the top of the Sitrep.
+
+- **Switch it on** in HQ, in the **Daily briefing** card under Scanning. It needs an Anthropic API key (choose **Anthropic Claude** under Scanning and paste it), because the news search runs on Anthropic's side. Without one, the card says so.
+- **How thorough:** Standard (Claude Haiku 5.5, about 7p a day) or Thorough (Claude Sonnet 5.5, about 25p a day). Each search costs a cent on top of the tokens. It counts towards the monthly AI limit, and shows in the spending stats.
+- **What's sent to Anthropic:** the area name (what you type under **Local news for**, or your Met Office region), the day's warnings and wider picture, health news, and how many days your food and water would last. Nothing else about you, and not your location: the warnings and live lines it's given leave out postcodes, streets, gauge and borehole names, and how far things are from home ("Power cut near home", "River Esk near home").
+- **On the Sitrep:** the paragraph, Local, UK and World ratings from quiet to severe ("↑ above usual" when something's up), the sources it relied on (only ones that really came back from its searches) and what it searched for. Written by AI: check anything important with the official source.
+- If it fails it tries again 20 minutes later, up to four times a day. If Anthropic refuses the key, it switches itself off. **Write one now** writes one straight away.
+- In Home Assistant: `sensor.dads_army_briefing`, with the headline as its state and the paragraph, ratings and sources as attributes.
 
 ## Trends
 
@@ -498,6 +556,19 @@ Your data is kept in the app's own storage. It survives restarts and updates, an
 - The spreadsheet export can't be made to run formulas: a cell starting with = + − or @ is saved as plain text.
 - HQ → **Download backup** saves a copy to your phone.
 - HQ → **Print full inventory** gives you a paper copy to keep with the stores, and **Print emergency plan & checks** gives you the plan.
+
+## What leaves your network
+
+Dads Army needs no internet to run. With warnings and the wider picture switched on, it downloads public feeds: each is the whole country, a whole network or a company's whole list, and it works out what's near home itself, so your location isn't sent with them. Which regional feeds it asks for says roughly where you are (Scotland's feeds for a home in or near Scotland, your network's and your water company's), but nothing finer. Every request carries only Dads Army's name: no cookies, no referrer.
+
+What goes, and when:
+
+- **Emergency Alerts (when switched on):** home's location rounded to about 100 m goes once to postcodes.io (ONS data), to find your district, county, region and constituency, so that an alert for somewhere else doesn't raise your alert level. Again if you move.
+- **Rainfall near you (when switched on):** each of the three nearest rain gauges' readings is asked for by the gauge's id, at the Environment Agency, SEPA or Natural Resources Wales. That says home is within 25 km of those gauges.
+- **Scanning:** a new barcode goes to Open Food Facts (only the barcode), unless you use the offline list. A photo of a date or label goes to the AI you choose.
+- **The stores review:** your item names and amounts, to that AI, when you ask.
+- **The daily briefing (when switched on):** the area name, the day's warnings and wider picture (without postcodes, streets, gauge names or distances), health news and how long your stores would last, to Anthropic, once a day.
+- **Credits:** two fixed public addresses on GitHub, only when you tap **Check GitHub for new names**.
 
 ## Security
 

@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -235,6 +235,7 @@ ITEM_UPGRADES = [("per_day", "REAL NOT NULL DEFAULT 0"), ("price", "REAL NOT NUL
                  ("storage", "TEXT NOT NULL DEFAULT ''")]
 STORAGE = ("ambient", "chilled", "frozen")
 KCAL_CATS = ("food", "drinks")   # what feeds the household: juice and milk count as food, not drinking water
+STORED_CATS = KCAL_CATS + ("pets",)   # what's kept in a cupboard, fridge or freezer; storage is '' for everything else
 ITEM_FIELDS = ("name", "category", "unit", "kcal_per_unit", "litres_per_unit", "target_qty", "per_day", "price",
                "notes", "pack_size", "pack_unit", "open_days", "storage")
 ITEM_DEFAULTS = {"pack_size": 0, "pack_unit": "", "open_days": 0, "storage": ""}
@@ -585,14 +586,27 @@ def clean_item(body, partial=False):
     if not partial or "storage" in body:
         v = str(body.get("storage") or "").strip().lower()
         out["storage"] = v if v in STORAGE else ""
+    # A cupboard, fridge or freezer only means something for food, drinks and pet food: a torch isn't "ambient".
+    if out.get("category") and out["category"] not in STORED_CATS:
+        out["storage"] = ""
     return out
 
 
+GUESS_FIELDS = ("kcal_per_unit", "open_days", "pack_size", "storage")   # what the AI can have estimated
+
+
+def clean_guessed(v):
+    """"kcal_per_unit,open_days" from a request, a backup or an undo: only the fields the AI can estimate."""
+    parts = v.split(",") if isinstance(v, str) else []
+    return ",".join(f for f in GUESS_FIELDS if f in parts)
+
+
 def insert_item(db, data, created, updated, item_id=None):
-    cols = (("id",) if item_id is not None else ()) + ITEM_FIELDS + ("created_at", "updated_at")
+    cols = (("id",) if item_id is not None else ()) + ITEM_FIELDS + ("ai_guessed", "created_at", "updated_at")
     # new food (the starter list) is cupboard food unless it says otherwise
-    defaults = dict(ITEM_DEFAULTS, storage="ambient" if data.get("category") in KCAL_CATS + ("pets",) else "")
-    vals = ([item_id] if item_id is not None else []) + [data.get(k, defaults.get(k)) for k in ITEM_FIELDS] + [created, updated]
+    defaults = dict(ITEM_DEFAULTS, storage="ambient" if data.get("category") in STORED_CATS else "")
+    vals = (([item_id] if item_id is not None else []) + [data.get(k, defaults.get(k)) for k in ITEM_FIELDS]
+            + [data.get("ai_guessed", ""), created, updated])
     return db.execute("INSERT INTO items(%s) VALUES (%s)" % (", ".join(cols), ", ".join("?" * len(cols))),
                       vals).lastrowid
 
@@ -834,9 +848,14 @@ def drink_cap(st):
     return (st["adults"] + st["children"]) * min(DRINK_CAP, st["water_per_person"])
 
 
+WATER_MAX_DAYS = 3660   # ten years: as far as the water is worked out
+
+
 def water_lasts(water_lots, drink_lots, per_day, cap, today):
     """How many days the water lasts when drinks can cover up to `cap` litres of each day's `per_day` (the
-    drinking), and plain water the rest (cooking, washing, pets), a day at a time, using whatever goes off first.
+    drinking), and plain water the rest (cooking, washing, pets), using whatever goes off first. Days that go the same
+    way are taken together: a run ends when a lot goes off, the drinks drop below a day's share or the water runs out
+    (so ten years of water is a few steps, not 3,660). The app's waterLasts does the same, step for step.
     Returns (days, plain water that passes its date before it's needed, in days' worth)."""
     if per_day <= 0:
         return 0.0, 0.0
@@ -849,7 +868,7 @@ def water_lasts(water_lots, drink_lots, per_day, cap, today):
                 out.append([amount, (dt.date.fromisoformat(exp[:10]) - today).days if exp else None])
         return sorted(out, key=lambda x: (x[1] is None, x[1] if x[1] is not None else 0))
     water, drinks = lots(water_lots), lots(drink_lots)
-    t, wasted = 0.0, 0.0
+    t, wasted, day = 0.0, 0.0, 0
 
     def take(pool, want):
         got = 0.0
@@ -860,7 +879,7 @@ def water_lasts(water_lots, drink_lots, per_day, cap, today):
             lot[0] -= n
             got += n
         return got
-    for day in range(3660):
+    while day < WATER_MAX_DAYS:
         for pool in (water, drinks):
             for lot in pool:
                 if lot[1] is not None and lot[1] < day and lot[0] > 0:
@@ -870,10 +889,24 @@ def water_lasts(water_lots, drink_lots, per_day, cap, today):
         w_av = sum(l[0] for l in water)
         d_av = sum(l[0] for l in drinks)
         d_use = min(cap, d_av)
-        if w_av >= per_day - d_use - 1e-9:
-            take(drinks, d_use)
-            take(water, per_day - d_use)
-            t += 1
+        need = per_day - d_use
+        if w_av >= need - 1e-9:
+            # Whole days like this one, until a lot goes off, the drinks drop below a day's share or the water runs out.
+            run = WATER_MAX_DAYS - day
+            for lot in water + drinks:
+                if lot[1] is not None and lot[0] > 0:
+                    run = min(run, lot[1] + 1 - day)
+            if 0 < d_av < cap:
+                run = 1   # the last of the drinks goes today
+            elif 0 < cap <= d_av:
+                run = min(run, math.floor(d_av / cap))
+            if need > 0:
+                run = min(run, math.floor((w_av + 1e-9) / need))
+            run = max(1, run)
+            take(drinks, d_use * run)
+            take(water, need * run)
+            t += run
+            day += run
             continue
         # The last, part day: as much of it as the water (and drinks, for the drinking) will cover.
         f = (w_av + d_use) / per_day
@@ -952,9 +985,10 @@ def summary():
             supplies.append((lasts, {"id": it["id"], "name": it["name"], "category": cat, "unit": unit,
                                      "have": _num(in_date), "per_day": _num(per_day), "days": _days(lasts),
                                      "text": text}))
-        # Only stock that's in date counts towards the target: out-of-date tins need replacing.
+        # Only stock that's in date counts towards the target: out-of-date tins need replacing. Kit is everything
+        # but what's eaten or drunk (food, drinks and water count as days instead), as the app has it.
         old = round(total - in_date, 3)
-        if target > 0 and cat not in ("food", "water"):
+        if target > 0 and cat not in KCAL_CATS + ("water",):
             kit_n += 1
             kit_sum += min(1.0, in_date / target)
         if target > 0 and in_date < target:
@@ -1326,6 +1360,7 @@ def api_state(body, query):
             "settings": get_settings(),
             "stock_review": setting_raw("stock_review", None),
             "ai_ready": ai_ready(),
+            "briefing": brief_public(),
             "log": [dict(r) for r in DB.execute("SELECT * FROM log ORDER BY id DESC LIMIT 60")],
             "server": {"version": VERSION, "time": now_iso(), "last_backup": LAST_BACKUP["at"],
                        "backup_dir": BACKUP_DIR, "ha": ha_status()},
@@ -1339,8 +1374,8 @@ def api_summary(body, query):
 
 @route("POST", "/api/items")
 def api_item_create(body, query):
-    data = clean_item(body)
-    if not data["storage"] and data["category"] in KCAL_CATS + ("pets",):
+    data = clean_item(body)   # storage is '' for anything that isn't food, drinks or pet food
+    if not data["storage"] and data["category"] in STORED_CATS:
         data["storage"] = "ambient"   # a new item is cupboard food unless the scan, the label or you say otherwise
     qty = clean_num(body.get("qty"), 0, 0, 1e7, "Quantity")
     expiry = clean_date(body.get("expiry"))
@@ -1351,9 +1386,9 @@ def api_item_create(body, query):
         if qty > 0:
             db.execute("INSERT INTO batches(item_id, qty, expiry, location, added_at) VALUES (?, ?, ?, ?, ?)",
                        (item_id, qty, expiry, location, ts))
-        guessed = [g for g in str(body.get("ai_guessed") or "").split(",") if g in ("kcal_per_unit", "open_days", "pack_size", "storage")]
+        guessed = clean_guessed(body.get("ai_guessed"))
         if guessed:   # read from a photo: values the AI estimated are marked until you change them
-            db.execute("UPDATE items SET ai_guessed = ? WHERE id = ?", (",".join(guessed), item_id))
+            db.execute("UPDATE items SET ai_guessed = ? WHERE id = ?", (guessed, item_id))
         code = clean_barcode(body.get("barcode"), required=False)
         if code:   # scanned: next time this barcode goes straight to the item
             db.execute("INSERT OR REPLACE INTO barcodes(code, item_id, product, added_at) VALUES (?, ?, ?, ?)",
@@ -1370,6 +1405,8 @@ def api_item_update(body, query, item_id):
         raise ApiError(400, "Nothing to change")
     with tx() as db:
         before = get_item(db, item_id)
+        if "storage" in data and data.get("category", before["category"]) not in STORED_CATS:
+            data["storage"] = ""   # only food, drinks and pet food go in a cupboard, fridge or freezer
         if "target_qty" in data and before["auto_target"] and abs(data["target_qty"] - before["target_qty"]) > 1e-9:
             data["auto_target"] = 0   # you've set your own target: it no longer follows the household
         guessed = [g for g in (before["ai_guessed"] or "").split(",") if g]
@@ -1612,6 +1649,8 @@ def restore_snapshot(db, snap):
     batches = snap["batches"]
     item_id = as_int_id(item.get("id"))
     data = clean_item(item)
+    if "ai_guessed" in item:   # what the AI estimated stays marked as an estimate
+        data["ai_guessed"] = clean_guessed(item.get("ai_guessed"))
     created = clean_text(item.get("created_at"), 30) or now_iso()
     exists = db.execute("SELECT rev FROM items WHERE id = ?", (item_id,)).fetchone()
     if "after" in snap:   # undos from 1.11.0 on say what the item should look like now
@@ -1703,11 +1742,12 @@ def friendly_ai_error(who, text):
     return "%s couldn't answer (%s)" % (name, t[:120])
 
 
-def record_ai(ai, model, task, usage, ok, note=""):
+def record_ai(ai, model, task, usage, ok, note="", extra_usd=0.0):
+    """Log one AI call and what it cost (tokens, plus extra_usd for web searches). Returns the cost."""
     tin, tout = int(usage.get("in") or 0), int(usage.get("out") or 0)
     # Home Assistant's AI Task is paid for there (no token counts come back); direct calls are costed here.
     price = AI_PRICES.get(model, AI_PRICE_UNKNOWN) if model else None
-    cost = round((tin * price[0] + tout * price[1]) / 1e6, 6) if price else None
+    cost = round((tin * price[0] + tout * price[1]) / 1e6 + (extra_usd or 0), 6) if price else None
     try:
         with tx() as db:
             db.execute("INSERT INTO ai_calls(ts, ai, model, task, tokens_in, tokens_out, cost_usd, ok, note) "
@@ -1717,6 +1757,7 @@ def record_ai(ai, model, task, usage, ok, note=""):
     except Exception:
         traceback.print_exc()
     HA_WAKE.set()   # the spend sensor in Home Assistant catches up straight away
+    return cost
 
 
 def month_spend(today=None):
@@ -1727,7 +1768,7 @@ def month_spend(today=None):
 
 
 AI_TASKS = (("Dads Army best before", "dates"), ("Dads Army label", "labels"), ("Dads Army nutrition", "labels"),
-            ("Dads Army fill in", "filled"), ("Dads Army stores review", "review"))
+            ("Dads Army fill in", "filled"), ("Dads Army stores review", "review"), ("Dads Army briefing", "briefing"))
 
 
 def ai_stats(today=None):
@@ -1740,7 +1781,7 @@ def ai_stats(today=None):
         r = DB.execute("SELECT COUNT(*), IFNULL(SUM(cost_usd), 0), IFNULL(SUM(ok), 0) FROM ai_calls WHERE ts >= ? AND ts < ?",
                        (a, b)).fetchone()
         return {"calls": r[0], "ok": r[2], "cost_usd": round(r[1], 6)}
-    tasks = {"dates": 0, "labels": 0, "filled": 0, "review": 0, "other": 0}
+    tasks = {"dates": 0, "labels": 0, "filled": 0, "review": 0, "briefing": 0, "other": 0}
     for r in DB.execute("SELECT task, COUNT(*) FROM ai_calls WHERE ts >= ? AND ok = 1 GROUP BY task", (m["since"],)):
         tasks[next((k for t, k in AI_TASKS if r[0] == t), "other")] += r[1]
     tok = DB.execute("SELECT IFNULL(SUM(tokens_in), 0), IFNULL(SUM(tokens_out), 0) FROM ai_calls WHERE ts >= ?", (m["since"],)).fetchone()
@@ -1784,15 +1825,76 @@ LABEL_PROMPT = (
     'can\'t read. No other text.')
 
 
+def _guessed(known):
+    """The fields an earlier photo only estimated: {"kcal_per_unit", "open_days", ...}."""
+    g = known.get("ai_guessed") if isinstance(known, dict) else ""
+    return set(x for x in (g if isinstance(g, str) else "").split(",") if x)
+
+
+def _filled(v):
+    return v not in (None, "", 0) and not isinstance(v, (dict, list, bool))
+
+
 def label_prompt(known):
-    """The label prompt, with what earlier photos (or Open Food Facts) already found, to build on."""
-    keep = {k: known.get(k) for k in ("name", "size", "grams", "kcal_100g", "count", "category", "unit", "best_before",
-                                      "open_days", "storage") if known.get(k) not in (None, "", 0)}
+    """The label prompt, with what earlier photos (or Open Food Facts) already found, to build on. A product from an
+    earlier photo says "expiry" and "quantity" where the prompt says "best_before" and "size". What was only estimated
+    goes back as an estimate ("_typical"), so it isn't returned as if it had been read off the pack."""
+    known = known if isinstance(known, dict) else {}
+    guessed = _guessed(known)
+    alias = {"size": ("size", "quantity"), "best_before": ("best_before", "expiry")}
+    keep = {}
+    for k in ("name", "size", "grams", "kcal_100g", "count", "category", "unit", "best_before", "open_days", "storage"):
+        v = next((known.get(a) for a in alias.get(k, (k,)) if _filled(known.get(a))), None)
+        if v is None:
+            continue
+        if k == "kcal_100g" and "kcal_per_unit" in guessed:
+            k = "kcal_100g_typical"
+        elif k == "open_days" and "open_days" in guessed:
+            k = "open_days_typical"
+        keep[k] = v
     if not keep:
         return LABEL_PROMPT
     return (LABEL_PROMPT + " Already known about this product from another photo or a database: " +
             json.dumps(keep)[:600] + ". Keep these unless this photo clearly shows otherwise, and fill in what this "
             "photo adds; reply with the whole object.")
+
+
+def merge_label(new, known):
+    """Another photo of the same product: what this photo read, plus what the earlier ones (or Open Food Facts) had
+    that it didn't show. A value read off the pack beats an estimate, and an estimate stays marked as one."""
+    if not isinstance(known, dict) or not known:
+        return new
+    out = dict(new)
+    was = _guessed(known)
+    now = set(x for x in (new.get("ai_guessed") or "").split(",") if x)
+    if not _filled(out.get("grams")) and _filled(known.get("grams")):   # the size, with what it's in
+        out["grams"] = known["grams"]
+        if _filled(known.get("pack_unit")):
+            out["pack_unit"] = known["pack_unit"]
+    for k in ("quantity", "count", "litres_per_unit", "expiry", "storage", "brand", "code"):
+        if not _filled(out.get(k)) and _filled(known.get(k)):
+            out[k] = known[k]
+    for field, keys in (("kcal_per_unit", ("kcal_per_unit", "kcal_100g")), ("open_days", ("open_days",))):
+        mine = any(_filled(out.get(k)) for k in keys)
+        if not any(_filled(known.get(k)) for k in keys):
+            continue
+        if mine and field not in now:   # this photo read it off the pack...
+            if field in was and all(out.get(k) == known.get(k) for k in keys if _filled(known.get(k))):
+                now.add(field)   # ...or it's the earlier estimate, said back: still an estimate
+            continue
+        if mine and field in was:
+            continue   # both only guessed: this photo's guess
+        for k in keys:   # this photo didn't show it, or only guessed where an earlier photo read it
+            out[k] = known.get(k) if _filled(known.get(k)) else out.get(k) if k != "kcal_per_unit" else 0
+        (now.add if field in was else now.discard)(field)
+    if not _filled(out.get("kcal_per_unit")) and out.get("category") in STORED_CATS and _filled(out.get("kcal_100g")) \
+            and _filled(out.get("grams")):
+        try:   # the calories per 100 g from one photo and the size from another
+            out["kcal_per_unit"] = round(float(out["kcal_100g"]) * float(out["grams"]) / 100.0)
+        except (TypeError, ValueError):
+            pass
+    out["ai_guessed"] = ",".join(f for f in GUESS_FIELDS if f in now)
+    return out
 
 
 def clean_barcode(v, required=True):
@@ -1853,7 +1955,24 @@ def multipack_total(text):
     return int(m.group(1)), each * int(m.group(1))
 
 
-DRINK_TAGS = r"beverages|juices|sodas|soft-drinks|milks|smoothies|plant-based-milks"
+# Open Food Facts categories, matched whole (a parent like "en:plant-based-foods-and-beverages" is on rice too).
+WATER_TAGS = {"en:waters", "en:spring-waters", "en:mineral-waters", "en:natural-mineral-waters", "en:bottled-waters",
+              "en:still-waters", "en:sparkling-waters", "en:carbonated-waters", "en:unflavoured-waters"}
+DRINK_TAGS = {"en:beverages", "en:non-alcoholic-beverages", "en:juices", "en:fruit-juices", "en:vegetable-juices",
+              "en:nectars", "en:sodas", "en:soft-drinks", "en:carbonated-drinks", "en:milks", "en:plant-based-milks",
+              "en:plant-based-beverages", "en:smoothies", "en:flavoured-waters"}
+NOT_DRINKING = {"en:hot-beverages", "en:alcoholic-beverages", "en:coffees", "en:teas", "en:instant-beverages",
+                "en:wines", "en:beers", "en:spirits", "en:ciders", "en:liqueurs"}   # not what you'd drink for water
+LIQUID_RE = re.compile(r"\d\s*(ml|cl|l|ltrs?|litres?|liters?)\b", re.I)
+SIZE_UNIT_RE = re.compile(r"\d\s*(kg|g|mg|ml|cl|l|ltrs?|litres?|liters?|oz|lb)\b", re.I)
+
+
+def is_liquid(text, unit=""):
+    """Is a pack size in ml, cl or litres? The printed size decides ("70 cl", "6 x 330 ml"), else the unit given."""
+    m = SIZE_UNIT_RE.search(str(text or ""))
+    if m:
+        return bool(LIQUID_RE.match(m.group(0)))
+    return str(unit or "").strip().lower() in ("ml", "cl", "l")
 PACK_WORDS = (("jar", r"\bjars?\b|glass"), ("carton", r"cartons?|tetra|brick"),
               ("tin", r"\btins?\b|canned|tinned|\bcans?\b|metal"), ("bottle", r"bottles?"),
               ("box", r"\bbox(es)?\b|cardboard"), ("bag", r"\bbags?\b|sack"), ("pouch", r"pouch"),
@@ -1912,18 +2031,27 @@ def product_from(code, p):
         kcal = round(float(kcal100) * grams / 100.0) if kcal100 is not None and grams else 0
     except (TypeError, ValueError):
         kcal = 0
-    tags = " ".join(p.get("categories_tags") or [])
+    tag_list = [str(t).strip().lower() for t in (p.get("categories_tags") or []) if t]
+    tags, tag_set = " ".join(tag_list), set(tag_list)
     mcount = re.match(r"^\s*(\d{1,3})\s*[x×]\s*", qty_text, re.I)
     count = int(mcount.group(1)) if mcount and int(mcount.group(1)) > 1 else 0
-    drink = re.search(r"waters|bottled-water|mineral-water", tags)
-    juice = not drink and re.search(DRINK_TAGS, tags)
+    # Drinkable: plain water, or a drink you'd have instead of water (not coffee, tea or alcohol).
+    sober = not (tag_set & NOT_DRINKING)
+    drink = sober and bool(tag_set & WATER_TAGS) and "en:flavoured-waters" not in tag_set
+    juice = sober and not drink and bool(tag_set & DRINK_TAGS)
+    liquid = is_liquid(qty_text, p.get("product_quantity_unit"))
+    booze = "en:alcoholic-beverages" in tag_set   # neither food for the stores nor drinking water
     full = (brand + " " if brand and brand.lower() not in name.lower() else "") + name
     out = {"code": code, "name": (full + (" (%s)" % qty_text if qty_text else "")).strip()[:120] or code,
            "brand": brand, "quantity": qty_text, "grams": grams, "kcal_per_unit": kcal,
-           "kcal_100g": kcal100, "category": "water" if drink else "drinks" if juice else "food", "count": count,
-           "litres_per_unit": round(grams / 1000.0, 2) if (drink or juice) and grams else 0,
+           "kcal_100g": kcal100, "category": "water" if drink else "drinks" if juice else "other" if booze else "food",
+           "count": count,
+           # Litres only for a drink sold by volume (a 1 kg bag of rice isn't 1 L of anything). Plain water by weight
+           # is the exception: 5000 g of water is 5 L, as the stores count it (item_litres).
+           "litres_per_unit": round(grams / 1000.0, 2) if grams and (drink or juice and liquid) else 0,
+           "pack_unit": "ml" if drink or liquid else "g",   # what "grams" is in, for the new item's pack size
            "unit": "pack" if count else pack_word(p, name, tags) or ("bottle" if drink or juice else "pack"),
-           "storage": "" if drink else storage_from(p, name, tags)}
+           "storage": "" if drink or booze else storage_from(p, name, tags)}
     if drink:
         out["kcal_per_unit"] = 0
     return out
@@ -1947,29 +2075,47 @@ def sweep_scan_photos():
         pass
 
 
-AI_READY = {"at": 0.0, "ok": False}
+AI_READY = {"at": 0.0, "ok": False, "busy": False}
+AI_READY_EVERY = 600   # seconds between asking Home Assistant whether it has an AI Task
+AI_READY_LOCK = threading.Lock()
 
 
 def ai_ready():
-    """Is an AI set up to use: an API key for the chosen provider, or an AI Task in Home Assistant (checked at
-    most every 10 minutes, as that asks Home Assistant)."""
+    """Is an AI set up to use: an API key for the chosen provider, or an AI Task in Home Assistant. Home Assistant is
+    asked in the background (at most every 10 minutes, and it can take seconds), so this answers at once with the
+    last answer, and /api/state never waits for it."""
     c = scan_ai_cfg()
     if c["provider"] != "ha":
         return bool(c["keys"].get(c["provider"]))
-    if time.time() - AI_READY["at"] > 600:
-        try:
-            AI_READY["ok"] = bool(ai_task_entities())
-        except Exception:
-            AI_READY["ok"] = False
-        AI_READY["at"] = time.time()
+    with AI_READY_LOCK:
+        due = not AI_READY["busy"] and time.time() - AI_READY["at"] > AI_READY_EVERY
+        if due:
+            AI_READY["busy"] = True
+    if due:
+        threading.Thread(target=refresh_ai_ready, name="ai-ready", daemon=True).start()
     return AI_READY["ok"]
 
 
-def ai_task_entities():
-    """Home Assistant's AI Task entities, the one chosen first, then Gemini, Claude, OpenAI."""
+def refresh_ai_ready():
+    """Ask Home Assistant for its AI Tasks. If it can't be asked (restarting, say), the last answer stands, so the AI
+    buttons don't vanish, and it's asked again in a minute."""
+    try:
+        AI_READY["ok"] = bool(ai_task_entities(strict=True))
+        AI_READY["at"] = time.time()
+    except Exception:
+        AI_READY["at"] = time.time() - AI_READY_EVERY + 60
+    finally:
+        AI_READY["busy"] = False
+
+
+def ai_task_entities(strict=False):
+    """Home Assistant's AI Task entities, the one chosen first, then Gemini, Claude, OpenAI. strict: raise if Home
+    Assistant can't be asked, rather than answer "none"."""
     if not HA_TOKEN:
         return []
     status, out = ha_request("GET", "/states", timeout=15)
+    if strict and (status != 200 or not isinstance(out, list)):
+        raise IOError("Home Assistant answered %s" % status)
     ents = [st["entity_id"] for st in out if isinstance(st, dict) and str(st.get("entity_id", "")).startswith("ai_task.")
             and st.get("state") != "unavailable"] if status == 200 and isinstance(out, list) else []
 
@@ -2162,12 +2308,16 @@ def parse_label_reply(text):
         open_days = number(d.get("open_days_typical"), 366)
         guessed.append("open_days")
     n = int(count) if count and count > 1 and count == int(count) else 0
-    drinkable = catg in WATER_CATS and grams
+    # Litres only for a drink sold by volume ("1 l", "6 x 330 ml"), not one sold by weight ("200 g" of instant coffee
+    # the AI called a drink). With no size printed, the "grams" of a drink are millilitres, as the prompt asks.
+    by_weight = bool(SIZE_UNIT_RE.search(size)) and not is_liquid(size)
+    drinkable = grams and (catg == "water" or catg == "drinks" and not by_weight)
     return {"code": "", "count": n,
             "name": (name + (" (%s)" % size if size and size.lower() not in name.lower() else "")).strip(),
             "brand": "", "quantity": size, "grams": grams, "kcal_100g": kcal100,
             "kcal_per_unit": kcal,
             "litres_per_unit": round(grams / 1000.0, 2) if drinkable else 0,
+            "pack_unit": "ml" if catg == "water" or (catg == "drinks" and not by_weight) or is_liquid(size) else "g",
             "open_days": int(round(open_days)) if open_days else 0,
             "category": catg, "unit": unit if re.fullmatch(r"[a-z]{2,12}", unit) else ("bottle" if catg in WATER_CATS else "pack"),
             "expiry": read_date_reply(d.get("best_before")) if d.get("best_before") else None, "from_ai": True,
@@ -2605,12 +2755,18 @@ REVIEW_PROMPT = (
     "cooking, hygiene, tools, comms, shelter, docs, pets, other}). No other text.\n\n")
 
 
+REVIEW_MAX_LINES = 300   # items sent to the AI at most
+
+
 def review_input():
+    """The household, and a line for each item in date (an opened pack counts until its "use within" date), for the
+    stores review. At most REVIEW_MAX_LINES lines."""
     st = get_settings()
     s_ = summary()
     lines = []
-    for it in all_items():
-        have = sum(b["qty"] for b in it["batches"] if not b["expiry"] or b["expiry"] >= dt.date.today().isoformat())
+    today = dt.date.today().isoformat()
+    for it in open_dated(all_items()):
+        have = sum(b["qty"] for b in it["batches"] if not b["expiry"] or b["expiry"] >= today)
         if have <= 0:
             continue
         bits = {"name": it["name"], "category": it["category"], "have": round(have, 2), "unit": it["unit"] or ""}
@@ -2624,6 +2780,7 @@ def review_input():
             bits["kept"] = {"ambient": "cupboard (ambient)", "chilled": "fridge (chilled)",
                             "frozen": "freezer (frozen)"}.get(it.get("storage") or "", "not recorded")
         lines.append(json.dumps(bits))
+    lines = lines[:REVIEW_MAX_LINES]
     head = {"adults": st["adults"], "children": st["children"], "pets": pets_count(st), "target_days": st["target_days"],
             "food_days": s_.get("food_days"), "water_days": s_.get("water_days"),
             "stored_water_litres": s_.get("water_litres"), "water_litres_needed_a_day": (st["adults"] + st["children"]) * st["water_per_person"] + pets_water(st)}
@@ -2631,24 +2788,32 @@ def review_input():
 
 
 def parse_review_reply(text):
+    """The AI's review as {summary, score, suggestions, wider}, or None. Anything of the wrong shape (a list where text
+    should be, a dict where a list should be) is left out, rather than failing the whole review."""
     m = re.search(r"\{.*\}", str(text or ""), re.S)
     try:
         d = json.loads(m.group(0)) if m else None
     except ValueError:
         d = None
-    if not isinstance(d, dict) or not str(d.get("summary") or "").strip():
+
+    def words(v, n):
+        return clean_text(v, n) if isinstance(v, str) else ""
+    if not isinstance(d, dict) or not words(d.get("summary"), 1500):
         return None
+    score = d.get("score")
     try:
-        score = max(1, min(5, int(d.get("score"))))
-    except (TypeError, ValueError):
+        score = max(1, min(5, int(float(score)))) if isinstance(score, (int, float, str)) and not isinstance(score, bool) else None
+    except (TypeError, ValueError, OverflowError):
         score = None
     sugg = []
-    for g in (d.get("suggestions") or [])[:6]:
-        if isinstance(g, dict) and str(g.get("add") or "").strip():
-            sugg.append({"add": clean_text(g.get("add"), 120), "why": clean_text(g.get("why"), 200),
-                         "category": g.get("category") if g.get("category") in CATEGORIES else "food"})
-    return {"summary": clean_text(d.get("summary"), 1500), "score": score, "suggestions": sugg,
-            "wider": clean_text(d.get("wider"), 400) if d.get("wider") else ""}
+    raw = d.get("suggestions")
+    for g in (raw if isinstance(raw, list) else [])[:6]:
+        if isinstance(g, dict) and words(g.get("add"), 120):
+            cat = g.get("category")
+            sugg.append({"add": words(g.get("add"), 120), "why": words(g.get("why"), 200),
+                         "category": cat if isinstance(cat, str) and cat in CATEGORIES else "food"})
+    return {"summary": words(d.get("summary"), 1500), "score": score, "suggestions": sugg,
+            "wider": words(d.get("wider"), 400)}
 
 
 @route("GET", "/api/ai/review")
@@ -2663,14 +2828,14 @@ def api_ai_review(body, query):
         head, lines = review_input()
     if not lines:
         raise ApiError(400, "There's nothing in the stores to review yet")
-    reply, ai = ai_ask(REVIEW_PROMPT + "Household: " + json.dumps(head) + "\nIn the stores:\n" + "\n".join(lines[:300]),
+    reply, ai = ai_ask(REVIEW_PROMPT + "Household: " + json.dumps(head) + "\nIn the stores:\n" + "\n".join(lines),
                        None, "Dads Army stores review", max_tokens=8000)   # a long list: plenty of room for the answer
     got = parse_review_reply(reply)
     if not got:
         print("Stores review: couldn't read the AI's answer (%d characters, ending %r)" % (len(reply or ""), str(reply or "")[-80:]),
               flush=True)
         raise ApiError(502, "The AI's answer couldn't be read (it may have been cut off). Try again.")
-    got.update(made_at=now_iso(), items=len(lines))
+    got.update(made_at=now_iso(), items=len(lines))   # what was sent (REVIEW_MAX_LINES at most)
     with tx() as db:
         set_setting_raw(db, "stock_review", got)
     return {"review": got, "ai": ai}
@@ -2777,7 +2942,7 @@ def api_scan_label(body, query):
     product = parse_label_reply(reply)
     if not product:
         raise ApiError(422, "Couldn't make out the product from that photo. Try the front of the pack, closer up.")
-    return {"product": product, "ai": ai}
+    return {"product": merge_label(product, known), "ai": ai}   # another photo: keeps what the earlier ones found
 
 
 @route("GET", "/api/scan/ai")
@@ -2823,6 +2988,7 @@ def api_scan_ai_put(body, query):
     with tx() as db:
         set_setting_raw(db, "scan_ai", raw)
         add_log("settings", "", "Scanning settings updated")
+    ai_ready()   # starts asking Home Assistant now, if that's the AI
     return api_scan_ai_get({}, {})
 
 
@@ -3815,6 +3981,8 @@ def api_restore(body, query):
         if not isinstance(it, dict):
             raise ApiError(400, "Backup file is damaged")
         data = clean_item(it)
+        if "ai_guessed" in it:   # backups from 1.13.0 on: what the AI estimated stays marked
+            data["ai_guessed"] = clean_guessed(it.get("ai_guessed"))
         data["_barcodes"] = []   # 1.13.0 on: codes, or {"code", "product"}; a damaged one is skipped
         for c in (it.get("barcodes") if isinstance(it.get("barcodes"), list) else [])[:50]:
             code = safe_barcode(c.get("code") if isinstance(c, dict) else c)
@@ -4164,6 +4332,15 @@ def ha_entities(s):
             "dates_read": ai["tasks"]["dates"], "labels_read": ai["tasks"]["labels"], "since": ai["since"]})
     except sqlite3.Error:
         pass
+    bl = brief_list()
+    if brief_cfg()["on"] and bl:
+        b = bl[-1]
+        put("sensor.dads_army_briefing", (b.get("headline") or "Daily briefing")[:250], "Dads Army briefing",
+            "mdi:newspaper-variant-outline", None, {
+                "briefing": b.get("text", ""), "day": b.get("day"), "made_at": b.get("made_at"),
+                "local": (b.get("levels") or {}).get("local"), "national": (b.get("levels") or {}).get("national"),
+                "global": (b.get("levels") or {}).get("global"), "sources": [x.get("url") for x in b.get("sources") or []]},
+            measurement=False)
     put("sensor.dads_army_food_days", s["food_days"], "Dads Army food", "mdi:food-drumstick", "days",
         {"goes_off_first_days": s["food_wasted_days"]})
     put("sensor.dads_army_water_days", s["water_days"], "Dads Army water", "mdi:water", "days")
@@ -5017,7 +5194,7 @@ UKHSA advises heating the rooms you use to at least 18°C. Below that, Dads Army
 
 ### The UK's own levels
 
-The national threat level, set by MI5's Joint Terrorism Analysis Centre, uses the same five names: LOW (an attack is highly unlikely), MODERATE (possible, but not likely), SUBSTANTIAL (likely), SEVERE (highly likely) and CRITICAL (highly likely in the near future). You can check the current national level on MI5's website. Dads Army doesn't read it.
+The national threat level, set by MI5's Joint Terrorism Analysis Centre, uses the same five names: LOW (an attack is highly unlikely), MODERATE (possible, but not likely), SUBSTANTIAL (likely), SEVERE (highly likely) and CRITICAL (highly likely in the near future). With warnings on, the current national level is in the wider picture (UK threat level, read from GOV.UK). It doesn't change the household level.
 
 ### Where the advice comes from
 
@@ -5522,6 +5699,59 @@ FEED_URLS = {
     "space": "https://services.swpc.noaa.gov/products/noaa-scales.json",
     "pound": "https://www.bankofengland.co.uk/boeapps/database/_iadb-fromshowcolumns.asp?csv.x=yes&Datefrom={start}"
              "&Dateto=now&SeriesCodes=XUDLUSS,XUDLERS,IUDBEDR&CSVF=TN&UsingCodes=Y&VPD=Y&VFD=N",
+    # More of the wider picture (1.15.0). The threat level as GOV.UK publishes it (MI5's own feed is behind a bot check).
+    "threat": "https://www.gov.uk/api/content/terrorism-national-emergency",
+    "cyber": "https://www.ncsc.gov.uk/api/1/services/v1/news-rss-feed.xml",
+    "travel": "https://www.gov.uk/foreign-travel-advice.atom",
+    "drought_search": "https://www.gov.uk/api/search.json?q=%22dry+weather+and+drought+in+England%22&count=20"
+                      "&fields=title,link,public_timestamp",
+    "govuk_content": "https://www.gov.uk/api/content",
+    "floodrisk": "https://check-for-flooding.service.gov.uk/",
+    "floodrisk_areas": "https://check-for-flooding.service.gov.uk/api/outlook.geojson",
+    "rain_stations": "https://environment.data.gov.uk/flood-monitoring/id/stations?parameter=rainfall&_limit=10000",
+    "rain": "https://environment.data.gov.uk/flood-monitoring/id/stations/{id}/readings?parameter=rainfall&since={since}"
+            "&_limit=2000",
+    "gw_stations": "https://environment.data.gov.uk/hydrology/id/stations?observedProperty=groundwaterLevel"
+                   "&status.label=Active&_limit=10000",
+    "gw": "https://environment.data.gov.uk/hydrology/id/measures/{id}/readings?{query}",
+    "ci_now": "https://api.carbonintensity.org.uk/intensity",
+    "ci_mix": "https://api.carbonintensity.org.uk/generation",
+    "frequency": "https://data.elexon.co.uk/bmrs/api/v1/system/frequency?from={start}&to={end}",
+    "margin": "https://data.elexon.co.uk/bmrs/api/v1/forecast/system/loss-of-load?from={start}&to={end}",
+    "margin_daily": "https://data.elexon.co.uk/bmrs/api/v1/forecast/margin/daily",
+    "dfs": "https://api.neso.energy/api/3/action/datastore_search_sql?",
+    "water": "https://utility.arcgis.com/usrsvcs/servers/c69af802939748e29f9d650a7dcde21a/rest/services/PUBLIC/"
+             "Aptumo_Contacts_PUBLIC/FeatureServer/0/query?where=1%3D1&outFields=JobGroup__c,JobType__c,"
+             "Region__c,ReportedDate__c&returnGeometry=true&outSR=4326&resultRecordCount=2000&f=json",
+    # The rest of the UK (1.15.0): regional providers, each asked only for homes it covers (see covers() and
+    # dno_covers()). Scotland's flood warnings and alerts (the two layers behind SEPA's Floodline map), river levels,
+    # rain gauges and the Scottish Flood Forecast; Wales' flood warnings and rain gauges; two more electricity
+    # networks; four more water companies. Each is the provider's whole list, picked through here.
+    "sepa_floods": "https://services-eu1.arcgis.com/jj6fR2HO7enbrICO/arcgis/rest/services/Flood_Warning_Areas_%28public%29"
+                   "_view/FeatureServer/0/query?where=severity+IS+NOT+NULL&outFields=fwa_name,local_authority,severity,"
+                   "message,startTime,updatedTime&returnGeometry=true&outSR=4326&geometryPrecision=5"
+                   "&maxAllowableOffset=0.0005&f=json",
+    "sepa_alerts": "https://services-eu1.arcgis.com/jj6fR2HO7enbrICO/arcgis/rest/services/Join_Features_to_Flood_Alert_"
+                   "Areas_2_view/FeatureServer/0/query?where=severity+IS+NOT+NULL&outFields=name,severity,message,"
+                   "startTime,updatedTime&returnGeometry=true&outSR=4326&geometryPrecision=5&maxAllowableOffset=0.0005&f=json",
+    "nrw_floods": "https://flood-warning.naturalresources.wales/?culture=en-GB",
+    "sepa_rivers": "https://webservices.sepa.org.uk/web.teal.waterlevels.api.wiskiLive/api/Stations",
+    "sepa_rain_stations": "https://timeseries.sepa.org.uk/KiWIS/KiWIS?service=kisters&type=queryServices&datasource=0"
+                          "&format=json&request=getTimeseriesList&parametertype_name=Precip&ts_name=Hour.Total"
+                          "&returnfields=station_no,station_name,station_latitude,station_longitude,ts_id",
+    "sepa_rain": "https://timeseries.sepa.org.uk/KiWIS/KiWIS?service=kisters&type=queryServices&datasource=0&format=json"
+                 "&request=getTimeseriesValues&ts_id={id}&period=P7D&returnfields=Timestamp,Value",
+    "nrw_rain_stations": "https://api.naturalresources.wales/telemetry/api/stations",
+    "nrw_rain_measures": "https://api.naturalresources.wales/telemetry/api/measures",
+    "nrw_rain": "https://api.naturalresources.wales/telemetry/api/readings?measureId={id}&start={start}&end={end}",
+    "sff": "https://scottishfloodforecast.sepa.org.uk/feed",
+    "power_enwl": "https://www.enwl.co.uk/api/power-outages/search?pageSize=500&pageNumber=1&includeCurrent=true"
+                  "&includeResolved=false&includeTodaysPlanned=true&includeFuturePlanned=false&includeCancelledPlanned=false",
+    "power_nie": "https://powercheck.nienetworks.co.uk/NIEPowerCheckerWebAPI/api/faults",
+    "water_yorkshire": "https://www.yorkshirewater.com/api/v1/ServiceEvents?include=presentation",
+    "water_southwest": "https://www.southwestwater.co.uk/api/rssfeed",
+    "water_bournemouth": "https://www.bournemouthwater.co.uk/api/rssfeed",
+    "water_ni": "https://www.niwater.com/whats-happening-in-your-area/current-service-updates",
     # Credits (1.12.0): only when someone taps "Check GitHub for new names".
     "credits": "https://raw.githubusercontent.com/parkerveese-cloud/dads-army/main/dadsarmy/CREDITS.md",
     "contributors": "https://api.github.com/repos/parkerveese-cloud/dads-army/contributors?per_page=100",
@@ -5533,29 +5763,45 @@ except ValueError:
 FEED_UA = "DadsArmy/%s (+https://github.com/parkerveese-cloud/dads-army)" % VERSION
 WARN_SOURCES = [  # key, what it is, on by default
     ("metoffice", "Met Office weather warnings", True),
-    ("floods", "Flood warnings (England)", True),
+    ("floods", "Flood warnings (England, Scotland and Wales)", True),
     ("govalerts", "UK Emergency Alerts", True),
     ("gdacs", "Disasters near the UK (GDACS)", True),
     ("fires", "Possible fires nearby (NASA satellites)", False),
     ("ukhsa", "UK Health Security Agency news", False),
     ("who", "WHO disease outbreak news", False),
     # Live information (1.12.0)
-    ("rivers", "River levels near you (England)", True),
+    ("rivers", "River levels near you (England and Scotland)", True),
     ("power", "Power cuts near you", True),
-    ("grid", "Electricity grid notices", True),
+    ("grid", "Electricity grid notices (Great Britain)", True),
     ("gas", "Gas storage", True),
     ("air", "Air quality near you", True),
     ("space", "Space weather", True),
     ("pound", "The pound and Bank Rate", True),
+    # More of the wider picture (1.15.0)
+    ("threat", "UK terrorism threat level", True),
+    ("cyber", "Cyber security alerts (NCSC)", True),
+    ("travel", "Foreign travel advice changes (FCDO)", True),
+    ("drought", "Drought, reservoirs and hosepipe bans (England)", True),
+    ("water", "Water supply problems near you (six water companies)", True),
+    ("floodrisk", "Flood risk forecast (England and Scotland)", True),
+    ("rain", "Rainfall near you (England, Scotland and Wales)", True),
+    ("ground", "Groundwater near you (England)", False),
+    ("gridnow", "The grid now: carbon and frequency (Great Britain)", False),
+    ("gridstress", "Electricity margin and demand flexibility (Great Britain)", True),
 ]
 WARN_SOURCE_NAMES = {"metoffice": "Met Office", "floods": "Environment Agency", "govalerts": "GOV.UK Emergency Alerts",
                      "gdacs": "GDACS", "fires": "NASA FIRMS", "ukhsa": "UKHSA", "who": "WHO",
                      "rivers": "Environment Agency", "power": "the power networks", "grid": "NESO / Elexon",
-                     "gas": "National Gas", "air": "Defra UK-AIR", "space": "NOAA", "pound": "Bank of England"}
+                     "gas": "National Gas", "air": "Defra UK-AIR", "space": "NOAA", "pound": "Bank of England",
+                     "threat": "GOV.UK", "cyber": "NCSC", "travel": "FCDO", "drought": "Environment Agency", "water": "your water company",
+                     "floodrisk": "Flood Forecasting Centre", "rain": "Environment Agency", "ground": "Environment Agency",
+                     "gridnow": "NESO / Elexon", "gridstress": "Elexon / NESO"}
+# A warning from a regional provider says who it's from ("by": "SEPA"), which beats these.
 MET_REGIONS = [  # code, name, rough middle (to guess yours from Home Assistant's location)
     ("os", "Orkney & Shetland", 59.6, -2.0), ("he", "Highlands & Eilean Siar", 57.5, -5.0),
     ("gr", "Grampian", 57.2, -2.8), ("st", "Strathclyde", 55.8, -4.8),
-    ("ta", "Central, Tayside & Fife", 56.5, -3.6), ("dg", "SW Scotland, Lothian Borders", 55.4, -3.2),
+    # The feed's own name for it (it's in each warning's title): a different one never matches.
+    ("ta", "Central, Tayside & Fife", 56.5, -3.6), ("dg", "Dumfries, Galloway, Lothian & Borders", 55.4, -3.2),
     ("ni", "Northern Ireland", 54.6, -6.7), ("wl", "Wales", 52.3, -3.7),
     ("nw", "North West England", 54.0, -2.7), ("ne", "North East England", 54.9, -1.8),
     ("yh", "Yorkshire & Humber", 53.9, -1.2), ("wm", "West Midlands", 52.5, -2.1),
@@ -5564,7 +5810,8 @@ MET_REGIONS = [  # code, name, rough middle (to guess yours from Home Assistant'
 ]
 MET_NAME = {c: n for c, n, _, _ in MET_REGIONS}
 WARN_DEFAULTS = {"on": False, "sources": {k: d for k, _, d in WARN_SOURCES}, "region": "", "lat": None, "lon": None,
-                 "flood_km": 20, "gdacs_km": 1000, "fire_km": 10}
+                 "flood_km": 20, "gdacs_km": 1000, "fire_km": 10,
+                 "ea_area": "", "water_co": ""}   # 1.15.0: for drought status and hosepipe bans
 WARN_EVERY = 15 * 60      # seconds between checks
 FLOOD_LOOKUPS = 80        # flood areas to look up per check (they're kept once found)
 WARN_STATE = {"items": [], "news": [], "sources": {}, "checked_at": None, "region": "", "seen": {}, "live": {}}
@@ -5601,6 +5848,10 @@ def warn_cfg():
         v = raw.get(k)
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             cfg[k] = int(min(hi, max(lo, v)))
+    if raw.get("ea_area") in EA_AREAS:
+        cfg["ea_area"] = raw["ea_area"]
+    if raw.get("water_co") in WATER_COS:
+        cfg["water_co"] = raw["water_co"]
     return cfg
 
 
@@ -5631,10 +5882,220 @@ def refresh_ha_home():
         pass
 
 
+# -- Which nation home is in, and which electricity network (1.15.0) ------------------------------------
+# For the regional providers: SEPA in Scotland, Natural Resources Wales, the electricity networks and water companies
+# each only cover part of the UK. Rough borders: a few km out near one, which doesn't matter, as covers() reaches over
+# it (a home just in England still gets Scotland's rain gauges if they're nearer).
+SCOTLAND_BORDER = [(-7.0, 54.6), (-4.0, 54.6), (-3.6, 54.83), (-3.45, 54.92), (-3.05, 55.0), (-2.85, 55.03),
+                   (-2.6, 55.17), (-2.25, 55.35), (-2.2, 55.45), (-2.03, 55.81), (0.0, 55.81)]   # (lon, lat), west to east
+WALES_BORDER = [(51.35, -2.9), (51.6, -2.65), (51.82, -2.65), (51.95, -2.95), (52.07, -3.05), (52.2, -3.15),
+                (52.35, -2.95), (52.55, -3.0), (52.75, -3.05), (52.9, -3.1), (52.95, -2.75), (53.05, -2.75),
+                (53.2, -2.95), (53.25, -3.05), (53.35, -3.22), (53.5, -3.28)]   # (lat, lon), south to north; Wales is west
+NI_OUTLINE = [[(-6.0, 55.35), (-6.95, 55.25), (-7.1, 55.1), (-7.3, 55.05), (-7.4, 54.95), (-7.5, 54.82),
+               (-7.75, 54.7), (-7.9, 54.6), (-8.2, 54.47), (-7.85, 54.3), (-7.6, 54.15), (-7.2, 54.2), (-7.0, 54.38),
+               (-6.85, 54.3), (-6.65, 54.07), (-6.35, 54.05), (-6.1, 54.0), (-5.4, 54.0),
+               (-5.4, 54.95)]]   # (lon, lat). The north-east corner cuts back west of the Mull of Kintyre (Scotland).
+GB = ("england", "wales", "scotland")
+
+
+def _interp(line, x):
+    for (x1, y1), (x2, y2) in zip(line, line[1:]):
+        if x1 <= x <= x2:
+            return y1 + (y2 - y1) * ((x - x1) / (x2 - x1) if x2 != x1 else 0)
+    return line[0][1] if x < line[0][0] else line[-1][1]
+
+
+def in_rings(rings, lat, lon):
+    """Is the point inside any of these outlines (rings of [lon, lat] points)?"""
+    inside = False
+    for ring in rings or []:
+        j = len(ring) - 1
+        for i in range(len(ring)):
+            (xi, yi), (xj, yj) = ring[i][:2], ring[j][:2]
+            if (yi > lat) != (yj > lat) and lon < (xj - xi) * (lat - yi) / ((yj - yi) or 1e-12) + xi:
+                inside = not inside
+            j = i
+    return inside
+
+
+def uk_nation(lat, lon):
+    """'england', 'wales', 'scotland', 'northern ireland', or '' (outside the UK, or the Isle of Man)."""
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return ""
+    if not (49.8 <= lat <= 61.0 and -8.3 <= lon <= 2.0):
+        return ""
+    if in_rings(NI_OUTLINE, lat, lon):
+        return "northern ireland"
+    if lat >= _interp(SCOTLAND_BORDER, lon) and (lon > -6.5 or lat > 55.6):
+        return "scotland"
+    if lon < -5.8 and lat > 51.3 or 54.0 < lat < 54.45 and -4.9 < lon < -4.3:
+        return ""   # Ireland, or the Isle of Man
+    if 51.35 < lat < 53.5 and lon < _interp(WALES_BORDER, lat):
+        return "wales"
+    return "england"
+
+
+def home_nation(home):
+    return uk_nation(home["lat"], home["lon"]) if home else ""
+
+
+def _offset(lat, lon, km, bearing):
+    """The point km away on a compass bearing (flat-earth: fine for tens of km)."""
+    b = math.radians(bearing)
+    return lat + km * math.cos(b) / 111.2, lon + km * math.sin(b) / (111.2 * max(0.2, math.cos(math.radians(lat))))
+
+
+def covers(home, nations, km=0):
+    """Does a feed for these nations cover home: is home in one of them, or within km of one?"""
+    if not home:
+        return False
+    if home_nation(home) in nations:
+        return True
+    return bool(km) and any(uk_nation(*_offset(home["lat"], home["lon"], d, b)) in nations
+                            for d in (km / 2.0, km) for b in range(0, 360, 45))
+
+
+# Which electricity network serves home: Great Britain's 14 distribution licence areas (NESO's boundaries,
+# simplified: see places/README.md), and Northern Ireland's one network. The ids are the MPAN distributor ids.
+DNO_FILE = os.environ.get("DADSARMY_DNO_AREAS", os.path.join(APP_DIR, "places", "dno_areas.json.gz"))
+DNO_NAMES = {10: "UK Power Networks", 12: "UK Power Networks", 19: "UK Power Networks", 11: "National Grid",
+             14: "National Grid", 21: "National Grid", 22: "National Grid", 13: "SP Energy Networks",
+             18: "SP Energy Networks", 15: "Northern Powergrid", 23: "Northern Powergrid", 16: "Electricity North West",
+             17: "SSEN", 20: "SSEN", "ni": "NIE Networks"}
+DNO_AREAS = []
+
+
+def dno_areas():
+    """[{id, rings, box}] from the bundled file, read once. Empty if it's missing."""
+    if not DNO_AREAS:
+        try:
+            with gzip.open(DNO_FILE, "rt", encoding="utf-8") as f:
+                for a in json.load(f)["areas"]:
+                    pts = [p for r in a["rings"] for p in r]
+                    a["box"] = (min(p[1] for p in pts), max(p[1] for p in pts), min(p[0] for p in pts), max(p[0] for p in pts))
+                    DNO_AREAS.append(a)
+        except (OSError, ValueError, KeyError):
+            traceback.print_exc()
+    return DNO_AREAS
+
+
+def dno_area(lat, lon):
+    """Home's licence area: 10 to 23 in Great Britain, "ni" in Northern Ireland, None if it can't be told."""
+    if uk_nation(lat, lon) == "northern ireland":
+        return "ni"
+    areas = dno_areas()
+    for a in areas:
+        s_, n_, w_, e_ = a["box"]
+        if s_ <= lat <= n_ and w_ <= lon <= e_ and in_rings(a["rings"], lat, lon):
+            return a["id"]
+    best, best_km = None, 15.0   # just off the simplified coast, or a small island: the nearest area
+    for a in areas:
+        s_, n_, w_, e_ = a["box"]
+        if s_ - 0.2 <= lat <= n_ + 0.2 and w_ - 0.3 <= lon <= e_ + 0.3:
+            for r in a["rings"]:
+                for p in r:
+                    k = km_between(lat, lon, p[1], p[0])
+                    if k < best_km:
+                        best, best_km = a["id"], k
+    return best
+
+
+def dno_covers(home, areas, km=0):
+    """Is home in one of these licence areas, or within km of one (a power cut over the boundary is still near)?"""
+    if not home:
+        return False
+    if dno_area(home["lat"], home["lon"]) in areas:
+        return True
+    return bool(km) and any(dno_area(*_offset(home["lat"], home["lon"], d, b)) in areas
+                            for d in (km / 2.0, km) for b in range(0, 360, 45))
+
+
+def bng_to_latlon(e, n):
+    """An Ordnance Survey National Grid easting and northing (as Natural Resources Wales gives them) to (lat, lon),
+    to about 100 m: no datum shift, which is plenty to say how far away something is."""
+    return _tm_to_latlon(e, n, 6377563.396, 6356256.909, 0.9996012717, 49, -2, 400000.0, -100000.0)
+
+
+def ig_to_latlon(e, n):
+    """An Irish Grid easting and northing (as NIE Networks gives them) to (lat, lon), to about 100 m."""
+    return _tm_to_latlon(e, n, 6377340.189, 6356034.447, 1.000035, 53.5, -8, 200000.0, 250000.0)
+
+
+def _tm_to_latlon(e, n, a, b, f0, lat0_deg, lon0_deg, e0, n0):
+    """Inverse Transverse Mercator (the Ordnance Survey's formulas)."""
+    lat0, lon0 = math.radians(lat0_deg), math.radians(lon0_deg)
+    e2, nn = 1 - (b * b) / (a * a), (a - b) / (a + b)
+    lat, m = lat0, 0.0
+    for _ in range(20):
+        lat += (n - n0 - m) / (a * f0)
+        d, s_ = lat - lat0, lat + lat0
+        m = b * f0 * ((1 + nn + 1.25 * nn ** 2 + 1.25 * nn ** 3) * d
+                      - (3 * nn + 3 * nn ** 2 + 2.625 * nn ** 3) * math.sin(d) * math.cos(s_)
+                      + (1.875 * nn ** 2 + 1.875 * nn ** 3) * math.sin(2 * d) * math.cos(2 * s_)
+                      - (35 / 24.0) * nn ** 3 * math.sin(3 * d) * math.cos(3 * s_))
+        if abs(n - n0 - m) < 0.001:
+            break
+    sl, cl, tl = math.sin(lat), math.cos(lat), math.tan(lat)
+    nu = a * f0 / math.sqrt(1 - e2 * sl * sl)
+    rho = a * f0 * (1 - e2) / (1 - e2 * sl * sl) ** 1.5
+    eta2 = nu / rho - 1
+    de = e - e0
+    lat_out = (lat - tl / (2 * rho * nu) * de ** 2
+               + tl / (24 * rho * nu ** 3) * (5 + 3 * tl ** 2 + eta2 - 9 * tl ** 2 * eta2) * de ** 4
+               - tl / (720 * rho * nu ** 5) * (61 + 90 * tl ** 2 + 45 * tl ** 4) * de ** 6)
+    lon_out = (lon0 + de / (cl * nu) - (nu / rho + 2 * tl ** 2) / (cl * 6 * nu ** 3) * de ** 3
+               + (5 + 28 * tl ** 2 + 24 * tl ** 4) / (cl * 120 * nu ** 5) * de ** 5
+               - (61 + 662 * tl ** 2 + 1320 * tl ** 4 + 720 * tl ** 6) / (cl * 5040 * nu ** 7) * de ** 7)
+    return round(math.degrees(lat_out), 5), round(math.degrees(lon_out), 5)
+
+
+def _last_sunday(year, month):
+    d = dt.date(year, month + 1, 1) - dt.timedelta(days=1) if month < 12 else dt.date(year, 12, 31)
+    return d - dt.timedelta(days=(d.weekday() + 1) % 7)
+
+
+def uk_local_to_utc(s):
+    """A feed's time as an aware UTC datetime, or None. With no zone ('2026-07-01T10:00:00') it's UK local time, as the
+    water companies and Natural Resources Wales give it; one that says its zone keeps to it; a number is epoch seconds
+    or milliseconds, as ArcGIS (SEPA's flood map) gives dates."""
+    if isinstance(s, bool) or s is None:
+        return None
+    text = str(s).strip()
+    if isinstance(s, (int, float)) or re.match(r"^\d{10,13}(\.\d+)?$", text):
+        try:
+            v = float(s)
+            return dt.datetime.fromtimestamp(v / 1000.0 if v > 1e11 else v, dt.timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
+    try:
+        t = dt.datetime.fromisoformat(re.sub(r"(?i)z$", "+00:00", text))
+    except ValueError:
+        try:
+            t = dt.datetime.fromisoformat(text[:19])
+        except ValueError:
+            return None
+    if t.tzinfo is not None:
+        return t.astimezone(dt.timezone.utc)
+    start = dt.datetime.combine(_last_sunday(t.year, 3), dt.time(1))    # clocks go forward at 01:00 GMT
+    end = dt.datetime.combine(_last_sunday(t.year, 10), dt.time(1))     # and back at 02:00 BST
+    bst = start + dt.timedelta(hours=1) <= t < end + dt.timedelta(hours=1)
+    return (t - dt.timedelta(hours=1 if bst else 0)).replace(tzinfo=dt.timezone.utc)
+
+
+MET_NATIONS = {"wales": ("wl",), "northern ireland": ("ni",), "scotland": ("os", "he", "gr", "st", "ta", "dg"),
+               "england": ("nw", "ne", "yh", "wm", "em", "ee", "sw", "se")}
+
+
 def guess_region(loc):
+    """The Met Office warning region for home: the nearest middle within home's own nation (Cardiff is Wales, not
+    the South West, however near Bristol is)."""
     if not loc:
         return ""
-    return min(MET_REGIONS, key=lambda r: km_between(loc["lat"], loc["lon"], r[2], r[3]))[0]
+    codes = MET_NATIONS.get(home_nation(loc))
+    pool = [r for r in MET_REGIONS if not codes or r[0] in codes]
+    return min(pool, key=lambda r: km_between(loc["lat"], loc["lon"], r[2], r[3]))[0]
 
 
 def http_get(url, timeout=20, limit=8 * 1024 * 1024):
@@ -5751,8 +6212,166 @@ def flood_centre(nid):
     return [float(it["lat"]), float(it["long"])]
 
 
+def ea_floods(home, km, mem):
+    """England's flood warnings within km of home: look up where each flood area is (once), then keep the near ones."""
+    areas = mem["areas"]
+    out, looked = [], 0
+    for r in parse_floods(http_get(FEED_URLS["floods"])):
+        centre = areas.get(r["area_id"])
+        if centre is None:
+            if looked >= FLOOD_LOOKUPS:
+                continue
+            looked += 1
+            try:
+                centre = areas[r["area_id"]] = flood_centre(r["area_id"])
+            except Exception:
+                continue
+        d = km_between(home["lat"], home["lon"], centre[0], centre[1])
+        if d <= km:
+            r["distance_km"] = int(round(d))
+            r["lat"], r["lon"] = round(centre[0], 4), round(centre[1], 4)   # so Places can steer away from it
+            out.append(r)
+    return out
+
+
+# Scotland's and Wales' flood warnings (1.15.0), beside England's. SEPA's are the two layers behind its Floodline map
+# (warning areas, and the bigger alert areas); Natural Resources Wales' are the data in its flood warning page. Neither
+# is an official data feed, so either could change: then that provider fails, not the others.
+FLOOD_WORDS = {3: "Severe flood warning", 2: "Flood warning", 1: "Flood alert"}
+
+
+def flood_severity(sev):
+    """SEPA's or Natural Resources Wales' severity (1 to 3, or the words) as Dads Army's: 3 severe flood warning,
+    2 flood warning, 1 flood alert. None if it's no longer in force."""
+    t = str(sev if sev is not None else "").strip().lower()
+    if not t or "no longer" in t or "removed" in t or "expired" in t or t == "4":
+        return None
+    if t == "1" or "severe" in t:
+        return 3
+    if t == "2" or "warning" in t:
+        return 2
+    return 1   # "3", a flood alert, or something new: worth showing
+
+
+def _flood(by, sev, name, text, area, issued, url, d, lat, lon):
+    return {"id": "flood:%s:%d:%s" % (by, sev, name[:120]), "source": "floods", "kind": "flood", "severity": sev,
+            "level": FLOOD_WORDS[sev], "title": "%s: %s" % (FLOOD_WORDS[sev], name), "text": text, "area": area,
+            "when": "", "url": url, "issued": iso_utc(issued), "distance_km": int(round(d)), "lat": round(lat, 4),
+            "lon": round(lon, 4), "by": by}
+
+
+def parse_sepa_floods(data, home, km, name_field):
+    """The warnings (or alerts) in force on one of SEPA's Floodline layers whose area takes in home, or comes
+    within km of it."""
+    doc = _json(data)
+    if not isinstance(doc, dict) or doc.get("error") or not isinstance(doc.get("features") or [], list):
+        raise ValueError("SEPA's flood map has changed")
+    out = []
+    for f in doc.get("features") or []:
+        a = f.get("attributes") if isinstance(f, dict) and isinstance(f.get("attributes"), dict) else {}
+        g = f.get("geometry") if isinstance(f, dict) and isinstance(f.get("geometry"), dict) else {}
+        sev = flood_severity(a.get("severity"))
+        if not sev:
+            continue
+        rings = []
+        for r in g.get("rings") if isinstance(g.get("rings"), list) else []:
+            pts = [[_f0(p[0]), _f0(p[1])] for p in r if isinstance(p, list) and len(p) >= 2] if isinstance(r, list) else []
+            pts = [p for p in pts if p[0] is not None and p[1] is not None]
+            if len(pts) >= 4:
+                rings.append(pts)
+        pts = [p for r in rings for p in r]
+        if not pts:
+            continue
+        inside = in_rings(rings, home["lat"], home["lon"])
+        d = 0.0 if inside else min(km_between(home["lat"], home["lon"], p[1], p[0]) for p in pts)
+        if d > km:
+            continue
+        name = plain(str(a.get(name_field) or ""), 120) or "Scotland"
+        out.append(_flood("SEPA", sev, name, plain(str(a.get("message") or ""), 1500),
+                          plain(str(a.get("local_authority") or ""), 120) or "Scotland",
+                          uk_local_to_utc(a.get("updatedTime") or a.get("startTime")),
+                          "https://floodline.sepa.org.uk/", d,
+                          sum(p[1] for p in pts) / len(pts), sum(p[0] for p in pts) / len(pts)))
+    return out
+
+
+def sepa_floods(home, km, mem):
+    """Scotland's flood warnings and alerts: both of SEPA's lists. One failing leaves the other; both, and it's failed."""
+    out, errors = [], []
+    for key, name_field in (("sepa_floods", "fwa_name"), ("sepa_alerts", "name")):
+        try:
+            out += parse_sepa_floods(http_get(FEED_URLS[key], timeout=30), home, km, name_field)
+        except Exception as e:
+            errors.append(e)
+    if len(errors) == 2:
+        raise errors[0]
+    return out
+
+
+def parse_nrw_floods(data, home, km):
+    """Flood alerts and warnings in force in Wales within km of home, from the data in Natural Resources Wales' flood
+    warning page."""
+    page = data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data)
+    i = page.find("Landing.Page.setData(")
+    j = page.find("{", i) if i >= 0 else -1
+    if j < 0:
+        raise ValueError("Natural Resources Wales' flood warning page has changed")
+    doc, _ = json.JSONDecoder().raw_decode(page[j:])
+    out = []
+    for m in doc.get("messages") if isinstance(doc, dict) and isinstance(doc.get("messages"), list) else []:
+        if not isinstance(m, dict) or m.get("active") is False:
+            continue
+        sev = flood_severity(m.get("severity"))
+        pt = m.get("point") if isinstance(m.get("point"), dict) else {}
+        if not sev or _f0(pt.get("x")) is None or _f0(pt.get("y")) is None:
+            continue
+        lat, lon = bng_to_latlon(_f0(pt["x"]), _f0(pt["y"]))
+        d = km_between(home["lat"], home["lon"], lat, lon)
+        if d > km:
+            continue
+        words = lambda v: v.get("english") if isinstance(v, dict) else v   # noqa: E731   ({"english", "welsh"})
+        uri = str(m.get("uri") or "")
+        out.append(_flood("Natural Resources Wales", sev, plain(str(words(m.get("name")) or ""), 120) or "Wales",
+                          plain(str(words(m.get("description")) or ""), 1500), "Wales",
+                          uk_local_to_utc(m.get("updated") or m.get("issued")),
+                          ("https://flood-warning.naturalresources.wales" + uri) if re.match(r"^/[A-Za-z0-9/_-]*$", uri)
+                          else "https://flood-warning.naturalresources.wales/", d, lat, lon))
+    return out
+
+
+def nrw_floods(home, km, mem):
+    return parse_nrw_floods(http_get(FEED_URLS["nrw_floods"], timeout=30), home, km)
+
+
+FLOOD_PROVIDERS = [   # who, the nation it covers, its warnings within km of home
+    ("Environment Agency", ("england",), ea_floods),
+    ("SEPA", ("scotland",), sepa_floods),
+    ("Natural Resources Wales", ("wales",), nrw_floods),
+]
+
+
+def fetch_floods(cfg, home, mem):
+    """Flood warnings near home, from each provider whose nation home is in, or within the flood distance of. If home's
+    own nation's provider fails, the source has failed (its last warnings stay on show); a neighbour's doesn't."""
+    km, nation, out = cfg["flood_km"], home_nation(home), []
+    for name, nations, fn in FLOOD_PROVIDERS:
+        if not covers(home, nations, km):
+            continue
+        try:
+            out += fn(home, km, mem)
+        except Exception as e:
+            if nation in nations:
+                raise
+            print("Floods: couldn't check %s's warnings (%s)" % (name, why_failed(e)), flush=True)
+    return out
+
+
+GDACS_VOLCANO_KM = 2000   # ash from a volcano this far away can still close UK airports
+
+
 def parse_gdacs(data, home, km):
-    """Orange and red disaster alerts in force within km of home."""
+    """Orange and red disaster alerts in force within km of home, and volcanoes within 2,000 km whatever km is (so the
+    alert level's volcano rule can see them)."""
     out = []
     for it in parse_xml(data).iter("item"):
         if (it.findtext(GDACS + "iscurrent") or "").strip().lower() != "true":
@@ -5765,10 +6384,12 @@ def parse_gdacs(data, home, km):
         except ValueError:
             continue
         d = km_between(home["lat"], home["lon"], lat, lon)
-        if d > km:
+        event = (it.findtext(GDACS + "eventtype") or "").strip().upper()   # EQ, TC, FL, VO, DR, WF
+        if d > (max(km, GDACS_VOLCANO_KM) if event == "VO" else km):
             continue
         out.append({"id": "gdacs:" + (it.findtext("guid") or it.findtext("link") or "")[:200], "source": "gdacs",
                     "kind": "disaster", "severity": GDACS_LEVEL[lvl], "level": lvl.capitalize() + " alert",
+                    "event": event,
                     "title": plain(it.findtext("title"), 300), "text": plain(it.findtext("description"), 1500),
                     "area": plain(it.findtext(GDACS + "country"), 120), "distance_km": int(round(d)), "when": "",
                     "url": safe_url(it.findtext("link")), "issued": iso_utc(parse_when(it.findtext("pubDate")))})
@@ -5779,10 +6400,11 @@ ALERT_STAMP = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}) (BST|GMT|UTC)\]")
 
 
 def parse_govalerts(data, now):
-    """Emergency Alerts still being sent, or that stopped in the last 12 hours."""
+    """Emergency Alerts still being sent, or that stopped in the last 12 hours. "area" is the whole list of areas (a
+    storm's can run to hundreds of characters), as that's what's matched against home; the title is cut short."""
     out = []
     for e in parse_xml(data).iter(ATOM + "entry"):
-        summ = plain(e.findtext(ATOM + "summary"), 600)
+        summ = plain(e.findtext(ATOM + "summary"), 4000)
         stamps = [dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M").replace(
             tzinfo=dt.timezone(dt.timedelta(hours=1 if m.group(2) == "BST" else 0))) for m in ALERT_STAMP.finditer(summ)]
         sent = stamps[0] if stamps else parse_when(e.findtext(ATOM + "published"))
@@ -5794,14 +6416,15 @@ def parse_govalerts(data, now):
         text = plain(" ".join(content.itertext()), 1500) if content is not None else ""
         live = stopped is None or stopped > now
         test = bool(re.search(r"\btest(ing)?\b", text, re.I))
-        area = plain(e.findtext(ATOM + "title"), 200)
+        area = plain(e.findtext(ATOM + "title"), 2000)
+        short = area if len(area) <= 200 else area[:200].rsplit(",", 1)[0] + " and more"
         link = e.find(ATOM + "link")
         # "Alert area: X. Sent: 5:00pm (GMT) on ... [2026-01-08 17:00 GMT]. Stopped: ..." -> "Sent: 5:00pm (GMT) on .... Stopped: ..."
         when = re.sub(r"^Alert area:.*?\.\s*(?=Sent)", "", re.sub(r"\s*\[[^\]]*\]", "", summ)).strip()
         out.append({"id": "govalert:" + (e.findtext(ATOM + "id") or summ)[:200], "source": "govalerts", "kind": "alert",
                     "severity": 3 if live and not test else 1,
                     "level": "Test" if test else "Emergency Alert" if live else "Ended",
-                    "title": "Emergency Alert: " + area, "text": text, "area": area, "when": when,
+                    "title": "Emergency Alert: " + short, "text": text, "area": area, "when": when,
                     "url": safe_url(link.get("href") if link is not None else "") or "https://www.gov.uk/alerts",
                     "issued": iso_utc(sent)})
     return out
@@ -6263,19 +6886,39 @@ def fires_near(home, km, hist, now, ignore=()):
 # (all of England's rivers, every power cut a network has): nothing about you is sent, and Dads Army
 # picks out what's near home itself. Each turns into a reading for the app and, when something's
 # up, a warning. Trend warnings ("emptying faster than last year") come from the feeds' own history.
-LIVE_KEYS = ("rivers", "power", "grid", "gas", "air", "space", "pound")
+LIVE_KEYS = ("rivers", "power", "grid", "gas", "air", "space", "pound",
+             "threat", "cyber", "travel", "drought", "water", "floodrisk", "rain", "ground", "gridnow", "gridstress")
 LIVE_EVERY = {"rivers": 14 * 60, "power": 14 * 60, "grid": 14 * 60, "gas": 3 * 3600, "air": 55 * 60,
-              "space": 29 * 60, "pound": 6 * 3600}     # seconds between fetches: no more often than they change
+              "space": 29 * 60, "pound": 6 * 3600,     # seconds between fetches: no more often than they change
+              "threat": 3 * 3600, "cyber": 3 * 3600, "travel": 3 * 3600, "drought": 12 * 3600, "water": 14 * 60, "floodrisk": 3 * 3600,
+              "rain": 55 * 60, "ground": 24 * 3600, "gridnow": 14 * 60, "gridstress": 55 * 60}
 LIVE_CREDIT = {
-    "rivers": "Environment Agency flood and river level data from the real-time data API (Beta), under the Open "
-              "Government Licence",
+    "rivers": "Environment Agency flood and river level data from the real-time data API (Beta), and SEPA's water "
+              "levels in Scotland, under the Open Government Licence",
     "power": "Live power cut data from UK Power Networks, National Grid Electricity Distribution, SSEN and Northern "
-             "Powergrid, under their open data licences",
+             "Powergrid, under their open data licences, and from Electricity North West's and NIE Networks' power "
+             "cut maps",
     "grid": "System warnings from Elexon's BMRS (Insights), issued by NESO",
     "gas": "GB gas storage from the National Gas data portal",
     "air": "Daily Air Quality Index from Defra's UK-AIR, under the Open Government Licence",
     "space": "Space weather scales from NOAA's Space Weather Prediction Center",
     "pound": "Exchange rates and Bank Rate from the Bank of England database, under the Open Government Licence",
+    "threat": "The UK threat level (set by the Joint Terrorism Analysis Centre and MI5) as GOV.UK publishes it, under the "
+              "Open Government Licence",
+    "cyber": "News from the National Cyber Security Centre, under the Open Government Licence",
+    "travel": "Foreign travel advice from the FCDO on GOV.UK, under the Open Government Licence",
+    "drought": "The Environment Agency's weekly dry weather and drought report on GOV.UK, under the Open Government "
+               "Licence",
+    "water": "Reports from your water company's public 'in your area' map or page (not an official feed)",
+    "floodrisk": "The Flood Forecasting Centre's five-day flood risk outlook (Environment Agency and Met Office), from "
+                 "GOV.UK's Check for flooding, under the Open Government Licence; in Scotland, the Scottish Flood Forecast "
+                 "(SEPA and the Met Office)",
+    "rain": "Rain gauges from the Environment Agency (real-time data API, Beta), SEPA and Natural Resources Wales, under "
+            "the Open Government Licence",
+    "ground": "Environment Agency groundwater levels from the Hydrology API, under the Open Government Licence",
+    "gridnow": "Carbon intensity from NESO's Carbon Intensity API (CC BY 4.0) and system frequency from Elexon's BMRS",
+    "gridstress": "Margin forecasts from Elexon's BMRS (Insights) and Demand Flexibility Service events from the NESO "
+                  "Data Portal",
 }
 RIVER_KM = 10          # rivers this close count as near home
 RIVER_KEEP_KM = 30     # station details kept for this far, so a small move of home doesn't need a refetch
@@ -6369,6 +7012,42 @@ def parse_river_readings(data):
     return out
 
 
+def parse_sepa_rivers(data, home):
+    """Scotland's river gauges within RIVER_KEEP_KM of home (SEPA's water levels list, readings and all): (stations,
+    {measure: (value, when)}) as for England. SEPA's own usual range is between the median yearly low and the median
+    yearly high, so "above its normal range" is over the usual yearly peak; the highest on record stands in for the
+    highest in recent years. Tide gauges are left out. SEPA's times are GMT all year."""
+    rows = _json(data)
+    if not isinstance(rows, list):
+        raise ValueError("SEPA's water levels have changed")
+    stations, levels = [], {}
+    for s in rows:
+        if not isinstance(s, dict) or not s.get("station_no"):
+            continue
+        lat, lon = _f0(s.get("station_latitude")), _f0(s.get("station_longitude"))
+        low, high = _f0(s.get("sepa_median_annual_minimum_level")), _f0(s.get("sepa_median_annual_maximum_level"))
+        if lat is None or lon is None or low is None or high is None or high <= low:
+            continue
+        if re.search(r"tid(e|al)", str(s.get("station_name") or ""), re.I) or \
+                re.search(r"firth|north sea|coastal", str(s.get("river_name") or ""), re.I):
+            continue
+        d = km_between(home["lat"], home["lon"], lat, lon)
+        if d > RIVER_KEEP_KM:
+            continue
+        no = re.sub(r"[^\w-]", "", str(s["station_no"]))[:20]
+        sid = "sepa-" + no
+        stations.append({"id": sid, "name": plain(str(s.get("station_name") or ""), 80),
+                         "river": plain(str(s.get("river_name") or ""), 80), "town": "", "lat": round(lat, 5),
+                         "lon": round(lon, 5), "measure": sid, "unit": "m", "high": high, "low": low,
+                         "recent_high": _f0(s.get("sepa_maximum_level")), "by": "SEPA",
+                         "url": "https://waterlevels.sepa.org.uk/Station/" + no})
+        v = _f0(s.get("value"))
+        when = parse_when(str(s.get("timestamp") or ""))
+        if v is not None and when:
+            levels[sid] = (v, iso_utc(when))
+    return stations, levels
+
+
 def river_state(st, v):
     hi, lo = st.get("high"), st.get("low")
     if hi is None:
@@ -6383,6 +7062,27 @@ def river_state(st, v):
     if lo is not None and v < lo:
         return "low"
     return "normal"
+
+
+def ea_rivers(home, mem):
+    """England's gauges near home (their details kept for a week) and every latest level reading."""
+    cache = mem["river_stations"]
+    spot = [round(home["lat"], 2), round(home["lon"], 2)]
+    old = (time.time() - (cache.get("t") or 0)) > 7 * 86400
+    if old or cache.get("home") != spot or not isinstance(cache.get("stations"), list):
+        st = parse_river_stations(http_get(FEED_URLS["river_stations"], timeout=60), home)
+        cache.clear()
+        cache.update({"t": time.time(), "home": spot, "stations": st})
+    return cache["stations"], parse_river_readings(http_get(FEED_URLS["rivers"], timeout=40))
+
+
+def sepa_rivers(home, mem):
+    return parse_sepa_rivers(http_get(FEED_URLS["sepa_rivers"], timeout=40), home)
+
+
+# River gauges: who, the nations it covers. The Environment Agency's list takes in some gauges over the Welsh border;
+# Natural Resources Wales publishes levels but not a usual range to compare them with, so Wales has no list of its own.
+RIVER_PROVIDERS = [("Environment Agency", ("england", "wales"), ea_rivers), ("SEPA", ("scotland",), sepa_rivers)]
 
 
 RIVER_WORDS = {"very_high": "Higher than it's been for years", "high": "Above its normal range",
@@ -6421,7 +7121,8 @@ def rivers_live(stations, levels, hist, home, now):
                "dir": DIR_SHORT.get(compass(home["lat"], home["lon"], st["lat"], st["lon"]), ""),
                "level": round(v, 2), "unit": st["unit"], "high": st["high"], "low": st["low"], "pct": pct,
                "state": state, "trend": trend, "when": when, "lat": st["lat"], "lon": st["lon"],
-               "url": "https://check-for-flooding.service.gov.uk/station/%s" % st["id"]}
+               "url": st.get("url") or "https://check-for-flooding.service.gov.uk/station/%s" % st["id"],
+               "by": st.get("by") or "Environment Agency"}
         rows.append(row)
         if state in ("high", "very_high"):
             sev = 2 if state == "very_high" else 1
@@ -6432,7 +7133,8 @@ def rivers_live(stations, levels, hist, home, now):
                               place, fq(round(v, 2)), fq(st["high"]),
                               "Keep an eye on flood warnings, and know how you'd get out if it rises further."),
                           "area": st["town"] or st["name"], "distance_km": int(round(d)), "when": "",
-                          "url": row["url"], "issued": iso_utc(parse_when(when) or now)})
+                          "url": row["url"], "issued": iso_utc(parse_when(when) or now), "by": row["by"],
+                          "river": st["river"]})
     rows.sort(key=lambda r: r["km"])
     order = {"very_high": 0, "high": 1}
     top = sorted(rows, key=lambda r: (order.get(r["state"], 2), r["km"]))
@@ -6501,23 +7203,96 @@ def parse_ssen(data):
 
 
 def parse_npg(data):
+    """One row per postcode: a cut covering several has a row, and a spot, for each (power_live uses the nearest)."""
     by = {}
     for r in json.loads(data.decode("utf-8")) or []:
         if not isinstance(r, dict) or not r.get("reference"):
             continue
         lat, lon = _f0(r.get("lat")), _f0(r.get("lng"))
-        if lat is None or lon is None or r["reference"] in by:
+        if lat is None or lon is None:
+            continue
+        if r["reference"] in by:
+            by[r["reference"]]["spots"].append([lat, lon])
             continue
         pc = r.get("postcode") if isinstance(r.get("postcode"), list) else []
-        by[r["reference"]] = _cut("Northern Powergrid", r["reference"], lat, lon,
-                                  (_f0(r.get("totalconfirmedpowercut")) or 0) + (_f0(r.get("totalpredictedpowercut")) or 0),
-                                  "planned" in (r.get("natureofoutage") or "").lower(),
-                                  r.get("estimatedtimetillresolution"), r.get("loggedtime"),
-                                  re.sub(r"\s+", " ", pc[0]) if pc else "")
+        by[r["reference"]] = dict(_cut("Northern Powergrid", r["reference"], lat, lon,
+                                       (_f0(r.get("totalconfirmedpowercut")) or 0) + (_f0(r.get("totalpredictedpowercut")) or 0),
+                                       "planned" in (r.get("natureofoutage") or "").lower(),
+                                       r.get("estimatedtimetillresolution"), r.get("loggedtime"),
+                                       re.sub(r"\s+", " ", pc[0]) if pc else ""), spots=[[lat, lon]])
     return list(by.values())
 
 
-POWER_FEEDS = (("power_ukpn", "ukpn"), ("power_nged", "nged"), ("power_ssen", "ssen"), ("power_npg", "npg"))
+# 1.15.0: Electricity North West and NIE Networks, from the lists behind their power cut maps (not official feeds).
+def parse_enwl(data):
+    doc = _json(data)
+    if not isinstance(doc, dict) or not isinstance(doc.get("Items"), list):
+        raise ValueError("Electricity North West's power cut list has changed")
+    out = []
+    for i in doc["Items"]:
+        if not isinstance(i, dict) or i.get("Type") not in ("CurrentFault", "TodaysPlannedWorks") \
+                or i.get("actualTimeOfRestoration"):
+            continue   # put right, cancelled, or another day's planned work
+        pt = i.get("outageCentrePoint") if isinstance(i.get("outageCentrePoint"), dict) else {}
+        lat, lon = _f0(pt.get("lat")), _f0(pt.get("lng"))
+        if lat is None or lon is None:
+            continue
+        pcs = [p.strip() for p in str(i.get("AffectedPostcodes") or "").split(",") if p.strip()]
+        out.append(_cut("Electricity North West", i.get("faultNumber"), lat, lon, _f0(i.get("consumersOff")),
+                        i["Type"] == "TodaysPlannedWorks", i.get("estimatedTimeOfRestoration"), i.get("date"),
+                        i.get("region") or (pcs[0] if pcs else "")))
+    return out
+
+
+def _nie_time(s, now):
+    """NIE Networks' '5:00 PM, 16 Nov 2026' (or '9:05 AM, 16 Nov', this year) as UK local time, or None."""
+    s = str(s or "").strip()
+    for fmt in ("%I:%M %p, %d %b %Y", "%I:%M %p, %d %b"):
+        try:
+            t = dt.datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        if fmt.endswith("%b"):
+            t = t.replace(year=now.year)
+            if t > now.replace(tzinfo=None) + dt.timedelta(days=200):
+                t = t.replace(year=now.year - 1)   # December's, read in January
+        return t
+    return None
+
+
+def parse_nie(data, now):
+    doc = _json(data)
+    if not isinstance(doc, dict) or not isinstance(doc.get("outageMessage"), list):
+        raise ValueError("NIE Networks' PowerCheck list has changed")
+    out = []
+    for o in doc["outageMessage"]:
+        if not isinstance(o, dict):
+            continue
+        try:   # Irish Grid eastings and northings
+            e, n = [float(v) for v in str((o.get("point") or {}).get("coordinates") or "").split(",")[:2]]
+        except (ValueError, AttributeError):
+            continue
+        lat, lon = ig_to_latlon(e, n)
+        planned = str(o.get("outageType") or "").lower() == "planned"
+        back = _nie_time(o.get("estRestoreFullDateTime"), now)
+        if planned and back and uk_local_to_utc(back.isoformat()) < now:
+            continue   # planned work that's finished
+        start = _nie_time(o.get("startTime"), now)
+        out.append(_cut("NIE Networks", o.get("outageId"), lat, lon, _f0(o.get("numCustAffected")), planned,
+                        back.isoformat() if back else "", start.isoformat() if start else "",
+                        o.get("postCode") or ""))
+    return out
+
+
+# Each network's live power cuts: (feed, parser, the licence areas it's asked for). The first four are fetched for
+# every home (each is a whole network, and a cut near a boundary is still near); Electricity North West and NIE
+# Networks only for homes on, or within POWER_KM of, their networks. SP Energy Networks (central and southern
+# Scotland, Merseyside and North Wales) only publishes its live power cuts to registered API users: no feed yet.
+POWER_FEEDS = (("power_ukpn", "ukpn", None), ("power_nged", "nged", None), ("power_ssen", "ssen", None),
+               ("power_npg", "npg", None), ("power_enwl", "enwl", {16}), ("power_nie", "nie", {"ni"}))
+POWER_NAMES = {"ukpn": "UK Power Networks", "nged": "National Grid", "ssen": "SSEN", "npg": "Northern Powergrid",
+               "enwl": "Electricity North West", "nie": "NIE Networks"}
+NO_LIVE_FEED = {"SP Energy Networks": "https://powercuts.spenergynetworks.co.uk/"}
 
 
 def when_words(s):
@@ -6531,9 +7306,14 @@ def when_words(s):
         local.day, local.strftime("%b"), local.strftime("%H:%M"))
 
 
-def power_live(cuts, home):
+def power_live(cuts, home, failed=(), no_feed=""):
+    """failed: networks whose feed didn't come through this time (the others still show). no_feed: home's own network,
+    if it doesn't publish its live power cuts."""
     rows, items = [], []
     for c in cuts:
+        if c.get("spots"):   # a cut with a spot for each postcode: how near is the nearest of them
+            c = dict(c)
+            c["lat"], c["lon"] = min(c.pop("spots"), key=lambda p: km_between(home["lat"], home["lon"], p[0], p[1]))
         d = km_between(home["lat"], home["lon"], c["lat"], c["lon"])
         if d > POWER_KM:
             continue
@@ -6559,12 +7339,18 @@ def power_live(cuts, home):
     rows.sort(key=lambda r: r["km"])
     unplanned = [r for r in rows if not r["planned"]]
     return items, {"cuts": rows[:6], "count": len(unplanned), "planned": len(rows) - len(unplanned),
-                   "homes": sum(r["customers"] for r in unplanned), "near": sum(1 for r in unplanned if r["km"] <= POWER_NEAR_KM)}
+                   "homes": sum(r["customers"] for r in unplanned), "near": sum(1 for r in unplanned if r["km"] <= POWER_NEAR_KM),
+                   "failed": list(failed), "no_feed": no_feed, "no_feed_url": NO_LIVE_FEED.get(no_feed, "")}
 
 
 # -- The electricity grid -----------------------------------------------------------------------
 GRID_PERIOD = re.compile(r"from\s+(\d{1,2})[:.]?(\d{2})\s*hrs?\s+(?:to|until)\s+(\d{1,2})[:.]?(\d{2})\s*hrs?\s+on\s+\w+\s+"
                          r"(\d{1,2})/(\d{1,2})/(\d{4})", re.I)
+
+
+# Notices about the system operators' own business, by warningType: IT outages, trades and emergency help between
+# operators. None is about supply, whatever words they use.
+GRID_SKIP = re.compile(r"\bIT SYSTEMS? OUTAGE|SO-SO|SO TO SO|EMERGENCY ASSISTANCE", re.I)
 
 
 def grid_text(t):
@@ -6584,9 +7370,9 @@ def parse_grid(data, now):
         when = parse_when(r.get("publishTime"))
         if not when or when > now + dt.timedelta(minutes=5):
             continue
-        if "TEST" in up or "FLEXIBIL" in up:
-            continue   # voltage reduction tests and the Demand Flexibility Service aren't warnings
-        if "DEMAND CONTROL IMMINENT" in up or "HIGH RISK OF DEMAND REDUCTION" in up:
+        if "TEST" in up or "FLEXIBIL" in up or GRID_SKIP.search(kind):
+            continue   # voltage reduction tests, the Demand Flexibility Service and the operators' own business
+        if re.search(r"DEMAND CONTROL IMMINENT|HIGH RISK OF DEMAND REDUCTION|\bHRDN\b", kind + " " + up):
             key = "demand"
         elif kind == "ELECTRICITY MARGIN NOTICE" or "ELECTRICITY MARGIN NOTICE" in up:
             key = "emn"
@@ -6854,9 +7640,1016 @@ def pound_live(rows, now):
     return items, reading
 
 
+# -- More of the wider picture (1.15.0) -------------------------------------------------------------
+# The threat level, cyber security, travel advice, drought and reservoirs, the five-day flood risk,
+# rainfall and groundwater near home, the grid's carbon and frequency, and its spare margin. Public and
+# national (rainfall and groundwater: the whole gauge list is fetched and the nearest picked here), so
+# nothing about you is sent. The daily briefing reads all of these.
+THREAT_NAMES = ["LOW", "MODERATE", "SUBSTANTIAL", "SEVERE", "CRITICAL"]
+THREAT_MEANS = {"LOW": "an attack is highly unlikely", "MODERATE": "an attack is possible, but not likely",
+                "SUBSTANTIAL": "an attack is likely", "SEVERE": "an attack is highly likely",
+                "CRITICAL": "an attack is highly likely in the near future"}
+THREAT_RAISED_DAYS = 7     # a raised threat level is a warning for a week
+NCSC_DAYS = 14
+NCSC_URGENT = re.compile(r"critical (security|vulnerabilit|flaw|issue)|actively exploited|being exploited|zero[- ]day|"
+                         r"urgent|ransomware attack|cyber ?attack on|under attack", re.I)
+FCDO_DAYS = 3
+FCDO_AGAINST = re.compile(r"against (all|all but essential) travel", re.I)
+RAIN_KM = 25
+GROUND_KM = 30
+EA_AREAS = {   # the Environment Agency's areas, and what the drought report calls each
+    "Cumbria and Lancashire": r"Cumbria", "Devon, Cornwall and the Isles of Scilly": r"Devon|Cornwall",
+    "East Anglia": r"East Anglia", "East Midlands": r"East Midlands",
+    "Greater Manchester, Merseyside and Cheshire": r"Greater Manchester|Merseyside",
+    "Hertfordshire and North London": r"Hertfordshire", "Kent, South London and East Sussex": r"Kent",
+    "Lincolnshire and Northamptonshire": r"Lincolnshire", "North East": r"North ?east",
+    "Solent and South Downs": r"Solent", "Thames": r"(?<!South London and )\bThames\b", "Wessex": r"Wessex",
+    "West Midlands": r"West Midlands", "Yorkshire": r"Yorkshire",
+}
+WATER_COS = ["Affinity Water", "Anglian Water", "Bournemouth Water", "Bristol Water", "Cambridge Water",
+             "Essex and Suffolk Water", "Hafren Dyfrdwy", "NI Water", "Northumbrian Water", "Portsmouth Water",
+             "Scottish Water", "SES Water", "Severn Trent Water", "South East Water", "South Staffs Water",
+             "South West Water", "Southern Water", "Thames Water", "United Utilities", "Welsh Water (Dŵr Cymru)",
+             "Wessex Water", "Yorkshire Water"]
+WATER_CO_ALSO = {   # other names the drought reports use for a company
+    "South Staffs Water": ("South Staffordshire Water",), "Welsh Water (Dŵr Cymru)": ("Welsh Water", "Dŵr Cymru"),
+    "Essex and Suffolk Water": ("Essex & Suffolk Water",), "SES Water": ("Sutton and East Surrey Water",)}
+DROUGHT_STAGES = [("severe drought", "Severe drought", 2), ("in drought", "Drought", 1),
+                  ("prolonged dry weather", "Prolonged dry weather", 0), ("recovery", "Recovering from drought", 0)]
+_MONTHS = {m: i for i, m in enumerate(["january", "february", "march", "april", "may", "june", "july", "august",
+                                        "september", "october", "november", "december"], 1)}
+FGS_SEV = {"VERY LOW": 0, "LOW": 0, "MEDIUM": 1, "HIGH": 2}
+GW_BANDS = [(5, "exceptionally low"), (13, "notably low"), (28, "below normal"), (72, "normal"),
+            (87, "above normal"), (95, "notably high"), (101, "exceptionally high")]
+FUEL_NAMES = {"CCGT": "Gas", "OCGT": "Gas (peaking)", "WIND": "Wind", "NUCLEAR": "Nuclear", "BIOMASS": "Biomass",
+              "COAL": "Coal", "OIL": "Oil", "NPSHYD": "Hydro", "PS": "Pumped storage", "OTHER": "Other"}
+
+
+def _json(data):
+    return json.loads(data.decode("utf-8"))
+
+
+# The UK threat level, as GOV.UK publishes it in its "Terrorism and national emergencies" guide (through the GOV.UK
+# Content API: MI5's own feed is behind a bot check). GOV.UK doesn't date the level, so "since" is when Dads Army saw
+# it change (see fetch_live).
+THREAT_PART = "terrorism-threat-levels"
+THREAT_PAGE = "https://www.gov.uk/terrorism-national-emergency/terrorism-threat-levels"
+
+
+def parse_threat(data):
+    """(national level, Northern Ireland's level or None) from "The threat to the UK ... from terrorism is severe." and
+    "The threat to Northern Ireland from Northern Ireland-related terrorism is substantial." ValueError if unreadable."""
+    doc = _json(data)
+    details = doc.get("details") if isinstance(doc, dict) and isinstance(doc.get("details"), dict) else {}
+    parts = [p for p in (details.get("parts") if isinstance(details.get("parts"), list) else []) if isinstance(p, dict)]
+    mine = [p for p in parts if p.get("slug") == THREAT_PART] or parts   # the threat levels part, or any if renamed
+
+    def text(body):   # HTML, or a list of {content_type, content}
+        if isinstance(body, list):
+            body = next((b.get("content") for b in body if isinstance(b, dict) and b.get("content_type") == "text/html"),
+                        None) or next((b.get("content") for b in body if isinstance(b, dict)), "")
+        return re.sub(r"\s+", " ", plain(body if isinstance(body, str) else "", 20000))
+    words = " ".join(text(p.get("body")) for p in mine)
+    names = "|".join(THREAT_NAMES)
+    national = re.search(r"(?<!Northern Ireland-related )terrorism is\s+(" + names + r")\b", words, re.I)
+    ni = re.search(r"Northern Ireland-related terrorism is\s+(" + names + r")\b", words, re.I)
+    if not national:
+        raise ValueError("couldn't read the threat level from GOV.UK")
+    return national.group(1).upper(), ni.group(1).upper() if ni else None
+
+
+def threat_live(national, ni, since, before, now):
+    """(warnings, reading). A warning at CRITICAL, or for a week after the level goes up."""
+    today = now.date()
+    raised = None
+    if before and before.get("level") in THREAT_NAMES:
+        if THREAT_NAMES.index(national) > THREAT_NAMES.index(before["level"]):
+            raised = today.isoformat()
+        elif before["level"] == national:
+            raised = before.get("raised_on")
+    if raised and (today - dt.date.fromisoformat(raised)).days > THREAT_RAISED_DAYS:
+        raised = None
+    reading = {"level": national, "means": THREAT_MEANS[national], "ni": ni, "raised_on": raised,
+               "raised_from": before.get("level") if raised and before and before.get("level") != national else
+               before.get("raised_from") if raised and before else None, "since": iso_utc(since)}
+    items = []
+    if national == "CRITICAL" or raised:
+        items.append({"id": "threat:%s:%s" % (national, raised or today.isoformat()), "source": "threat",
+                      "kind": "threat", "severity": 3 if national == "CRITICAL" else 1, "level": national.title(),
+                      "title": ("UK threat level raised to %s" if raised else "UK threat level %s") % national,
+                      "text": "The national threat level is %s: %s. Follow what the police and GOV.UK say, and be "
+                              "alert rather than alarmed." % (national, THREAT_MEANS[national]),
+                      "area": "UK", "when": "", "url": THREAT_PAGE, "issued": iso_utc(since) or iso_utc(now)})
+    return items, reading
+
+
+def fetch_threat(mem, now):
+    national, ni = parse_threat(http_get(FEED_URLS["threat"]))
+    before = mem["live"].get("threat") or {}
+    # When it changed, as far as Dads Army has seen: the last "since" while it's the same, now when it moves.
+    since = parse_when(before.get("since")) if before.get("level") == national else now if before.get("level") else None
+    return threat_live(national, ni, since, before, now)
+
+
+# Cyber security: the National Cyber Security Centre's news. Alerts about live attacks and critical
+# flaws come out as news; one in the last three days is worth a warning.
+def parse_ncsc(data, now):
+    out = []
+    for it in parse_xml(data).iter("item"):
+        when = parse_when(it.findtext("pubDate"))
+        if not when or now - when > dt.timedelta(days=NCSC_DAYS):
+            continue
+        title = plain(it.findtext("title"), 200)
+        link = (it.findtext("link") or "").strip()
+        out.append({"title": title, "text": plain(it.findtext("description"), 400), "issued": iso_utc(when),
+                    "urgent": bool(NCSC_URGENT.search(title)) and now - when <= dt.timedelta(days=3),
+                    "url": link if link.startswith("https://www.ncsc.gov.uk/") else "https://www.ncsc.gov.uk/news"})
+    return out[:5]
+
+
+def cyber_live(news, now):
+    items = [{"id": "cyber:" + n["url"][-120:] + ":" + n["issued"][:10], "source": "cyber", "kind": "cyber",
+              "severity": 1, "level": "NCSC", "title": n["title"], "text": n["text"], "area": "UK", "when": "",
+              "url": n["url"], "issued": n["issued"]} for n in news if n["urgent"]]
+    return items, {"news": news, "urgent": len(items)}
+
+
+# Travel advice: what the Foreign, Commonwealth & Development Office changed in the last few days.
+def parse_fcdo(data, now):
+    out = []
+    for e in parse_xml(data).iter(ATOM + "entry"):
+        when = parse_when(e.findtext(ATOM + "updated"))
+        if not when or now - when > dt.timedelta(days=FCDO_DAYS):
+            continue
+        summ = e.find(ATOM + "summary")
+        text = plain(" ".join(summ.itertext()) if summ is not None else "", 300)
+        link = next((l.get("href") for l in e.findall(ATOM + "link") if l.get("rel") == "alternate"), "") or ""
+        out.append({"country": plain(e.findtext(ATOM + "title"), 80), "text": text, "issued": iso_utc(when),
+                    "against": bool(FCDO_AGAINST.search(text)),
+                    "url": link if link.startswith("https://www.gov.uk/foreign-travel-advice")
+                    else "https://www.gov.uk/foreign-travel-advice"})
+    return out[:10]
+
+
+def travel_live(changes):
+    return [], {"changes": changes, "against": [c["country"] for c in changes if c["against"]]}
+
+
+# Drought and reservoirs: the Environment Agency's weekly "Dry weather and drought in England" report,
+# through the GOV.UK Content API. England only.
+def _report_date(title):
+    """The end of the week a report covers: the last date in '... 30 October to 5 November 2026'."""
+    m = re.findall(r"(\d{1,2}) ([A-Za-z]+)(?: (\d{4}))?", title)
+    year = re.findall(r"\b(20\d\d)\b", title)
+    if not m or not year:
+        return None
+    d, mon, y = m[-1]
+    try:
+        return dt.date(int(y or year[-1]), _MONTHS[mon.lower()], int(d))
+    except (KeyError, ValueError):
+        return None
+
+
+def parse_drought_report(body):
+    """The figures in one weekly report's HTML: storage, areas at each stage, hosepipe bans, companies."""
+    parts = re.split(r"<h[23][^>]*>(.*?)</h[23]>", body, flags=re.S)
+    sections = [(re.sub(r"^[\d.]+\s*", "", plain(parts[i])), parts[i + 1]) for i in range(1, len(parts) - 1, 2)]
+    out = {"storage": None, "vs_average": None, "stages": {}, "tubs": [], "companies": {}, "summary": ""}
+    text = re.sub(r"\s+", " ", plain(body, 200000))
+    num = r"(?:to|at|was|is|of) (?:around |about |just |only )?(\d+(?:\.\d+)?)%"
+    gap = r"(?:[^.%]|\.\d){0,70}?"
+    for rx in (r"(?:[Tt]otal|[Nn]ational|England) (?:reservoir )?storage" + gap + num,
+               r"storage (?:for|in) England" + gap + num, r"[Rr]eservoir storage" + gap + num + r" nationally"):
+        m = next((x for x in re.finditer(rx, text) if 15 <= float(x.group(1)) <= 100), None)
+        if m:
+            out["storage"] = float(m.group(1))
+            a = re.search(r"^(?:[^.]|\.\d){0,120}?(\d+(?:\.\d+)?)% (below|lower|above|higher)", text[m.end():])
+            if a:
+                out["vs_average"] = float(a.group(1)) * (-1 if a.group(2) in ("below", "lower") else 1)
+            break
+    for head, h in sections:
+        low = head.lower()
+        lis = [re.sub(r"\s+", " ", plain(x)) for x in re.findall(r"<li[^>]*>(.*?)</li>", h, re.S)]
+        if low.startswith("summary"):
+            paras = [plain(x) for x in re.findall(r"<p[^>]*>(.*?)</p>", h, re.S)]
+            out["summary"] = paras[0] if paras else ""
+        elif "temporary use ban" in low:
+            out["tubs"] = lis
+        elif "areas in" in low or "area in" in low:
+            for words, stage, _ in DROUGHT_STAGES:
+                if words in low:
+                    out["stages"][stage] = lis
+                    break
+        else:
+            for co in WATER_COS + ["Veolia Water"] + [n for also in WATER_CO_ALSO.values() for n in also]:
+                if low == co.lower():
+                    out["companies"][co] = " ".join(plain(x) for x in re.findall(r"<p[^>]*>(.*?)</p>", h, re.S))
+    return out
+
+
+def drought_live(rep, when, url, cfg, now):
+    """(warnings, reading) for your Environment Agency area and water company (set in the warnings settings)."""
+    area, co = cfg.get("ea_area") or "", cfg.get("water_co") or ""
+    names = ((co,) + WATER_CO_ALSO.get(co, ())) if co else ()   # "South Staffordshire Water" is South Staffs Water
+    week = when.strftime("%-d %B") if when else ""
+    reading = {"storage": rep["storage"], "vs_average": rep["vs_average"], "week": week, "url": url,
+               "counts": {k: len(v) for k, v in rep["stages"].items() if v}, "area": area, "stage": "",
+               "company": co, "company_text": plain(next((rep["companies"][n] for n in names if rep["companies"].get(n)), ""), 500),
+               "ban": "", "stale": bool(when and (now.date() - when).days > 21)}
+    items = []
+    if reading["stale"]:
+        return items, reading
+    if area:
+        rx = re.compile(EA_AREAS.get(area, re.escape(area)), re.I)
+        found = None
+        for words, stage, sev in DROUGHT_STAGES:
+            for li in rep["stages"].get(stage) or []:
+                if rx.search(li) and not (stage == "Severe drought" and re.match(r"parts of", li, re.I)):
+                    found = found or (stage, sev)
+        stage, sev = found or ("Normal", 0)
+        reading["stage"] = stage
+        if sev:
+            items.append({"id": "drought:%s:%s" % (stage, when.isoformat() if when else ""), "source": "drought",
+                          "kind": "drought", "severity": sev, "level": stage, "title": "%s in %s" % (stage, area),
+                          "text": "The Environment Agency's report for the week to %s. Use water carefully, and keep "
+                                  "your stored water topped up." % week, "area": area, "when": "", "url": url,
+                          "issued": iso_utc(dt.datetime.combine(when, dt.time(12), dt.timezone.utc)) if when else ""})
+    if co:
+        ban = [t for t in rep["tubs"] if any(t.lower().startswith(n.lower()) for n in names)]
+        if ban:
+            reading["ban"] = plain(ban[0], 300)
+            items.append({"id": "hosepipe:%s:%s" % (co, when.isoformat() if when else ""), "source": "drought",
+                          "kind": "drought", "severity": 1, "level": "Hosepipe ban", "title": "Hosepipe ban: " + co,
+                          "text": reading["ban"] + ". Check " + co + "'s website for what it covers.", "area": co,
+                          "when": "", "url": url,
+                          "issued": iso_utc(dt.datetime.combine(when, dt.time(12), dt.timezone.utc)) if when else ""})
+    return items, reading
+
+
+def fetch_drought(cfg, mem):
+    found = _json(http_get(FEED_URLS["drought_search"]))
+    pubs = sorted((r for r in found.get("results") or []
+                   if str(r.get("title", "")).lower().startswith("dry weather and drought in england")
+                   and str(r.get("link", "")).startswith("/government/publications/")),
+                  key=lambda r: r.get("public_timestamp") or "", reverse=True)
+    if not pubs:
+        raise ValueError("no drought reports on GOV.UK")
+    reports = []
+    for pub in pubs[:2]:
+        doc = _json(http_get(FEED_URLS["govuk_content"] + pub["link"]))
+        for a in (doc.get("details") or {}).get("attachments") or []:
+            title, path = str(a.get("title") or ""), str(a.get("url") or "")
+            when = _report_date(title)
+            if when and path.startswith("/government/publications/"):
+                reports.append((when, path))
+        if reports:
+            break
+    if not reports:
+        raise ValueError("no drought reports on GOV.UK")
+    when, path = max(reports)
+    cache = mem.setdefault("drought_reports", {})
+    if path not in cache:
+        cache.clear()
+        cache[path] = parse_drought_report((_json(http_get(FEED_URLS["govuk_content"] + path)).get("details") or {})
+                                           .get("body") or "")
+    return drought_live(cache[path], when, "https://www.gov.uk" + path, cfg, dt.datetime.now(dt.timezone.utc))
+
+
+# The flood risk forecast: five days for England from the Flood Forecasting Centre (Environment Agency and Met Office),
+# as GOV.UK's Check for flooding publishes it; three days for Scotland from the Scottish Flood Forecast (SEPA and the Met
+# Office). The Flood Forecasting Centre's own open API closed in June 2026 (its new one needs a key), and Wales and
+# Northern Ireland have no open forecast just now (SOURCE_COVERAGE). The areas at risk are fetched whole and home is
+# checked against them here, so the forecast is for where you live and nothing about home is sent.
+OUTLOOK_RISK = {1: "VERY LOW", 2: "LOW", 3: "MEDIUM", 4: "HIGH"}
+
+
+def parse_outlook_page(data):
+    """From Check for flooding's front page: when the outlook was issued, its words, and each day's name."""
+    page = data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data or "")
+    m = re.search(r'"outlookUTC"\s*:\s*"([^"]+)"', page)
+    issued = parse_when(m.group(1)) if m else None
+    names = {}
+    m = re.search(r"outlookDays\s*=\s*(\[.*?\])", page, re.S)
+    try:
+        for d in (json.loads(m.group(1)) if m else []):
+            when = parse_when(d.get("date")) if isinstance(d, dict) else None
+            if when and isinstance(d.get("idx"), int):
+                names[d["idx"]] = when.strftime("%A")
+    except ValueError:
+        names = {}
+    text = plain(re.sub(r"(?is)<script.*?</script>|<style.*?</style>", " ", page), 20000).replace("\n", " ")
+    m = re.search(r"Flood forecast for the next 5 days\s*(.*?)\s*(?:Updated at|Produced by|$)", text)
+    return issued, (plain(m.group(1), 600) if m else ""), names
+
+
+def floodrisk_live(page, areas, home):
+    issued, text, names = parse_outlook_page(page)
+    areas = _json(areas) if isinstance(areas, (bytes, bytearray)) else areas
+    feats = areas.get("features") if isinstance(areas, dict) else None
+    if not isinstance(feats, list):
+        raise ValueError("no flood risk outlook in the feed")
+    mine = {}
+    for f in feats:
+        props = f.get("properties") if isinstance(f, dict) else None
+        if not isinstance(props, dict) or not isinstance(props.get("risk-level"), int):
+            continue
+        g = f.get("geometry") if isinstance(f.get("geometry"), dict) else {}
+        coords = g.get("coordinates") or []
+        rings = [coords[0]] if g.get("type") == "Polygon" and coords else \
+            [p[0] for p in coords if p] if g.get("type") == "MultiPolygon" else []
+        if in_rings(rings, home["lat"], home["lon"]):
+            for d in props.get("days") or []:
+                if isinstance(d, int):
+                    mine[d] = max(mine.get(d, 1), props["risk-level"])
+    top = max(list(mine.values()) or [1])
+    risk = OUTLOOK_RISK.get(top, "VERY LOW")
+    first = min([d for d, v in mine.items() if v == top] or [1])
+    rising = top > mine.get(1, 1)   # higher later in the five days than today
+    when = names.get(first) or ("today" if first == 1 else "day %d" % first)
+    url = FEED_URLS["floodrisk"] if FEED_URLS["floodrisk"].startswith("https://") else "https://check-for-flooding.service.gov.uk/"
+    head = ("Flood risk %s where you live on %s" % (risk.lower(), when) if top > 1
+            else "Flood risk very low where you live for the next five days")
+    reading = {"risk": risk, "headline": head, "text": text or "No flooding is expected where you live.", "rising": rising,
+               "issued": iso_utc(issued), "url": url, "days": 5, "by": "Flood Forecasting Centre"}
+    items = []
+    if FGS_SEV.get(risk):
+        items.append({"id": "floodrisk:%s:%s" % (risk, (iso_utc(issued) or "")[:10]), "source": "floodrisk",
+                      "kind": "flood", "severity": FGS_SEV[risk], "level": risk.title() + " flood risk",
+                      "title": head, "text": reading["text"], "area": "Where you live", "when": "", "url": url,
+                      "issued": iso_utc(issued)})
+    return items, reading
+
+
+SFF_WORDS = [   # what the Scottish Flood Forecast says, as the Flood Forecasting Centre's risk it's closest to
+    (r"\bno (significant )?flooding is expected|no-flooding", "VERY LOW", "No flooding expected"),
+    (r"severe|significant", "HIGH", "Significant flooding possible"),
+    (r"minor|possible|likely|expected", "MEDIUM", "Flooding possible"),
+]
+
+
+def sff_live(data):
+    """The latest Scottish Flood Forecast (its RSS feed: one item a day, with a picture of the three-day map)."""
+    latest, when = None, None
+    for it in parse_xml(data).iter("item"):
+        t = parse_when(it.findtext("pubDate"))
+        if latest is None or (t and (when is None or t > when)):
+            latest, when = it, t
+    if latest is None:
+        raise ValueError("no Scottish Flood Forecast in the feed")
+    text = plain(latest.findtext("description"), 600)
+    enc = latest.find("enclosure")
+    hint = ((enc.get("url") if enc is not None else "") or "").rsplit("/", 1)[-1] + " " + text
+    risk, word = next(((r, w) for rx, r, w in SFF_WORDS if re.search(rx, hint, re.I)), ("LOW", "See the forecast"))
+    if risk == "VERY LOW" and re.search(r"\b(are|is) possible\b", text, re.I):
+        risk = "LOW"   # nothing significant, but some impacts are possible
+    link = (latest.findtext("link") or "").strip()
+    url = link if link.startswith("https://scottishfloodforecast.sepa.org.uk") else "https://scottishfloodforecast.sepa.org.uk/"
+    first = (re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0] if text else word).rstrip(".")
+    reading = {"risk": risk, "word": word, "headline": first, "text": text, "rising": False, "issued": iso_utc(when),
+               "url": url, "days": 3, "by": "Scottish Flood Forecast"}
+    items = []
+    if FGS_SEV.get(risk):
+        items.append({"id": "floodrisk:sff:%s:%s" % (risk, (iso_utc(when) or "")[:10]), "source": "floodrisk",
+                      "kind": "flood", "severity": FGS_SEV[risk], "level": word, "title": first + " (Scottish Flood Forecast)",
+                      "text": text, "area": "Scotland", "when": "", "url": url, "issued": iso_utc(when),
+                      "by": "SEPA"})
+    return items, reading
+
+
+def fetch_floodrisk(home):
+    if not home:
+        raise NeedLocation()   # the forecast is for where you live
+    if home_nation(home) == "scotland":
+        return sff_live(http_get(FEED_URLS["sff"]))
+    return floodrisk_live(http_get(FEED_URLS["floodrisk"]), http_get(FEED_URLS["floodrisk_areas"], timeout=40), home)
+
+
+# Rainfall near home: the nearest rain gauges, from the Environment Agency (England), SEPA (Scotland) and Natural Resources
+# Wales. Each gauge list is national, and the nearest are picked here; their readings are asked for by gauge, which
+# says roughly where home is (to within the 25 km the nearest gauges are in).
+def parse_rain_stations(data):
+    return [[s.get("notation"), plain(s.get("label") or s.get("notation"), 80), float(s["lat"]), float(s["long"])]
+            for s in _json(data).get("items") or []
+            if isinstance(s, dict) and s.get("lat") is not None and s.get("long") is not None and s.get("notation")]
+
+
+def parse_sepa_rain_stations(data):
+    """SEPA's rain gauges with an hourly total (KiWIS answers as a table: a header row, then one row each)."""
+    rows = _json(data)
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], list):
+        raise ValueError("SEPA's rain gauge list has changed")
+    out = []
+    for r in rows[1:]:
+        g = dict(zip(rows[0], r)) if isinstance(r, list) else {}
+        lat, lon = _f0(g.get("station_latitude")), _f0(g.get("station_longitude"))
+        if lat is not None and lon is not None and g.get("ts_id"):
+            out.append([str(g["ts_id"]), plain(str(g.get("station_name") or ""), 80), lat, lon])
+    return out
+
+
+def parse_nrw_rain_stations(stations, measures):
+    """Natural Resources Wales' rain gauges that are online: [measure id, name, lat, lon]."""
+    st, ms, where = _json(stations), _json(measures), {}
+    for s in st if isinstance(st, list) else []:
+        lat, lon = (_f0(s.get("latitude")), _f0(s.get("longitude"))) if isinstance(s, dict) else (None, None)
+        if lat is not None and lon is not None and s.get("monitoring_station_reference"):
+            where[s["monitoring_station_reference"]] = (lat, lon, re.sub(r"\s*rain ?gauge$", "", plain(
+                str(s.get("monitoring_station_name_en") or ""), 80), flags=re.I))
+    out = []
+    for m in ms if isinstance(ms, list) else []:
+        if not isinstance(m, dict) or m.get("measure_type_en") != "Rainfall" or str(m.get("measure_status_name")) != "Online":
+            continue
+        spot = where.get(m.get("monitoring_station_reference"))
+        if spot and m.get("measure_id"):
+            out.append([str(m["measure_id"]), spot[2], spot[0], spot[1]])
+    if not out:
+        raise ValueError("no rain gauges in Natural Resources Wales' list")
+    return out
+
+
+def ea_rain(gid, now):
+    since = (now - dt.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = _json(http_get(FEED_URLS["rain"].format(id=urllib.parse.quote(gid), since=since), timeout=60)).get("items") or []
+    return [(r.get("dateTime"), r.get("value")) for r in rows if isinstance(r, dict)]
+
+
+def sepa_rain(gid, now):
+    got = _json(http_get(FEED_URLS["sepa_rain"].format(id=urllib.parse.quote(gid)), timeout=40))
+    got = got[0] if isinstance(got, list) and got else got if isinstance(got, dict) else {}
+    return [(r[0], r[1]) for r in got.get("data") or [] if isinstance(r, list) and len(r) >= 2]
+
+
+def nrw_rain(gid, now):
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    rows = _json(http_get(FEED_URLS["nrw_rain"].format(id=urllib.parse.quote_plus(gid), start=(now - dt.timedelta(days=7))
+                                                       .strftime(fmt), end=now.strftime(fmt)), timeout=40))
+    return [(str(r.get("timestamp") or "").replace(" ", "T") + "Z", r.get("value"))   # UTC, though it doesn't say
+            for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+RAIN_PROVIDERS = [   # who, the nation it covers, its gauge list, a gauge's readings, the page for its gauges
+    ("Environment Agency", ("england",), lambda: parse_rain_stations(http_get(FEED_URLS["rain_stations"], timeout=60)),
+     ea_rain, "https://check-for-flooding.service.gov.uk/river-and-sea-levels"),
+    ("SEPA", ("scotland",), lambda: parse_sepa_rain_stations(http_get(FEED_URLS["sepa_rain_stations"], timeout=40)),
+     sepa_rain, "https://rainfall.sepa.org.uk/"),
+    ("Natural Resources Wales", ("wales",), lambda: parse_nrw_rain_stations(http_get(FEED_URLS["nrw_rain_stations"],
+                                                                                     timeout=40),
+                                                                            http_get(FEED_URLS["nrw_rain_measures"],
+                                                                                     timeout=40)),
+     nrw_rain, "https://rivers-and-seas.naturalresources.wales/"),
+]
+
+
+def rain_link(provider, gid):
+    """The nearest gauge's own page (the Environment Agency's rainfall station page), else the provider's."""
+    if provider == "Environment Agency" and re.match(r"^[A-Za-z0-9_-]{1,40}$", str(gid or "")):
+        return "https://check-for-flooding.service.gov.uk/rainfall-station/" + gid
+    return dict((p[0], p[4]) for p in RAIN_PROVIDERS).get(provider, "https://check-for-flooding.service.gov.uk/")
+
+
+def rain_totals(rows, now):
+    """(last 24 hours, last 7 days) in mm from one gauge's readings: [(when, mm)]."""
+    day_ago, week_ago = now - dt.timedelta(hours=24), now - dt.timedelta(days=7)
+    day = week = 0.0
+    for when, v in rows:
+        v, t = _f0(v), parse_when(str(when or ""))
+        if v is None or t is None or v < 0 or v > 100 or t < week_ago:
+            continue
+        week += v
+        if t >= day_ago:
+            day += v
+    return day, week
+
+
+def rain_live(gauges, now):
+    """gauges: [(km, name, day_mm, week_mm, who, gauge id)], nearest first."""
+    day = sum(g[2] for g in gauges) / len(gauges)
+    week = sum(g[3] for g in gauges) / len(gauges)
+    who = []
+    for g in gauges:
+        if g[4] not in who:
+            who.append(g[4])
+    url = rain_link(gauges[0][4], gauges[0][5])
+    reading = {"day_mm": round(day, 1), "week_mm": round(week, 1), "by": " and ".join(who), "url": url,
+               "gauges": [{"name": g[1], "km": round(g[0], 1)} for g in gauges]}
+    items = []
+    if day >= 30:
+        items.append({"id": "rain:%s:%d" % (now.date().isoformat(), 2 if day >= 50 else 1), "source": "rain",
+                      "kind": "weather", "severity": 2 if day >= 50 else 1, "level": "Heavy rain",
+                      "title": "Heavy rain near home: %.0f mm in 24 hours" % day,
+                      "text": "Averaged over the nearest rain gauges. Watch for surface water flooding, and don't drive "
+                              "through flood water.", "area": "Near home", "when": "", "url": url,
+                      "issued": iso_utc(now), "by": reading["by"]})
+    return items, reading
+
+
+def fetch_rain(home, mem, now):
+    """The three nearest gauges within RAIN_KM, from each provider whose nation home is in or within RAIN_KM of. If home's
+    own nation's gauge list can't be had (and isn't kept from before), the source has failed."""
+    near, nation = [], home_nation(home)
+    for name, nations, gauges, _readings, _page in RAIN_PROVIDERS:
+        if not covers(home, nations, RAIN_KM):
+            continue
+        cache = mem.setdefault("rain_stations", {}).setdefault(name, {})
+        if time.time() - (cache.get("t") or 0) > 7 * 86400 or not isinstance(cache.get("g"), list):
+            try:
+                g = gauges()
+                cache.clear()
+                cache.update({"t": time.time(), "g": g})
+            except Exception as e:
+                if not isinstance(cache.get("g"), list):   # nothing from before to fall back on
+                    if nation in nations:
+                        raise
+                    print("Rainfall: couldn't get %s's rain gauges (%s)" % (name, why_failed(e)), flush=True)
+                    continue
+        near += [(km_between(home["lat"], home["lon"], g[2], g[3]), g, name) for g in cache["g"]]
+    near = [x for x in sorted(near, key=lambda x: x[0]) if x[0] <= RAIN_KM][:3]
+    if not near:
+        return [], {"day_mm": None, "week_mm": None, "gauges": []}
+    readings = dict((p[0], p[3]) for p in RAIN_PROVIDERS)
+    got = []
+    for k, g, name in near:
+        try:
+            rows = readings[name](g[0], now)
+        except Exception:
+            continue
+        if rows:
+            got.append((k, g[1]) + rain_totals(rows, now) + (name, g[0]))
+    if not got:
+        raise ValueError("no recent readings from the rain gauges near home")
+    return rain_live(got, now)
+
+
+# Groundwater near home: Environment Agency boreholes (the Hydrology API). Most are read by hand every few
+# months, so the latest reading is compared with the same time of year in earlier years.
+def gw_status(rows, today):
+    """(date, level, percentile for the time of year) or None."""
+    pts = []
+    for r in rows:
+        try:
+            pts.append((dt.date.fromisoformat(str(r["date"])[:10]), float(r["value"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not pts:
+        return None
+    pts.sort()
+    last_d, last_v = pts[-1]
+    if (today - last_d).days > 120:
+        return None
+    doy = last_d.timetuple().tm_yday
+    same = [v for d, v in pts if d.year < last_d.year
+            and min(abs(d.timetuple().tm_yday - doy), 365 - abs(d.timetuple().tm_yday - doy)) <= 45]
+    if len(same) < 5:
+        return None
+    return last_d, last_v, 100.0 * sum(1 for v in same if v < last_v) / len(same)
+
+
+def parse_gw_stations(data):
+    """[name, lat, lon, [measures, the logger first]] for each active borehole."""
+    out = []
+    for s in _json(data).get("items") or []:
+        if not isinstance(s, dict) or s.get("lat") is None:
+            continue
+        ms = [m.get("@id", "") for m in s.get("measures") or [] if isinstance(m, dict) and "gw-" in m.get("@id", "")]
+        if ms:
+            ms.sort(key=lambda m: 0 if "logged" in m else 1)   # loggers read all day; "dipped" is by hand
+            out.append([plain(s.get("label") or "", 80), float(s["lat"]), float(s["long"]), [m.rsplit("/", 1)[1] for m in ms]])
+    return out
+
+
+GW_RECENT_DAYS = 60    # a logger's recent readings...
+GW_YEARS = 8           # ...and a few days either side of the same date in each of the 8 years before
+GW_WINDOW_DAYS = 10
+
+
+def gw_rows(measure, since, until=None, limit=20000):
+    """A measure's readings from since (to before until), oldest first."""
+    q = {"mineq-date": since.isoformat(), "_limit": str(limit)}
+    if until:
+        q["max-date"] = until.isoformat()
+    rows = _json(http_get(FEED_URLS["gw"].format(id=urllib.parse.quote(measure), query=urllib.parse.urlencode(q)),
+                          timeout=40)).get("items")
+    lo, hi = since.isoformat(), until.isoformat() if until else "9999"
+    return [r for r in rows or [] if isinstance(r, dict) and lo <= str(r.get("date") or "")[:10] < hi]
+
+
+def _daily(rows):
+    """One reading a day (the day's last), from a logger's every 15 minutes."""
+    by = {}
+    for r in rows:
+        by[str(r.get("date") or "")[:10]] = r
+    return [by[d] for d in sorted(by)]
+
+
+def gw_logger_rows(measure, today):
+    """A logger's last 60 days, and the same few weeks in each earlier year. (Asked for from 12 years ago in one go,
+    the 20,000 readings allowed end years back, so its latest reading always looked out of date.)"""
+    rows = _daily(gw_rows(measure, today - dt.timedelta(days=GW_RECENT_DAYS), limit=10000))
+    if not rows:
+        return []
+    last = dt.date.fromisoformat(str(rows[-1]["date"])[:10])
+    for n in range(1, GW_YEARS + 1):
+        mid = last - dt.timedelta(days=round(365.25 * n))
+        try:
+            rows = _daily(gw_rows(measure, mid - dt.timedelta(days=GW_WINDOW_DAYS),
+                                  mid + dt.timedelta(days=GW_WINDOW_DAYS + 1), limit=3000)) + rows
+        except Exception:
+            continue   # that year missing: the rest still compare
+    return rows
+
+
+def fetch_ground(home, mem, now):
+    """Up to three boreholes within GROUND_KM, each read from its logger or, failing that, by hand. A deep borehole
+    below sea level (the confined chalk under London) follows changes over decades, not this year's rain: shown, and
+    marked, but never worth watching."""
+    cache = mem.setdefault("gw_stations", {})
+    if time.time() - (cache.get("t") or 0) > 14 * 86400 or not isinstance(cache.get("g"), list):
+        cache.clear()
+        cache.update({"t": time.time(), "g": parse_gw_stations(http_get(FEED_URLS["gw_stations"], timeout=60))})
+    near = sorted(((km_between(home["lat"], home["lon"], g[1], g[2]), g) for g in cache["g"]), key=lambda x: x[0])
+    today = now.date()
+    since = today - dt.timedelta(days=365 * 12)
+    holes, asked, failed = [], 0, 0
+    for k, g in near[:8]:
+        if k > GROUND_KM or len(holes) >= 3:
+            break
+        got, ms = None, g[3] if isinstance(g[3], list) else [g[3]]
+        for m in ms:   # the logger, then the readings by hand
+            asked += 1
+            try:
+                rows = gw_logger_rows(m, today) if "logged" in m else gw_rows(m, since)
+            except Exception:
+                failed += 1
+                continue
+            got = gw_status(rows, today)
+            if got:
+                break
+        if got:
+            d, v, pct = got
+            holes.append({"name": g[0].title(), "km": round(k, 1), "date": d.isoformat(), "level_m": round(v, 2),
+                          "pct": round(pct), "band": next(w for lim, w in GW_BANDS if pct < lim), "deep": v < 0,
+                          "url": "https://environment.data.gov.uk/hydrology/station/" + ms[0].split("-gw-")[0]})
+    if not holes and asked and failed == asked:
+        raise IOError("the Environment Agency's groundwater readings couldn't be reached")
+    return [], {"boreholes": holes, "any_near": any(k <= GROUND_KM for k, _ in near)}
+
+
+# The grid now: carbon intensity and the mix (NESO's Carbon Intensity API), and the frequency (Elexon).
+def frequency_check(lo, hi):
+    """Britain's grid runs at 50 Hz: normally within 49.8-50.2, and by law within 49.5-50.5."""
+    if lo < 49.5 or hi > 50.5:
+        return 2, "Grid frequency outside its legal limits: %.2f Hz" % (lo if lo < 49.5 else hi)
+    if lo < 49.8:
+        return 1, "Grid frequency dipped to %.2f Hz" % lo
+    return 0, ""
+
+
+def gridnow_live(cur, mix, freq, now):
+    ci = cur["intensity"].get("actual")
+    ci = cur["intensity"].get("forecast") if ci is None else ci
+    reading = {"ci": ci, "index": cur["intensity"].get("index") or "",
+               "mix": sorted(({"fuel": str(m.get("fuel")), "pct": round(float(m.get("perc") or 0), 1)}
+                              for m in mix if float(m.get("perc") or 0) > 0), key=lambda m: -m["pct"])[:6]}
+    items = []
+    if freq:
+        reading.update(hz=round(freq[-1], 3), hz_min=round(min(freq), 3), hz_max=round(max(freq), 3))
+        sev, title = frequency_check(min(freq), max(freq))
+        if sev:
+            items.append({"id": "gridnow:%s" % now.strftime("%Y-%m-%dT%H"), "source": "gridnow", "kind": "grid",
+                          "severity": sev, "level": "Frequency", "title": title,
+                          "text": "A dip like this usually means a large power station or link has tripped. The grid "
+                                  "is designed to cope; a short power cut is possible if it goes on.",
+                          "area": "Great Britain", "when": "", "url": "https://bmrs.elexon.co.uk/system-frequency",
+                          "issued": iso_utc(now)})
+    return items, reading
+
+
+def fetch_gridnow(now):
+    cur = _json(http_get(FEED_URLS["ci_now"]))["data"][0]
+    try:
+        mix = (_json(http_get(FEED_URLS["ci_mix"])).get("data") or {}).get("generationmix") or []
+    except Exception:
+        mix = []
+    freq = []
+    try:
+        got = _json(http_get(FEED_URLS["frequency"].format(
+            start=(now - dt.timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"), end=now.strftime("%Y-%m-%dT%H:%M:%SZ"))))
+        freq = [float(x["frequency"]) for x in (got.get("data", got) if isinstance(got, dict) else got)
+                if isinstance(x, dict) and x.get("frequency")]
+    except Exception:
+        pass
+    return gridnow_live(cur, mix, freq, now)
+
+
+# Grid stress: the spare margin over the next 14 hours and two weeks (Elexon), and NESO's Demand
+# Flexibility Service events.
+def dfs_events(rows, today):
+    out = []
+    for r in sorted(rows, key=lambda r: (r.get("Delivery Date") or "", r.get("From_Local") or "")):
+        d = str(r.get("Delivery Date") or "")[:10]
+        if d < today.isoformat():
+            continue
+        mw = int(_f0(r.get("Service Requirement MW")) or 0)
+        if out and out[-1][0] == d and out[-1][3] == r.get("Event Type") and out[-1][2] == r.get("From_Local"):
+            out[-1] = (d, out[-1][1], r.get("To_Local"), out[-1][3], max(out[-1][4], mw))
+        else:
+            out.append((d, r.get("From_Local"), r.get("To_Local"), r.get("Event Type"), mw))
+    return out
+
+
+def gridstress_live(slots, days, dfs, now):
+    latest = {}
+    for r in slots:   # several forecasts for each half-hour: keep the newest
+        k = r.get("startTime")
+        if k and _f0(r.get("deratedMargin")) is not None and (k not in latest or r.get("publishTime", "") > latest[k].get("publishTime", "")):
+            latest[k] = r
+    rows = sorted(latest.values(), key=lambda r: r["startTime"])
+    if not rows:
+        raise ValueError("no margin forecast from Elexon")
+    tight = min(rows, key=lambda r: _f0(r["deratedMargin"]))
+    margin = _f0(tight["deratedMargin"])
+    lolp = max(_f0(r.get("lossOfLoadProbability")) or 0 for r in rows)
+    fortnight = sorted({d["forecastDate"]: d for d in days if isinstance(d, dict) and _f0(d.get("margin")) is not None
+                        and d.get("forecastDate")}.values(), key=lambda d: d["forecastDate"])
+    low = min(fortnight, key=lambda d: _f0(d["margin"])) if fortnight else None
+    reading = {"margin_mw": round(margin), "at": tight["startTime"], "lolp": lolp,
+               "low_mw": round(_f0(low["margin"])) if low else None, "low_on": low["forecastDate"] if low else None,
+               "dfs": [{"day": d, "from": a, "to": b, "kind": str(k or ""), "mw": mw} for d, a, b, k, mw in dfs[:4]]}
+    items = []
+    sev = 2 if margin < 1000 or lolp >= 0.01 else 1 if margin < 3000 else 0
+    if sev:
+        items.append({"id": "gridstress:%s" % tight["startTime"][:13], "source": "gridstress", "kind": "grid",
+                      "severity": sev, "level": "Tight margin",
+                      "title": "Electricity margin tight: %.1f GW spare at %s" % (margin / 1000.0,
+                                                                                    _hhmm_local(tight["startTime"])),
+                      "text": "The spare generating capacity once likely breakdowns are allowed for. Above about 3 GW "
+                              "is comfortable. Charge power banks, and use less between 4 and 7pm.",
+                      "area": "Great Britain", "when": "", "url": "https://bmrs.elexon.co.uk/",
+                      "issued": iso_utc(now)})
+    return items, reading
+
+
+def _hhmm_local(t):
+    d = parse_when(t)
+    return d.astimezone().strftime("%H:%M") if d else ""
+
+
+def fetch_gridstress(now):
+    got = _json(http_get(FEED_URLS["margin"].format(start=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                                    end=(now + dt.timedelta(hours=14)).strftime("%Y-%m-%dT%H:%M:%SZ"))))
+    slots = got.get("data", got) if isinstance(got, dict) else got
+    days, dfs = [], []
+    try:
+        d = _json(http_get(FEED_URLS["margin_daily"]))
+        days = d.get("data", d) if isinstance(d, dict) else d
+    except Exception:
+        pass
+    try:
+        sql = ('SELECT "Delivery Date","From_Local","To_Local","Event Type","Service Requirement MW" FROM "%s" '
+               'ORDER BY "Delivery Date" DESC, "From_Local" ASC LIMIT 60' % DFS_RESOURCE)
+        rows = (_json(http_get(FEED_URLS["dfs"] + urllib.parse.urlencode({"sql": sql}), timeout=60))   # it can take a minute
+                .get("result") or {}).get("records") or []
+        dfs = dfs_events(rows, now.date())
+    except Exception:
+        pass
+    return gridstress_live(slots if isinstance(slots, list) else [], days if isinstance(days, list) else [], dfs, now)
+
+
+# Water supply: the reports behind six water companies' "in your area" maps and pages. Cambridge Water and South Staffs
+# Water share one public ArcGIS layer; Yorkshire Water, and South West Water and Bournemouth Water (the same kind of
+# feed), have their own; NI Water's are read from its service updates page. None is an official feed, so any could
+# change. Each is the company's whole list, picked through here. Your company is the one you choose in the warnings
+# settings: it isn't guessed (much of Birmingham is Severn Trent, not South Staffs Water), except in Northern
+# Ireland, where NI Water supplies everyone. Other companies don't publish theirs this way (water_coverage).
+WATER_PAGES = {"Cambridge Water": "https://www.cambridge-water.co.uk/incidents/in-my-area/",
+               "South Staffs Water": "https://www.south-staffs-water.co.uk/incidents/in-my-area/",
+               "Yorkshire Water": "https://www.yorkshirewater.com/your-water/problems-in-your-area/",
+               "South West Water": "https://www.southwestwater.co.uk/in-your-area",
+               "Bournemouth Water": "https://www.bournemouthwater.co.uk/in-your-area",
+               "NI Water": "https://www.niwater.com/whats-happening-in-your-area/current-service-updates"}
+WATER_REGIONS = {"Cambridge Water": "C", "South Staffs Water": "S"}   # on the one ArcGIS layer
+WATER_CLOSE_KM = 3     # two or more supply problems this close are probably yours...
+WATER_SURE_KM = 1      # ...or one this close (one a couple of km off could be another street's burst main)
+WATER_NEAR_KM = 10     # ...and these are listed
+WATER_ONLY = "Only covers " + ", ".join(list(WATER_PAGES)[:-1]) + " and " + list(WATER_PAGES)[-1] + " customers"
+WATER_CHOOSE = "Choose your water company under Where you are"
+WATER_SEVERE = re.compile(r"do not drink|don't drink|boil (your )?water|boil notice|do not use|no water|without water|"
+                          r"loss of (water )?supply|interruption|supply (is )?off", re.I)
+WATER_DONE = re.compile(r"finished our work|should now be resolved|has been resolved|been restored|now restored|"
+                        r"thank (all )?(of )?our customers for their patience|work (is|has been) completed", re.I)
+
+
+def water_company(cfg, home):
+    """Your water company: the one chosen in the warnings settings. Not guessed, except NI Water in Northern Ireland."""
+    if cfg.get("water_co"):
+        return cfg["water_co"]
+    return "NI Water" if home_nation(home) == "northern ireland" else ""
+
+
+def water_coverage(cfg, home):
+    """(covered, why not). Only six water companies publish their supply problems, and only once you've said which
+    is yours."""
+    if not home:
+        return False, "Needs your home location"
+    co = water_company(cfg, home)
+    return (True, "") if co in WATER_PAGES else (False, WATER_CHOOSE if not co else WATER_ONLY)
+
+
+def _report(group, what, place, lat, lon, when=None, text="", url="", rings=None, reach_km=None):
+    """One water company's report, whichever company it came from. group: supply (no water, low pressure), quality,
+    planned, leak or other."""
+    return {"group": group, "what": plain(str(what or ""), 80) or "Report", "place": plain(str(place or ""), 100),
+            "lat": lat, "lon": lon, "when": when, "text": plain(str(text or ""), 400), "url": safe_url(url),
+            "rings": rings or [], "reach_km": reach_km}
+
+
+def aptumo_reports(data, region):
+    """Cambridge Water ("C") and South Staffs Water ("S")."""
+    doc = _json(data)
+    err = doc.get("error") if isinstance(doc, dict) else "something unexpected"
+    if err or not isinstance(doc.get("features") or [], list):
+        raise ValueError("the incidents map said: %s" % plain(str(err.get("message") if isinstance(err, dict)
+                                                                  else err or "something unexpected"), 120))
+    out = []
+    for f in doc.get("features") or []:
+        a = f.get("attributes") if isinstance(f, dict) and isinstance(f.get("attributes"), dict) else {}
+        g = f.get("geometry") if isinstance(f, dict) and isinstance(f.get("geometry"), dict) else {}
+        if a.get("Region__c") != region or _f0(g.get("y")) is None or _f0(g.get("x")) is None:
+            continue
+        group, kind = str(a.get("JobGroup__c") or ""), str(a.get("JobType__c") or "Report")
+        out.append(_report("supply" if group.lower() == "supply" else "leak" if "leak" in group.lower() else "other",
+                           kind[:1].upper() + kind[1:].lower(), "", _f0(g["y"]), _f0(g["x"]),
+                           uk_local_to_utc(a.get("ReportedDate__c")), "" if group.lower() == "supply" else group))
+    return out
+
+
+YW_GROUPS = {"water supply": "supply", "water quality": "quality", "planned works": "planned", "bursts and leaks": "leak",
+             "being investigated": "other"}   # roadworks and sewage reports aren't about your water supply
+
+
+def yorkshire_reports(data):
+    doc = _json(data)
+    if not isinstance(doc, dict) or not isinstance(doc.get("data"), list):
+        raise ValueError("Yorkshire Water's list has changed")
+    out = []
+    for e in doc["data"]:
+        group = YW_GROUPS.get(str(e.get("category") or "").strip().lower()) if isinstance(e, dict) else None
+        if not group or _f0(e.get("latitude")) is None or _f0(e.get("longitude")) is None:
+            continue
+        if WATER_DONE.search(str(e.get("latestUpdate") or "")):
+            continue   # put right, but still on the map for a while
+        reach = _f0(e.get("radiusDistance"))
+        what = re.sub(r"\s+(reported\s+)?in this area$", "", str(e.get("title") or e.get("category") or ""), flags=re.I)
+        out.append(_report(group, what, str(e.get("location") or "").strip(" ,"),
+                           _f0(e.get("latitude")), _f0(e.get("longitude")), uk_local_to_utc(e.get("lastUpdated")),
+                           e.get("latestUpdate"), str(e.get("detailsUrl") or "") if str(e.get("detailsUrl") or "")
+                           .startswith("https://www.yorkshirewater.com/") else "",
+                           reach_km=min(10.0, reach / 1000.0) if reach else None))
+    return out
+
+
+SWW_GROUPS = {"unplanned interruption": "supply", "planned interruption": "planned", "reported leak": "leak",
+              "flushing": "planned"}   # not reservoir and lake news, or engineering schemes
+
+
+def _sww_over(e, now):
+    """Has a South West Water or Bournemouth Water job finished? Past its end, or, when the end is "23:59 the next
+    day" (a stand-in, not a real time), once that next day has come."""
+    end, start = uk_local_to_utc(e.get("endDate")), uk_local_to_utc(e.get("startDate"))
+    if end and end < now - dt.timedelta(hours=1):
+        return True
+    raw_end, raw_start = str(e.get("endDate") or "")[:16], str(e.get("startDate") or "")[:10]
+    try:
+        stand_in = raw_end[11:16] == "23:59" and (dt.date.fromisoformat(raw_end[:10]) - dt.date.fromisoformat(raw_start)).days == 1
+    except ValueError:
+        return False
+    return bool(stand_in and start and start <= now and now.date().isoformat() >= raw_end[:10])
+
+
+def _one_place(text):
+    """'Union Street, Plymouth, Union Street, Plymouth, PL1 2AB' -> 'Union Street, Plymouth, PL1 2AB'."""
+    parts = []
+    for p in str(text or "").split(","):
+        p = p.strip()
+        if p and p.lower() not in [x.lower() for x in parts]:
+            parts.append(p)
+    return ", ".join(parts)
+
+
+def sww_reports(data, now):
+    """South West Water and Bournemouth Water. Each job's outline is [lon, lat] points."""
+    doc = _json(data)
+    if not isinstance(doc, dict) or not isinstance(doc.get("serviceData"), list):
+        raise ValueError("the water company's list has changed")
+    out = []
+    for e in doc["serviceData"]:
+        group = SWW_GROUPS.get(str(e.get("categoryTitle") or "").strip().lower()) if isinstance(e, dict) else None
+        try:
+            lat, lon = [float(x) for x in str(e.get("coordinatesString") or "").split()[:2]]
+        except (ValueError, AttributeError):
+            continue
+        if not group or _sww_over(e, now):
+            continue
+        first = re.split(r"</p>", str(e.get("description") or e.get("summary") or ""), maxsplit=1, flags=re.I)[0]
+        if WATER_DONE.search(first):
+            continue
+        poly = e.get("polygon") if isinstance(e.get("polygon"), dict) else {}
+        ring = [[_f0(p[0]), _f0(p[1])] for p in poly.get("polygonPoints") or [] if isinstance(p, list) and len(p) >= 2]
+        ring = [p for p in ring if p[0] is not None and p[1] is not None]
+        out.append(_report(group, e.get("categoryTitle"), _one_place(e.get("address") or e.get("streetArea") or e.get("postCode")),
+                           lat, lon, uk_local_to_utc(e.get("startDate") or e.get("publishDate")), first,
+                           rings=[ring] if len(ring) >= 4 else []))
+    return out
+
+
+def niwater_reports(data):
+    """NI Water's current service updates (no data feed: read from the page itself)."""
+    page = data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data)
+    out = []
+    for block in re.split(r'<div class="site grid-item', page)[1:]:
+        head = block[:600]
+        status = (re.search(r'data-event-status="([^"]*)"', head) or [None, ""])[1]
+        cat = (re.search(r'data-category="([^"]*)"', head) or [None, ""])[1].lower()
+        m = re.search(r"<li>\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*</li>", block)
+        if (status and status.lower() != "active") or not m:
+            continue
+        what = plain((re.search(r"<strong>(.*?)</strong>", block, re.S) or [None, ""])[1], 60) or "Service update"
+        until = plain((re.search(r'class="restoration">(.*?)</span>', block, re.S) or [None, ""])[1], 80)
+        # The event's own start ("Estimated start time: ..."); "Last updated" beside it is when the page was.
+        start = re.search(r'class="starttime">[^<0-9]*(\d{1,2} [A-Za-z]+ \d{4} \d{1,2}:\d{2})', block) or \
+            re.search(r"Last\s+updated:\s*(\d{1,2} [A-Za-z]+ \d{4} \d{1,2}:\d{2})", block)
+        try:
+            when = uk_local_to_utc(dt.datetime.strptime(start.group(1), "%d %B %Y %H:%M").isoformat()) if start else None
+        except ValueError:
+            when = None
+        text = next((plain(p, 300) for p in re.findall(r"<p>(.*?)</p>", block, re.S) if "NI Water" in p or "Customers" in p), "")
+        group = "planned" if re.search(r"(?<!un)planned", cat) else "quality" if re.search(r"quality|boil|discolou?r", cat) \
+            else "supply"
+        out.append(_report(group, what, plain((re.search(r'<h3 class="title">(.*?)</h3>', block, re.S) or [None, ""])[1], 100),
+                           float(m.group(1)), float(m.group(2)), when, " ".join(x for x in (text, until + "." if until else "") if x)))
+    return out
+
+
+def water_reports(co, now):
+    if co in WATER_REGIONS:
+        return aptumo_reports(http_get(FEED_URLS["water"], timeout=30), WATER_REGIONS[co])
+    if co == "Yorkshire Water":
+        return yorkshire_reports(http_get(FEED_URLS["water_yorkshire"], timeout=30))
+    if co in ("South West Water", "Bournemouth Water"):
+        return sww_reports(http_get(FEED_URLS["water_southwest" if co == "South West Water" else "water_bournemouth"],
+                                    timeout=30), now)
+    if co == "NI Water":
+        return niwater_reports(http_get(FEED_URLS["water_ni"], timeout=30))
+    return []
+
+
+def water_live(reports, co, home, now):
+    """A supply problem is yours when the company says home's area is affected (its outline or reach takes home in),
+    or two or more are reported within 3 km, or one within 1 km. One further off is listed, and worth watching, but
+    it isn't a warning: it may be another street's burst main."""
+    near = []
+    for r in reports:
+        if r["lat"] is None or r["lon"] is None:
+            continue
+        km = km_between(home["lat"], home["lon"], r["lat"], r["lon"])
+        if km > WATER_NEAR_KM:
+            continue
+        said = bool(r["rings"] and in_rings(r["rings"], home["lat"], home["lon"])) or bool(r["reach_km"] and km <= r["reach_km"])
+        near.append(dict(r, km=round(km, 1), said=said))
+    near.sort(key=lambda x: x["km"])
+    close = sum(1 for x in near if x["group"] in ("supply", "quality") and x["km"] <= WATER_CLOSE_KM)
+    items, rows = [], []
+    for x in near:
+        yours = x["said"] or (x["km"] <= WATER_CLOSE_KM and (close >= 2 or x["km"] <= WATER_SURE_KM))
+        if yours and x["group"] in ("supply", "quality"):
+            items.append({"id": "water:%s:%s:%s" % (x["what"], x["km"], iso_utc(x["when"])[:13]), "source": "water",
+                          "kind": "water", "severity": 2 if WATER_SEVERE.search(x["what"] + " " + x["text"]) else 1,
+                          "level": "Water supply", "title": "%s reported %s" % (
+                              x["what"], "right by home" if x["km"] < 0.1 else _km_words(x["km"]) + " away"),
+                          "text": ((x["text"] + " ") if x["text"] else "") + "Reported to %s. If your taps are affected, "
+                                  "check %s's website or call them, and use your stored water." % (co, co),
+                          "area": x["place"] or co, "when": "", "url": x["url"] or WATER_PAGES[co],
+                          "issued": iso_utc(x["when"]) or iso_utc(now), "distance_km": int(round(x["km"])), "by": co})
+        rows.append({"kind": x["what"], "group": {"supply": "Supply", "quality": "Water quality", "planned": "Planned work",
+                                                   "leak": "Leak"}.get(x["group"], "Other"),
+                     "km": x["km"], "issued": iso_utc(x["when"]), "where": x["place"], "yours": bool(yours),
+                     "url": x["url"]})
+    supply = [x for x in near if x["group"] in ("supply", "quality")]
+    return items, {"company": co, "reports": rows[:10], "supply": len(supply), "url": WATER_PAGES[co],
+                   "close": sum(1 for x in supply if x["km"] <= WATER_CLOSE_KM),
+                   "planned_here": sum(1 for x in near if x["group"] == "planned" and x["said"])}
+
+
+DFS_RESOURCE = "3635fd80-49d7-4d02-964d-cc8c08d50302"
+
+
+
 LIVE_LOOK = {"rivers": ("🏞️", "Rivers"), "power": ("🔌", "Power cuts"), "grid": ("⚡", "The grid"),
              "gas": ("🔥", "Gas storage"), "air": ("🌫️", "Air quality"), "space": ("☀️", "Space weather"),
-             "pound": ("💷", "The pound")}
+             "pound": ("💷", "The pound"), "threat": ("🛡️", "Threat level"), "cyber": ("💻", "Cyber security"),
+             "travel": ("✈️", "Travel advice"), "drought": ("💧", "Drought and reservoirs"), "water": ("🚰", "Water supply"),
+             "floodrisk": ("🌧️", "Flood risk forecast"), "rain": ("☔", "Rainfall"), "ground": ("🕳️", "Groundwater"),
+             "gridnow": ("🔋", "The grid now"), "gridstress": ("📉", "Grid margin")}
 TREND_WORDS = {"rising": "rising", "falling": "falling", "steady": "steady"}
 
 
@@ -6877,14 +8670,18 @@ def live_rows(live, items):
             continue
         emoji, name = LIVE_LOOK[key]
         text, state = "", "good"
+        brief = None   # the line for the daily briefing, where the app's names a place right by home
         if key == "rivers":
             w = r.get("worst")
             if not w:
                 text = "No river gauges within %d km" % RIVER_KM
             else:
                 text = "%s: %s, %s" % (w["where"], RIVER_WORDS[w["state"]].lower(), TREND_WORDS.get(w["trend"], w["trend"]))
+                brief = "%s near home: %s, %s" % (w["river"] or "A river", RIVER_WORDS[w["state"]].lower(),
+                                                 TREND_WORDS.get(w["trend"], w["trend"]))
                 if r.get("count", 0) > 1:
                     text += " · %d gauges nearby" % r["count"]
+                    brief += " · %d gauges nearby" % r["count"]
         elif key == "power":
             if r["count"]:
                 c = [x for x in r["cuts"] if not x["planned"]][0] if any(not x["planned"] for x in r["cuts"]) else None
@@ -6895,6 +8692,12 @@ def live_rows(live, items):
                 text = "None within %d km" % POWER_KM
             if r.get("planned"):
                 text += " · %d planned" % r["planned"]
+            brief = re.sub(r", nearest [^·]*?(?= ·|$)", "", text)   # how far the nearest is says where home is
+            if r.get("no_feed"):   # home's own network doesn't publish its power cuts
+                text += " · %s has no live feed" % r["no_feed"]
+                state = "warn" if state == "good" else state
+            if r.get("failed"):
+                text += " · couldn't check " + and_join(r["failed"])
         elif key == "grid":
             text = r["text"]
             state = {"normal": "good", "notice": "warn", "demand": "bad"}.get(r["status"], "good")
@@ -6925,13 +8728,72 @@ def live_rows(live, items):
             text = " · ".join(bits)
             if r.get("usd_week") is not None and abs(r["usd_week"]) >= 1:
                 text += " · %s%% on the dollar this week" % _signed(r["usd_week"])
+        elif key == "threat":
+            text = "%s: %s" % (r["level"].title(), r["means"]) + (" · raised this week" if r.get("raised_on") else "")
+            state = "bad" if r["level"] == "CRITICAL" else "warn" if r.get("raised_on") or r["level"] == "SEVERE" else "good"
+        elif key == "cyber":
+            text = ("%d urgent alert%s · " % (r["urgent"], "" if r["urgent"] == 1 else "s") if r["urgent"] else "") + \
+                ("Latest: " + r["news"][0]["title"] if r["news"] else "Nothing new in the last two weeks")
+        elif key == "travel":
+            n = len(r["changes"])
+            text = ("%d countr%s updated in 3 days" % (n, "y" if n == 1 else "ies")) if n else "No changes in 3 days"
+            if r["against"]:
+                text += " · against travel: " + ", ".join(r["against"][:3])
+        elif key == "drought":
+            bits = []
+            if r.get("storage") is not None:
+                bits.append("Reservoirs %s%% full" % fq(r["storage"]) +
+                            (" (%s%% %s average)" % (fq(abs(r["vs_average"])), "below" if r["vs_average"] < 0 else "above")
+                             if r.get("vs_average") else ""))
+            if r.get("area"):
+                bits.append("%s: %s" % (r["area"], (r.get("stage") or "normal").lower()))
+            elif r.get("counts"):
+                bits.append(", ".join("%d %s" % (v, k.lower()) for k, v in r["counts"].items()))
+            if r.get("ban"):
+                bits.append("hosepipe ban")
+            text = " · ".join(bits) or "No report this week"
+            if r.get("stale"):
+                text = "No report since %s" % r.get("week")
+        elif key == "water":
+            text = ("%d supply report%s within %d km" % (r["supply"], "" if r["supply"] == 1 else "s", WATER_NEAR_KM)
+                    if r["supply"] else "No supply problems reported within %d km" % WATER_NEAR_KM) + " · " + r["company"]
+            if r.get("close"):   # within 3 km: maybe yours (a warning when it's sure)
+                state = "warn"
+            if r.get("planned_here"):
+                text += " · planned work may affect home"
+        elif key == "floodrisk":
+            text = "%s%s" % (r.get("word") or r["risk"].capitalize(), ", rising" if r.get("rising") else "")
+            if r.get("days"):
+                text += " · next %d days" % r["days"]
+            state = {"MEDIUM": "warn", "HIGH": "bad"}.get(r["risk"], "good")
+        elif key == "rain":
+            text = ("%s mm in 24 hours · %s mm this week" % (fq(r["day_mm"]), fq(round(r["week_mm"])))
+                    if r.get("day_mm") is not None else "No rain gauge within %d km" % RAIN_KM)
+        elif key == "ground":
+            b = r.get("boreholes") or []
+            # A deep borehole (below sea level) follows decades, not this year's rain: shown, never worth watching.
+            text = ("%s: %s for the time of year%s" % (b[0]["name"], b[0]["band"], " (a deep borehole)" if b[0].get("deep") else "")
+                    if b else "No recent readings from the boreholes near home" if r.get("any_near")
+                    else "No borehole within %d km" % GROUND_KM)
+            brief = "Groundwater near home: %s for the time of year" % b[0]["band"] if b else None
+            state = "warn" if b and b[0]["pct"] < 13 and not b[0].get("deep") else "good"
+        elif key == "gridnow":
+            text = "%s g CO2/kWh (%s)" % (r.get("ci"), r.get("index") or "")
+            if r.get("hz"):
+                text += " · %.2f Hz" % r["hz"]
+        elif key == "gridstress":
+            text = "%s GW spare at worst, %s" % (fq(round(r["margin_mw"] / 1000.0, 1)), _hhmm_local(r["at"]))
+            if r.get("low_mw") is not None:
+                text += " · 2 weeks: %s GW lowest" % fq(round(r["low_mw"] / 1000.0, 1))
+            if r.get("dfs"):
+                text += " · demand flexibility event"
         if worst.get(key, 0) >= 2:
             state = "bad"
         elif worst.get(key, 0) == 1 and state == "good":
             state = "warn"
         rows.append({"key": key, "emoji": emoji, "name": name, "text": text, "state": state,
                      "dot": {"good": "🟢", "warn": "🟡", "bad": "🔴"}[state], "checked_at": r.get("checked_at"),
-                     "credit": r.get("credit", "")})
+                     "credit": r.get("credit", ""), "brief": brief or text})
     return rows
 
 
@@ -6956,33 +8818,54 @@ def fetch_live(key, cfg, home, mem, now):
     if key == "pound":
         start = (now.date() - dt.timedelta(days=40)).strftime("%d/%b/%Y")
         return pound_live(parse_pound(http_get(FEED_URLS["pound"].format(start=start))), now)
+    if key == "threat":
+        return fetch_threat(mem, now)
+    if key == "cyber":
+        return cyber_live(parse_ncsc(http_get(FEED_URLS["cyber"]), now), now)
+    if key == "travel":
+        return travel_live(parse_fcdo(http_get(FEED_URLS["travel"]), now))
+    if key == "drought":
+        return fetch_drought(cfg, mem)
+    if key == "floodrisk":
+        return fetch_floodrisk(home)   # Scotland's own forecast for a home there
+    if key == "gridnow":
+        return fetch_gridnow(now)
+    if key == "gridstress":
+        return fetch_gridstress(now)
     if not home:
         raise NeedLocation()
     if key == "rivers":
-        cache = mem["river_stations"]
-        spot = [round(home["lat"], 2), round(home["lon"], 2)]
-        old = (time.time() - (cache.get("t") or 0)) > 7 * 86400
-        if old or cache.get("home") != spot or not isinstance(cache.get("stations"), list):
-            st = parse_river_stations(http_get(FEED_URLS["river_stations"], timeout=60), home)
-            cache.clear()
-            cache.update({"t": time.time(), "home": spot, "stations": st})
-        return rivers_live(cache["stations"], parse_river_readings(http_get(FEED_URLS["rivers"], timeout=40)),
-                           mem["river_history"], home, now)
+        stations, levels = [], {}
+        for name, nations, fn in RIVER_PROVIDERS:
+            if not covers(home, nations, RIVER_KEEP_KM):
+                continue
+            try:
+                st, lv = fn(home, mem)
+            except Exception as e:   # home's own nation's gauges failing fails the source; a neighbour's doesn't
+                if home_nation(home) in nations:
+                    raise
+                print("Rivers: couldn't check %s's gauges (%s)" % (name, why_failed(e)), flush=True)
+                continue
+            stations += st
+            levels.update(lv)
+        return rivers_live(stations, levels, mem["river_history"], home, now)
     if key == "power":
-        cuts, worked, err = [], 0, None
-        for url_key, kind in POWER_FEEDS:
-            if not FEED_URLS.get(url_key):
+        cuts, worked, err, failed = [], 0, None, []
+        for url_key, kind, areas in POWER_FEEDS:
+            if not FEED_URLS.get(url_key) or (areas and not dno_covers(home, areas, POWER_KM)):
                 continue
             try:
                 data = http_get(FEED_URLS[url_key], timeout=30)
-                cuts += {"ukpn": parse_ukpn, "ssen": parse_ssen, "npg": parse_npg}[kind](data) if kind != "nged" \
-                    else parse_nged(data, now)
+                cuts += parse_nged(data, now) if kind == "nged" else parse_nie(data, now) if kind == "nie" else \
+                    {"ukpn": parse_ukpn, "ssen": parse_ssen, "npg": parse_npg, "enwl": parse_enwl}[kind](data)
                 worked += 1
-            except Exception as e:   # one network's feed being down shouldn't hide the others
+            except Exception as e:   # one network's feed being down (or changing shape) shouldn't hide the others
                 err = e
+                failed.append(POWER_NAMES[kind])
         if not worked and err:
             raise err
-        return power_live(cuts, home)
+        mine = DNO_NAMES.get(dno_area(home["lat"], home["lon"]))
+        return power_live(cuts, home, failed, mine if mine in NO_LIVE_FEED else "")
     if key == "air":
         sites = parse_air_sites(http_get(FEED_URLS["air"]))
         fc = mem["air_forecast"]
@@ -6994,6 +8877,13 @@ def fetch_live(key, cfg, home, mem, now):
             except Exception:
                 pass   # the current readings are still worth having
         return air_live(sites, fc.get("fc"), home, now)
+    if key == "water":
+        co = water_company(cfg, home)
+        return water_live(water_reports(co, now), co, home, now)
+    if key == "rain":
+        return fetch_rain(home, mem, now)
+    if key == "ground":
+        return fetch_ground(home, mem, now)
     raise ValueError("unknown source")
 
 
@@ -7016,25 +8906,7 @@ def fetch_source(key, cfg, home, region, mem, now):
         return parse_gdacs(http_get(FEED_URLS["gdacs"]), home, cfg["gdacs_km"])
     if key == "fires":
         return fires_near(home, cfg["fire_km"], mem["fire_cells"], now, mem["fire_ignore"])
-    # Floods: look up where each flood area is (once), then keep the ones near you.
-    areas = mem["areas"]
-    out, looked = [], 0
-    for r in parse_floods(http_get(FEED_URLS["floods"])):
-        centre = areas.get(r["area_id"])
-        if centre is None:
-            if looked >= FLOOD_LOOKUPS:
-                continue
-            looked += 1
-            try:
-                centre = areas[r["area_id"]] = flood_centre(r["area_id"])
-            except Exception:
-                continue
-        d = km_between(home["lat"], home["lon"], centre[0], centre[1])
-        if d <= cfg["flood_km"]:
-            r["distance_km"] = int(round(d))
-            r["lat"], r["lon"] = round(centre[0], 4), round(centre[1], 4)   # so Places can steer away from it
-            out.append(r)
-    return out
+    return fetch_floods(cfg, home, mem)
 
 
 def home_key(home):
@@ -7059,12 +8931,15 @@ def warnings_run():
         cfg = warn_cfg()
         mem = {"areas": setting_raw("flood_areas", {}) or {}, "fire_cells": setting_raw("fire_cells", {}) or {},
                "fire_ignore": fire_ignore_list(), "river_stations": setting_raw("river_stations", {}) or {},
-               "river_history": setting_raw("river_history", {}) or {}, "air_forecast": setting_raw("air_forecast", {}) or {}}
+               "river_history": setting_raw("river_history", {}) or {}, "air_forecast": setting_raw("air_forecast", {}) or {},
+               "rain_stations": setting_raw("rain_stations", {}) or {}}
     if not cfg["on"]:
         return
     home = home_location(cfg)
     region = cfg["region"] or guess_region(home) or "UK"
     now = dt.datetime.now(dt.timezone.utc)
+    if cfg["sources"].get("govalerts") and home:
+        refresh_home_places(home)   # which Emergency Alerts cover home: its county, district and region
     with WARN_LOCK:
         prev = json.loads(json.dumps(WARN_STATE))
     by_src = {}
@@ -7073,7 +8948,7 @@ def warnings_run():
     statuses, any_ok = {}, False
     mem["live"] = live = dict(prev.get("live") or {})
     for key, _, _ in WARN_SOURCES:
-        if not cfg["sources"][key]:
+        if not cfg["sources"][key] or not source_covers(key, cfg, home)[0]:   # off, or not for where you live
             by_src.pop(key, None)
             live.pop(key, None)
             continue
@@ -7124,6 +8999,7 @@ def warnings_run():
         set_setting_raw(db, "river_stations", mem["river_stations"])
         set_setting_raw(db, "river_history", mem["river_history"])
         set_setting_raw(db, "air_forecast", mem["air_forecast"])
+        set_setting_raw(db, "rain_stations", mem["rain_stations"])   # each provider's gauges, kept for a week
     with WARN_LOCK:
         WARN_STATE.clear()
         WARN_STATE.update(state)
@@ -7138,14 +9014,14 @@ def warnings_run():
 def warning_event(new):
     """Event data for new warnings, for phone alerts."""
     def line(w):
-        return "%s (%s)" % (w["title"], WARN_SOURCE_NAMES.get(w["source"], w["source"]))
+        return "%s (%s)" % (w["title"], w.get("by") or WARN_SOURCE_NAMES.get(w["source"], w["source"]))
     if len(new) == 1:
         message = line(new[0]) + "."
     else:
         message = "%d new warnings: %s." % (len(new), "; ".join(line(w) for w in new[:5])
                                           + ("; and %d more" % (len(new) - 5) if len(new) > 5 else ""))
     return {"count": len(new), "max_severity": max(w["severity"] for w in new), "message": message,
-            "items": [{k: w.get(k) for k in ("title", "level", "severity", "source", "area", "url")}
+            "items": [{k: w.get(k) for k in ("title", "level", "severity", "source", "area", "url", "by") if k != "by" or w.get(k)}
                       for w in new[:LIST_LIMIT]]}
 
 
@@ -7176,6 +9052,40 @@ def load_warnings():
                     WARN_STATE[k] = cached[k]
 
 
+def nation_coverage(nations, why):
+    """(covered, why not) for a source that only exists in these nations. With home not known (or outside the UK)
+    it's on, as before: the source then says what it can."""
+    def check(cfg, home):
+        nation = home_nation(home)
+        return (True, "") if not nation or nation in nations else (False, why)
+    return check
+
+
+GB_ONLY = "Only covers Great Britain (Northern Ireland's grid is run with Ireland's)"
+
+# Sources that only apply in some places: (covered, why not). One that doesn't cover home isn't fetched, and says
+# "Not available for your area" in the settings (never "failing"). Everything else is for the whole UK, with
+# regional providers behind some of it (FLOOD_PROVIDERS, RIVER_PROVIDERS, RAIN_PROVIDERS, POWER_FEEDS, WATER_PAGES).
+SOURCE_COVERAGE = {
+    "water": water_coverage,
+    "floods": nation_coverage(GB, "There's no flood warning feed for Northern Ireland yet"),
+    "rivers": nation_coverage(GB, "There's no river level feed for Northern Ireland yet"),
+    "floodrisk": nation_coverage(("england", "scotland"), "There's no open flood risk forecast for Wales or Northern "
+                                                           "Ireland just now"),
+    "rain": nation_coverage(GB, "No rain gauges for Northern Ireland yet (the Environment Agency, SEPA and Natural "
+                                "Resources Wales cover Great Britain)"),
+    "ground": nation_coverage(("england",), "Only covers England (the Environment Agency's boreholes)"),
+    "drought": nation_coverage(("england",), "Only covers England (the Environment Agency's weekly drought report)"),
+    "grid": nation_coverage(GB, GB_ONLY), "gridnow": nation_coverage(GB, GB_ONLY), "gridstress": nation_coverage(GB, GB_ONLY),
+}
+
+
+def source_covers(key, cfg, home):
+    """(covered, why not) for where home is. A source that doesn't cover home isn't fetched or shown."""
+    check = SOURCE_COVERAGE.get(key)
+    return check(cfg, home) if check else (True, "")
+
+
 def warn_public():
     """For the app: the settings, what's in force and how each source is doing."""
     cfg = warn_cfg()
@@ -7183,19 +9093,23 @@ def warn_public():
     with WARN_LOCK:
         st = json.loads(json.dumps(WARN_STATE))
     on = cfg["on"]
-    live = dict((k, v) for k, v in (st.get("live") or {}).items() if on and cfg["sources"].get(k))
+    unavailable = {k: source_covers(k, cfg, loc)[1] for k in SOURCE_COVERAGE if not source_covers(k, cfg, loc)[0]}
+    live = dict((k, v) for k, v in (st.get("live") or {}).items() if on and cfg["sources"].get(k) and k not in unavailable)
+    if unavailable:
+        st["items"] = [i for i in st["items"] if i.get("source") not in unavailable]
     return {"config": cfg, "on": on, "live": live, "live_rows": live_rows(live, st["items"] if on else []),
             "items": st["items"] if on else [], "news": st["news"] if on else [],
             "sources": st["sources"] if on else {}, "checked_at": st["checked_at"] if on else None,
             "location": loc, "region": cfg["region"] or guess_region(loc) or "UK", "region_guessed": not cfg["region"],
             "regions": [[c, n] for c, n, _, _ in MET_REGIONS], "source_list": [[k, n] for k, n, _ in WARN_SOURCES],
+            "ea_areas": sorted(EA_AREAS), "water_cos": WATER_COS, "unavailable": unavailable,
             "fire_ignored": len(fire_ignore_list()), "ha": bool(HA_TOKEN)}
 
 
 def warn_brief():
     """For Home Assistant and /api/summary."""
     w = warn_public()
-    keep = ("title", "level", "severity", "source", "area", "when", "url", "issued", "distance_km")
+    keep = ("title", "level", "severity", "source", "area", "when", "url", "issued", "distance_km", "event", "by")
     items = [dict({k: i.get(k) for k in keep if i.get(k) not in (None, "")}, text=(i.get("text") or "")[:300])
              for i in w["items"]]
     top = max([i["severity"] for i in w["items"]] or [0])
@@ -7236,6 +9150,12 @@ def api_warnings_set(body, query):
                              ("fire_km", 2, 50, "Fire distance")):
         if k in body:
             cur[k] = int(clean_num(body.get(k), cur[k], lo, hi, label))
+    for k, allowed in (("ea_area", EA_AREAS), ("water_co", WATER_COS)):
+        if k in body:
+            v = str(body.get(k) or "")
+            if v and v not in allowed:
+                raise ApiError(400, "That isn't one of the choices")
+            cur[k] = v
     with tx() as db:
         set_setting_raw(db, "warnings", cur)
         add_log("settings", "", "Warnings switched on" if cur["on"] and "on" in body and body.get("on")
@@ -7857,6 +9777,122 @@ def weather_kind(title):
     return None
 
 
+# --------------------------------------------------------------------------
+# What raises the household level. An Emergency Alert is sent to one area: only one that covers home counts
+# (an alert in another county is shown in the live panel, but doesn't raise yours). A disaster abroad only
+# counts if it can reach a UK home: one in the UK or Ireland, anything within 300 km, or a volcano within
+# 2,000 km (ash closes airports). An earthquake in Norway doesn't.
+# --------------------------------------------------------------------------
+HOME_PLACES = {"key": None, "names": [], "nation": "", "at": 0.0, "busy": False}
+NEAR_UK = re.compile(r"united kingdom|\buk\b|ireland|great britain", re.I)
+UK_WIDE = {"uk", "united kingdom", "uk wide", "whole uk", "nationwide"}
+GB_WIDE = {"great britain", "gb", "britain"}   # not Northern Ireland
+ONS_SUFFIX = re.compile(r",\s*(?:city|county) of\s*(?=,|;|$|\band\b)", re.I)   # "Bristol, City of" (as ONS has it)
+
+
+def area_name(s):
+    """An area's name as an alert's areas and home's are compared: lower case, plain words, without "parts of", "the
+    whole of", "City of", or a trailing "City" or "County of" (ONS has "Glasgow City", "Bristol, City of" and
+    "Herefordshire, County of"; alerts say "Glasgow", "Bristol" and "Herefordshire")."""
+    t = str(s or "").lower().replace("&", " and ")
+    t = re.sub(r"[’'`]", "", t)
+    t = re.sub(r"[^a-z]+", " ", t).strip()
+    t = re.sub(r"^(?:(?:in|across|all of|the whole of|whole of|some parts of|parts of|part of|areas of|the) )+", "", t)
+    t = re.sub(r" (?:city|county) of$", "", t)
+    if t != "city of london":   # the Square Mile, not London
+        t = re.sub(r"^city of ", "", t)
+    t = re.sub(r" (?:city|region)$", "", t)
+    t = re.sub(r"^(north|south) (east|west) england$", r"\1 \2", t)   # "South West England" is the South West region
+    return "london" if t == "greater london" else t
+
+
+def alert_parts(area):
+    """The whole names in an alert's areas: each between commas, and each part of one joined by "and" or "&" ("Wales
+    and South West England" is Wales, and South West England). A name is never found inside another: "North East
+    Lincolnshire" isn't the North East."""
+    out = set()
+    for piece in re.split(r"[,;/]", ONS_SUFFIX.sub("", str(area or ""))):
+        for bit in [piece] + re.split(r"\band\b|&", piece, flags=re.I):
+            bit = area_name(bit)
+            if bit:
+                out.add(bit)
+    return out
+
+
+def _lookup_places(key):
+    """District, county, region, constituency and nation for a point (rounded to about 100 m), from postcodes.io
+    (ONS data). Not wards or parishes: their names ("Central", "Castle") turn up in other places' names. The police
+    force area as well: a metropolitan district has no county, and it's the one that says "Greater Manchester"."""
+    names, nation = [], ""
+    try:
+        url = FEED_URLS.get("places", "https://api.postcodes.io/postcodes") + "?" + urllib.parse.urlencode(
+            {"lat": key[0], "lon": key[1], "limit": 1, "radius": 2000})
+        res = (json.loads(http_get(url)).get("result") or [None])[0] or {}
+        for f in ("admin_district", "admin_county", "region", "parliamentary_constituency",
+                  "parliamentary_constituency_2024", "pfa"):
+            v = area_name(res.get(f))
+            if v and v not in names:
+                names.append(v)
+        nation = area_name(res.get("country"))
+    except Exception as e:
+        print("Alert areas: couldn't look up home's county (%s); every Emergency Alert will count for now" % e, flush=True)
+    HOME_PLACES.update(key=key, names=names, nation=nation, busy=False, at=time.time())
+
+
+def _places_key(loc):
+    """Home to 3 decimal places (about 100 m): to 2, near a boundary, home can land in the next borough."""
+    try:
+        return (round(float(loc["lat"]), 3), round(float(loc["lon"]), 3))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def refresh_home_places(loc):
+    """Look up home's area if it's new, or the last try failed over an hour ago. Called from the warnings
+    loop (which is fetching anyway), never while working out the alert level."""
+    key = _places_key(loc)
+    if key is None or HOME_PLACES["busy"]:
+        return
+    if HOME_PLACES["key"] == key and (HOME_PLACES["names"] or time.time() - HOME_PLACES["at"] < 3600):
+        return
+    HOME_PLACES["busy"] = True
+    _lookup_places(key)
+
+
+def home_places(loc):
+    """(names, nation) for home, or ([], '') until known."""
+    key = _places_key(loc)
+    if key is not None and HOME_PLACES["key"] == key and HOME_PLACES["names"]:
+        return HOME_PLACES["names"], HOME_PLACES["nation"]
+    return [], ""
+
+
+def alert_covers_home(area, loc):
+    """Does an Emergency Alert's area take in home? Its whole names are compared with home's district, county,
+    region and constituency, and a list that names home's nation (or the UK) counts. No area given, or home's area
+    not known (yet): yes, better safe."""
+    names, nation = home_places(loc)
+    if not names:
+        return True
+    parts = alert_parts(area)
+    if not parts or parts & UK_WIDE or (parts & GB_WIDE and nation in GB):
+        return True
+    if nation and nation in parts:
+        return True
+    return bool(parts & set(area_name(n) for n in names))
+
+
+def disaster_reaches_uk(w):
+    """A disaster in the UK or Ireland (and only there), within 300 km, or a volcano within 2,000 km. One listing many
+    countries, Ireland among them (a drought across Europe), only counts within 300 km."""
+    d = w.get("distance_km")
+    d = 99999 if d is None else d
+    countries = [c for c in re.split(r"[,;]", w.get("area") or "") if c.strip()]
+    if countries and all(NEAR_UK.search(c) for c in countries):
+        return True
+    return d <= 300 or (w.get("event") == "VO" and d <= GDACS_VOLCANO_KM)
+
+
 def assess(s, home):
     """Where the household stands, LOW (1) to CRITICAL (5), why, and what to do."""
     factors = []
@@ -7868,7 +9904,7 @@ def assess(s, home):
     for w in s["warnings"]["items"] if s["warnings"]["enabled"] else []:
         src, sev, title = w.get("source"), w.get("severity") or 0, w.get("title") or ""
         if src == "govalerts":
-            if sev >= 3:
+            if sev >= 3 and alert_covers_home(w.get("area"), home_location(warn_cfg()) or {}):
                 add(5, "emergency_alert", title)
         elif src == "floods":
             lvl, key = {3: (5, "severe_flood"), 2: (4, "flood_warning")}.get(sev, (2, "flood_alert"))
@@ -7877,7 +9913,8 @@ def assess(s, home):
             lvl, key = {3: (4, "met_red"), 2: (3, "met_amber")}.get(sev, (2, "met_yellow"))
             add(lvl, key, title, weather_kind(title))
         elif src == "gdacs":
-            add(2, "disaster", title)
+            if disaster_reaches_uk(w):
+                add(2, "disaster", title)
         elif src == "fires":
             near = (w.get("distance_km") if w.get("distance_km") is not None else 99) <= 3
             add(3 if near else 2, "fire_near", title)
@@ -8247,16 +10284,357 @@ def local_addresses():
     return addrs
 
 
+# -- The daily briefing (1.15.0) ------------------------------------------------------------------
+# At 6am Claude reads what Dads Army already knows (the warnings, the wider picture, health news and how long
+# the stores last), searches the news, and writes one paragraph on what to be aware of locally, across the UK
+# and in the world, against what's been usual lately. It needs your own Anthropic API key (HQ → Scanning), as
+# the web search runs on Anthropic's side. Off until you switch it on.
+BRIEF_HOUR = 6
+BRIEF_KEEP = 60                    # days of briefings kept, for the baseline and to look back on
+BRIEF_TRIES = 4                    # attempts a day at most (each one costs), 20 minutes apart
+BRIEF_SEARCH_USD = 0.01            # Anthropic web search: $10 per 1,000 searches
+BRIEF_MODELS = {"claude-haiku-5-5": ("Standard", "Claude Haiku 5.5: about 7p a day", "web_search_20250305"),
+                "claude-sonnet-5-5": ("Thorough", "Claude Sonnet 5.5: about 25p a day", "web_search_20260209")}
+BRIEF_LEVELS = {1: "Quiet", 2: "Normal", 3: "Raised", 4: "High", 5: "Severe"}
+BRIEF = {"busy": False, "error": "", "day": "", "tries": 0, "last_try": 0.0}
+BRIEF_LOCK = threading.Lock()
+BRIEF_WAKE = threading.Event()
+
+
+def brief_cfg():
+    raw = setting_raw("briefing", {}) or {}
+    raw = raw if isinstance(raw, dict) else {}
+    model = raw.get("model") if raw.get("model") in BRIEF_MODELS else "claude-haiku-5-5"
+    return {"on": bool(raw.get("on")), "model": model, "area": clean_text(str(raw.get("area")), 60) if raw.get("area") else ""}
+
+
+def brief_list():
+    v = setting_raw("briefings", []) or []
+    return [b for b in v if isinstance(b, dict) and b.get("day")] if isinstance(v, list) else []
+
+
+def brief_area(c=None):
+    """Where 'local' is: what you've typed, else the Met Office region from the warnings settings (or worked out
+    from your location), else the UK."""
+    c = c or brief_cfg()
+    if c["area"]:
+        return c["area"]
+    cfg = warn_cfg()
+    return MET_NAME.get(cfg["region"] or guess_region(home_location(cfg)) or "", "") or "the UK"
+
+
+def brief_key():
+    return scan_ai_cfg()["keys"].get("anthropic") or ""
+
+
+BRIEF_PROMPT = """You are writing the daily threat and risk briefing for a UK household's preparedness app, Dads Army. \
+Today is {today}. Home is in {area}, UK.
+
+Use web search to check the news from the last 24-48 hours: (1) local news for {area}; (2) the UK: security and \
+terrorism, cyber attacks and outages, severe weather, health, power, water, fuel and food supply, transport, civil unrest; \
+(3) the world: wars and conflict, major disasters, pandemics, big cyber incidents, shocks to energy, food or markets. \
+Prefer reputable sources (BBC, Reuters, AP, the Guardian, Sky, GOV.UK, NCSC, Met Office, local papers and councils). \
+Do at most {searches} searches.
+
+What Dads Army already knows (from official feeds, checked automatically):
+{known}
+
+How the last few days were rated (1 quiet, 2 normal background, 3 raised, 4 high, 5 severe):
+{baseline}
+
+Write ONE paragraph of 110 to 170 words, in plain British English, calm and factual, for a busy parent: lead with \
+what matters most to this household, then cover local, national and global, saying plainly when things are normal. \
+Compare with the usual baseline above (say if something is new, rising or easing). Where it helps, say one practical \
+thing to do (for example: top up water, charge power banks, check travel before setting off). No scaremongering, no \
+speculation beyond what the sources say, no markdown, no bullet points, no links, no citation numbers.
+
+Reply in exactly this form, and nothing else:
+BRIEFING: <the paragraph>
+HEADLINE: <the main point in under 12 words>
+LEVELS: local=<1-5> national=<1-5> global=<1-5>
+VS_USUAL: local=<same|higher|lower> national=<same|higher|lower> global=<same|higher|lower>
+SOURCES: <the URLs of up to 6 search results the briefing relies on, most important first, separated by spaces>"""
+
+
+# Titles that name places right by home (a river gauge, a street, a postcode, how far away): the briefing is told
+# what's happening, not exactly where. The area it's about (a county or region) is sent separately.
+BRIEF_NEARBY = ("water", "power", "fires", "rivers", "floods", "rain")
+DISTANCE_RE = re.compile(r"\s*\d+(?:\.\d+)?\s*k?m\s+(?:(?:north|south|east|west)(?:-(?:east|west))?\s+of\s+home|away)\b", re.I)
+POSTCODE_RE = re.compile(r"\b[A-Z]{1,2}[0-9][0-9A-Z]?(?:\s*[0-9](?:[A-Z]{2})?)?\b")   # PL1 2AB, EX4 6, BT1
+
+
+def brief_safe(source, title, river=""):
+    """A warning's title as the briefing's AI is told it: "near home" for distances, and no postcodes, streets or
+    gauge names for the warnings that are about somewhere right by home."""
+    t = DISTANCE_RE.sub(" near home", str(title or ""))
+    if source not in BRIEF_NEARBY:
+        return t.strip()
+    if source == "rivers" and ":" in t:   # "River Esk at Sleights: above its normal range" -> "River Esk near home: ..."
+        t = "%s near home:%s" % (river or "A river", t.split(":", 1)[1])
+    elif source == "floods":   # "Flood alert: River Esk at Sleights" -> "Flood alert: River Esk"
+        t = re.sub(r"^(.*?) at [^:]+$", r"\1", t)
+    t = re.sub(r"\s{2,}", " ", POSTCODE_RE.sub("", t))
+    return re.sub(r"\s*,\s*(?=,|:|$)", "", t).strip(" ,-·:") or "A warning near home"
+
+
+def brief_known(sm=None):
+    """What the warnings, the wider picture, health news and the stores say right now, for the prompt. Nothing that
+    says exactly where home is (see brief_safe)."""
+    lines = []
+    w = warn_public()
+    if w["on"]:
+        for r in w["live_rows"]:
+            lines.append("- %s: %s (%s)" % (r["name"], r.get("brief") or r["text"], {
+                "good": "fine", "warn": "worth watching", "bad": "serious"}.get(r["state"], r["state"])))
+        for i in w["items"][:10]:
+            lines.append("- Warning (%s): %s%s" % (i.get("by") or WARN_SOURCE_NAMES.get(i.get("source"), i.get("source")),
+                                                   brief_safe(i.get("source"), i.get("title", ""), i.get("river")),
+                                                   (", " + i["level"]) if i.get("level") else ""))
+        for i in w["news"][:5]:
+            lines.append("- News (%s): %s" % (WARN_SOURCE_NAMES.get(i.get("source"), i.get("source")), i.get("title", "")))
+        travel = (w["live"].get("travel") or {}).get("changes") or []
+        if travel:
+            lines.append("- FCDO travel advice changed for: " + ", ".join(
+                c["country"] + (" (against travel)" if c["against"] else "") for c in travel[:8]))
+    try:
+        sm = sm or summary()
+        lines.append("- The household's stores: food for %s days, water for %s days." % (sm.get("food_days"), sm.get("water_days")))
+    except Exception:
+        pass
+    text = "\n".join(lines) or "- Nothing from the official feeds (warnings are switched off)."
+    return text[:7000]
+
+
+def brief_baseline(past, today):
+    rows = [b for b in past if b["day"] < today][-14:]
+    if not rows:
+        return "No earlier briefings yet: judge 'usual' from what is normal for the UK."
+    out = ["%s: local %s, national %s, global %s" % (b["day"], *((b.get("levels") or {}).get(k, "?")
+                                                                 for k in ("local", "national", "global")))
+           for b in rows]
+    out.append("Yesterday's briefing said: " + str(rows[-1].get("text", ""))[:900])
+    return "\n".join(out)
+
+
+def parse_brief_reply(text):
+    """The paragraph, headline, levels and named sources out of the reply. ValueError if there's no paragraph."""
+    t = (text or "").strip()
+    m = re.search(r"BRIEFING:\s*(.+?)(?=\n\s*HEADLINE:|\n\s*LEVELS:|\n\s*SOURCES:|\Z)", t, re.S | re.I)
+    para = re.sub(r"\s+", " ", (m.group(1) if m else "")).strip()
+    para = re.sub(r"\[\d+\]|\*\*|__", "", para).strip()
+    if len(para) < 40:
+        raise ValueError("The briefing came back empty")
+    h = re.search(r"HEADLINE:\s*(.+)", t, re.I)
+    levels, vs = {}, {}
+    lv = re.search(r"LEVELS:\s*(.+)", t, re.I)
+    if lv:
+        for k, v in re.findall(r"(local|national|global)\s*=\s*([1-5])", lv.group(1), re.I):
+            levels[k.lower()] = int(v)
+    vu = re.search(r"VS_USUAL:\s*(.+)", t, re.I)
+    if vu:
+        for k, v in re.findall(r"(local|national|global)\s*=\s*(same|higher|lower)", vu.group(1), re.I):
+            vs[k.lower()] = v.lower()
+    src = re.search(r"SOURCES:\s*(.+)", t, re.I)
+    urls = [u.rstrip(".,;)>]") for u in re.findall(r"https?://[^\s<>\"']+", src.group(1))] if src else []
+    return {"text": para[:1500], "headline": clean_text(h.group(1).strip(), 120) if h else "", "levels": levels,
+            "vs_usual": vs, "source_urls": urls[:8]}
+
+
+def brief_call(key, model, prompt, usage, searches=6):
+    """One Messages API call with web search, following pause_turn. Returns (final text, cited sources,
+    searches made, {url: title} of every search result)."""
+    tool = {"type": BRIEF_MODELS[model][2], "name": "web_search", "max_uses": searches,
+            "user_location": {"type": "approximate", "country": "GB", "timezone": "Europe/London"}}
+    messages = [{"role": "user", "content": prompt}]
+    content = []
+    for _ in range(4):
+        out = _post_json("https://api.anthropic.com/v1/messages", {
+            "model": model, "max_tokens": 8000, "output_config": {"effort": "medium"},
+            "tools": [tool], "messages": messages}, {"x-api-key": key, "anthropic-version": "2026-10-21"}, timeout=240)
+        u = out.get("usage") or {}
+        usage["in"] = usage.get("in", 0) + u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + \
+            u.get("cache_creation_input_tokens", 0)
+        usage["out"] = usage.get("out", 0) + u.get("output_tokens", 0)
+        usage["searches"] = usage.get("searches", 0) + int((u.get("server_tool_use") or {}).get("web_search_requests") or 0)
+        if out.get("stop_reason") == "refusal":
+            raise IOError("Claude declined to write the briefing")
+        content = content + (out.get("content") or []) if messages[-1]["role"] == "assistant" else (out.get("content") or [])
+        if out.get("stop_reason") != "pause_turn":
+            break
+        messages = [{"role": "user", "content": prompt}, {"role": "assistant", "content": content}]
+    final, sources, queries, results = [], [], [], {}
+    for b in content:
+        kind = b.get("type")
+        if kind == "server_tool_use":
+            q = (b.get("input") or {}).get("query")
+            if q:
+                queries.append(clean_text(q, 120))
+            final = []   # only the writing after the last search is the answer
+        elif kind == "web_search_tool_result":
+            final = []
+            for r in b.get("content") if isinstance(b.get("content"), list) else []:
+                url = safe_url(r.get("url"))
+                if url and r.get("type") == "web_search_result":
+                    results.setdefault(url, clean_text(r.get("title") or url, 160))
+        elif kind == "text":
+            final.append(b.get("text", ""))
+            for c in b.get("citations") or []:
+                url = safe_url(c.get("url"))
+                if url and url not in [x["url"] for x in sources]:
+                    sources.append({"url": url, "title": clean_text(c.get("title") or url, 160)})
+    return "".join(final), sources[:10], queries[:10], results
+
+
+def make_briefing(by="schedule"):
+    """Write today's briefing. Returns it, or raises ApiError."""
+    with BRIEF_LOCK:
+        if BRIEF["busy"]:
+            raise ApiError(409, "Today's briefing is already being written")
+        BRIEF["busy"], BRIEF["last_try"] = True, time.time()
+    c, usage = brief_cfg(), {}
+    model = c["model"]
+    try:
+        key = brief_key()
+        if not key:
+            raise ApiError(400, "The daily briefing needs an Anthropic API key: add one in HQ → Scanning")
+        ai_limit_check(scan_ai_cfg())
+        today = dt.date.today()
+        past = brief_list()
+        prompt = BRIEF_PROMPT.format(today=today.strftime("%A %-d %B %Y"), area=brief_area(c), searches=6,
+                                     known=brief_known(), baseline=brief_baseline(past, today.isoformat()))
+        try:
+            reply, sources, queries, results = brief_call(key, model, prompt, usage)
+            got = parse_brief_reply(reply)
+            # The sources it names, but only ones that really came back from its searches.
+            for u in got.pop("source_urls", []):
+                if u in results and u not in [x["url"] for x in sources]:
+                    sources.append({"url": u, "title": results[u]})
+            sources = sources[:8]
+        except (urllib.error.URLError, IOError, ValueError, socket.timeout) as e:
+            msg = friendly_ai_error("anthropic", str(getattr(e, "reason", e)))
+            record_ai("anthropic", model, "Dads Army briefing", usage, False, msg,
+                      extra_usd=usage.get("searches", 0) * BRIEF_SEARCH_USD)
+            if "didn't accept the API key" in msg:   # not a working key: switch it off rather than try every day
+                with tx() as db:
+                    set_setting_raw(db, "briefing", dict(c, on=False))
+                msg += " The daily briefing has been switched off until you add a working key."
+            raise ApiError(502, msg)
+        cost = record_ai("anthropic", model, "Dads Army briefing", usage, True,
+                         extra_usd=usage.get("searches", 0) * BRIEF_SEARCH_USD)
+        entry = dict(got, day=today.isoformat(), made_at=now_iso(), model=model, by=by, area=brief_area(c),
+                     sources=sources, searched=queries, searches=usage.get("searches", 0), cost_usd=cost)
+        keep = [b for b in past if b["day"] != entry["day"]] + [entry]
+        with tx() as db:
+            set_setting_raw(db, "briefings", keep[-BRIEF_KEEP:])
+        BRIEF["error"] = ""
+        HA_WAKE.set()
+        print("Briefing: written for %s (%d searches, $%.4f)" % (entry["day"], entry["searches"], cost or 0), flush=True)
+        return entry
+    except ApiError as e:
+        BRIEF["error"] = e.message
+        print("Briefing: failed: %s" % BRIEF["error"], flush=True)
+        raise
+    finally:
+        BRIEF["busy"] = False
+
+
+def brief_due(c, now=None):
+    now = now or dt.datetime.now()
+    if not c["on"] or BRIEF["busy"] or now.hour < BRIEF_HOUR or not brief_key():
+        return False
+    day = now.date().isoformat()
+    if any(b["day"] == day for b in brief_list()):
+        return False
+    if BRIEF["day"] != day:
+        BRIEF["day"], BRIEF["tries"] = day, 0
+    return BRIEF["tries"] < BRIEF_TRIES and time.time() - BRIEF["last_try"] >= 20 * 60
+
+
+def briefing_loop():
+    while True:
+        try:
+            if brief_due(brief_cfg()):
+                BRIEF["tries"] += 1
+                try:
+                    make_briefing()
+                except ApiError:
+                    pass
+        except Exception:
+            traceback.print_exc()
+        BRIEF_WAKE.wait(60)
+        BRIEF_WAKE.clear()
+
+
+def brief_public():
+    c = brief_cfg()
+    past = brief_list()
+    latest = past[-1] if past else None
+    return {"config": c, "available": bool(brief_key()), "busy": BRIEF["busy"], "error": BRIEF["error"],
+            "latest": latest if c["on"] else None, "hour": BRIEF_HOUR, "area_auto": brief_area(dict(c, area="")),
+            "models": {k: {"name": v[0], "about": v[1]} for k, v in BRIEF_MODELS.items()}, "levels": BRIEF_LEVELS,
+            "history": [{k: b.get(k) for k in ("day", "headline", "levels")} for b in past[-30:]] if c["on"] else []}
+
+
+@route("GET", "/api/briefing")
+def api_briefing(body, query):
+    return brief_public()
+
+
+@route("PUT", "/api/briefing")
+def api_briefing_put(body, query):
+    c = brief_cfg()
+    if "on" in body:
+        if body["on"] and not brief_key():
+            raise ApiError(400, "The daily briefing needs an Anthropic API key: add one under Scanning")
+        c["on"] = bool(body["on"])
+    if "model" in body:
+        if body["model"] not in BRIEF_MODELS:
+            raise ApiError(400, "Unknown model")
+        c["model"] = body["model"]
+    if "area" in body:
+        c["area"] = clean_text(str(body["area"] or ""), 60) if str(body["area"] or "").strip() else ""
+    with tx() as db:
+        set_setting_raw(db, "briefing", c)
+        if "on" in body:
+            add_log("settings", "", "Daily briefing switched on" if c["on"] else "Daily briefing switched off")
+    if c["on"] and "on" in body and not BRIEF["busy"] and not any(b["day"] == dt.date.today().isoformat() for b in brief_list()):
+        threading.Thread(target=lambda: _brief_quiet("switched on"), name="briefing-now", daemon=True).start()
+    BRIEF_WAKE.set()
+    return brief_public()
+
+
+def _brief_quiet(by):
+    try:
+        make_briefing(by)
+    except ApiError:
+        pass
+
+
+@route("POST", "/api/briefing/now")
+def api_briefing_now(body, query):
+    if not brief_cfg()["on"]:
+        raise ApiError(400, "Switch the daily briefing on first")
+    if BRIEF["busy"]:
+        raise ApiError(409, "A briefing is already being written")
+    if not brief_key():
+        raise ApiError(400, "The daily briefing needs an Anthropic API key")
+    threading.Thread(target=lambda: _brief_quiet("by hand"), name="briefing-now", daemon=True).start()
+    time.sleep(0.2)
+    return brief_public()
+
+
 def main():
     if sys.version_info < (3, 7):
         sys.exit("Dads Army needs Python 3.7 or newer")
     init_db()
     load_warnings()
+    ai_ready()   # Home Assistant's AI Task: asked in the background, so the first screen has the answer sooner
     threading.Thread(target=backup_loop, name="backups", daemon=True).start()
     threading.Thread(target=history_loop, name="history", daemon=True).start()
     threading.Thread(target=offline_loop, name="offline-barcodes", daemon=True).start()
     sweep_scan_photos()
     threading.Thread(target=warnings_loop, name="warnings", daemon=True).start()
+    threading.Thread(target=briefing_loop, name="briefing", daemon=True).start()
     if HA_TOKEN:
         threading.Thread(target=home_sensors_loop, name="home-sensors", daemon=True).start()
     if HA_TOKEN:

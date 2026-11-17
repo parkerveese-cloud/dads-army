@@ -1053,3 +1053,17 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
 .no-ai [data-act="scan-label"], .no-ai [data-act="scan-label-same"], .no-ai [data-act="scan-label-more"],
 .no-ai [data-act="scan-nutrition"], .no-ai [data-act="scan-date"], .no-ai [data-act="scan-usebatch"],
 .no-ai [data-act="ai-fill"], .no-ai [data-act="stock-review"] { display: none !important; }
+
+/* The daily briefing (1.15.0) */
+.brief-card .card-head { align-items: baseline; }
+.brief-text { font-size: 1.02rem; line-height: 1.6; margin: 6px 0 10px; }
+.brief-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+.brief-chip { font-size: .82rem; padding: 3px 10px; border-radius: 999px; background: var(--good-bg); color: var(--good-ink); }
+.brief-chip[data-state="warn"] { background: var(--warn-bg); color: var(--warn-ink); }
+.brief-chip[data-state="bad"] { background: var(--bad-bg); color: var(--bad-ink); }
+.brief-vs { opacity: .8; }
+.brief-src summary { cursor: pointer; font-size: .9rem; }
+.brief-src ul { margin: 6px 0; padding-left: 18px; font-size: .9rem; }
+.brief-src li { margin: 3px 0; overflow-wrap: anywhere; }
+.brief-foot { margin-bottom: 0; }
+.opt.is-off > span { opacity: .65; }

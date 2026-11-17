@@ -44,3 +44,11 @@ The file is gzipped, tab-separated text with one place per line:
 | `a` | Emergency assembly point |
 | `e` | High ground |
 | `k` | Park |
+
+# Electricity licence areas
+
+`dno_areas.json.gz` holds the outlines of Great Britain's 14 electricity distribution licence areas, so Dads Army can tell which network serves home (and so which live power cut feeds to read) without asking anyone. Northern Ireland has one network, NIE Networks.
+
+It's built from NESO's [GIS Boundaries for GB DNO License Areas](https://www.neso.energy/data-portal/gis-boundaries-gb-dno-license-areas) with `tools/build_dno_areas.py`: the outlines are simplified to about 300 m and turned from British National Grid into latitude and longitude (to about 100 m). Supported by National Energy SO Open Data (NESO Open Data Licence).
+
+It's gzipped JSON: `areas` is a list of `{id, dno, area, name, rings}`, where `id` is the MPAN distributor id (10 to 23) and `rings` are outlines as `[longitude, latitude]` points.

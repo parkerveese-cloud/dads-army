@@ -1,5 +1,70 @@
 # Changelog
 
+## 1.15.0
+
+**The daily briefing**
+
+- **Every morning at 6am**, Claude reads what Dads Army already knows (the warnings, the wider picture, health news and how long your stores last), searches the news, and writes **one paragraph** on the threats and risks to be aware of: locally, across the UK and in the world (weather, conflict, cyber, health, power, supply and more), compared with what's been usual over the last fortnight. It's at the top of the Sitrep, with Local, UK and World ratings ("↑ above usual" when something's up), the sources it relied on and what it searched for.
+- **Off until you switch it on**, in HQ under Scanning. It needs your own Anthropic API key, as the news search runs on Anthropic's side; without one, the card explains that and the switch isn't shown. **Standard** (Claude Haiku 5.5) is about 7p a day, **Thorough** (Claude Sonnet 5.5) about 25p. It counts towards the monthly AI limit and the spending stats, and a key Anthropic refuses switches it off rather than trying every day.
+- **Local news for** a town or county you type, or your Met Office region. That name, the day's warnings and wider picture and how long your stores last are sent to Anthropic; nothing else about you.
+- **Write one now** in HQ, a history of 60 days for the baseline, and `sensor.dads_army_briefing` in Home Assistant (the headline, with the paragraph, ratings and sources as attributes). `GET/PUT /api/briefing`, `POST /api/briefing/now`.
+
+**More of the wider picture**
+
+Ten more live sources, under **More of the wider picture** in the warnings settings. The briefing reads them too.
+
+- **UK threat level** (set by the Joint Terrorism Analysis Centre and MI5, read from GOV.UK): a warning for a week after it goes up, and at critical.
+- **Cyber security** (NCSC): a warning for a critical flaw or live attack in the last three days.
+- **Travel advice** (FCDO): which countries' advice changed in the last three days, and any against travel.
+- **Drought, reservoirs and hosepipe bans** (the Environment Agency's weekly report, England): reservoir storage, your area's drought status and your water company's hosepipe ban. Choose your Environment Agency area and water company in the warnings settings.
+- **Water supply problems near you**: reports within 10 km from your water company's public "in your area" map or page, for Cambridge Water, South Staffs Water, Yorkshire Water, South West Water, Bournemouth Water and NI Water. Choose your company in the warnings settings (it isn't guessed from where you live, except NI Water in Northern Ireland). For any other company it **switches itself off**, and the settings say why.
+- **Flood risk forecast**: five days for England from the Flood Forecasting Centre's outlook (Environment Agency and Met Office) as GOV.UK's Check for flooding publishes it, three for Scotland from the Scottish Flood Forecast (SEPA and the Met Office). The areas at risk are fetched whole and home is checked against them on the Pi, so it gives the risk *where you live* and which day, and home's location isn't sent. A warning at medium or high. (The Flood Forecasting Centre's own open API closed in June 2026; its new one needs a key. Wales has no open forecast just now, so it shows *Not for your area* there.)
+- **Rainfall near you**: the nearest rain gauges within 25 km (the Environment Agency's, SEPA's or Natural Resources Wales'): a warning at 30 mm in a day, serious at 50.
+- **Groundwater near you** (Environment Agency boreholes within 30 km), against the same time of year. Off to begin with.
+- **The grid now**: carbon intensity and the mix (NESO), and the frequency (Elexon), with a warning if it dips. Off to begin with.
+- **Electricity margin** (Elexon) for the next 14 hours and two weeks, and NESO's Demand Flexibility Service events: a warning when the margin is tight.
+
+**Only what can reach you raises the alert level**
+
+- An **Emergency Alert** raises it only if its area takes in home: your district, county, region, constituency or police force area, or the whole UK, Great Britain or your nation. The alert's areas are compared as whole names ("North East Lincolnshire" isn't the North East, and a ward called "Central" isn't Central Bedfordshire), "Wales and South West England" counts for both, and "Glasgow" is ONS's "Glasgow City". One for another county still shows in the live panel. To know home's area, its location rounded to about 100 m is looked up once at postcodes.io (ONS data); until then every alert counts, to be safe.
+- A **GDACS disaster** raises it only if it's in the UK or Ireland, within 300 km, or a volcano within 2,000 km (ash closes airports), whatever the disaster distance is set to. An earthquake in Norway shows in the panel but no longer raises the level, and neither does a drought across Europe that lists Ireland among many countries.
+
+**The rest of the UK**
+
+Where England's feeds don't reach, Scotland's, Wales' and Northern Ireland's own take over. Each is asked only for homes it covers (in its nation or network, or near enough to the border to matter), and each is the provider's whole list, picked through on your own machine.
+
+- **Flood warnings** in Scotland from SEPA (the flood warning and flood alert areas behind its Floodline map: a warning counts if home is inside the area or within your flood distance) and in Wales from Natural Resources Wales (its flood warning page), beside the Environment Agency's for England. They raise the alert level as England's do, and say who they're from.
+- **River levels** in Scotland from SEPA's gauges, against SEPA's own usual range (its median yearly low and high). Natural Resources Wales publishes levels but no usual range, so Wales has only the Environment Agency's border gauges for now.
+- **Rainfall** from SEPA's and Natural Resources Wales' rain gauges, and **the flood risk forecast** from the Scottish Flood Forecast, as above.
+- **Power cuts** from Electricity North West and NIE Networks (the lists behind their power cut maps) for homes on or near their networks, as well as the four networks before. SP Energy Networks only publishes its live power cuts to registered users, so a home on its network gets a note saying so, with its power cut map. If one network's feed fails or changes shape, the others still show, and the live line says which couldn't be checked.
+- **Water supply** from four more companies, as above.
+- **Which nation, and which network:** rough borders for the nations (Kintyre is Scotland), and the outlines of Great Britain's 14 electricity licence areas from NESO's open data, bundled as `places/dno_areas.json.gz` (built by `tools/build_dno_areas.py`, about 40 KB).
+- **Not for your area:** a source that can't cover home isn't fetched and says so in the warnings settings, rather than failing. In Northern Ireland: flood warnings, river levels, rainfall, the flood risk forecast and the grid sources (its grid is run with Ireland's). In Wales: the flood risk forecast. Outside England: groundwater and the drought report.
+
+**Fixes from a regression run against the real feeds**
+
+A run of every source against the real feeds on 17 November 2026, and a review of the code, turned these up.
+
+- **The threat level** is read from GOV.UK: MI5's own feed now answers automated requests with a bot check (403).
+- **Grid notices:** levelled by their type, and the system operators' own business (IT outages, trades between operators, emergency help between them) is left out, whatever words it uses.
+- **Met Office region:** the Dumfries, Galloway, Lothian & Borders region had a different name from the feed's, so its warnings never matched; and the region guessed from your location is now within your own nation (Cardiff is Wales, not the South West).
+- **Groundwater:** a borehole's logger is read for the last 60 days and the same weeks in earlier years (asked for in one go, its 20,000 readings ended years ago, so it always looked out of date), falling back to the readings by hand. A deep borehole below sea level is shown but never "worth watching", and "below sea level" is said as such. No borehole near home is a note, not a failure.
+- **Water supply:** your water company is chosen, not guessed (much of Birmingham is Severn Trent, not South Staffs Water). A supply problem counts as yours when the company says your area is affected, or two are reported within 3 km, or one within 1 km. One a little further off is listed, but isn't a warning.
+- **Links:** the rainfall line opens the nearest gauge's page (the Environment Agency's old rainfall page is gone), and NCSC news falls back to its news page.
+- **Slow feeds** (the Environment Agency's rain readings and NESO's Demand Flexibility list, which can take a minute) are given 60 seconds.
+- **The drought report** finds South Staffs Water under its full name, South Staffordshire Water.
+- **Northern Powergrid:** a cut covering several postcodes is placed at the one nearest home, not the first listed.
+- **📷 Add another photo** keeps the date, size and calories the first photo read, and what the AI only estimated stays marked as an estimate unless the new photo reads it off the pack.
+- **Open Food Facts drinks:** categories are matched whole, so rice ("plant-based foods and beverages") isn't drinking water, and coffee, tea and alcohol aren't either. Litres only for a drink sold by volume (and a label's drink sold by weight gets none).
+- **Cupboard, fridge or freezer** is only kept for food, drinks and pet food (a torch isn't "ambient"), and the item page says **stored in the cupboard**.
+- **The stores review:** an answer of the wrong shape leaves out the odd part rather than failing, opened packs are sent by their "use within" date, and it counts what it sent. A suggestion already on the supply run says so, and can't be added twice.
+- **Restore and undo** keep what the AI estimated marked as an estimate.
+- **Kit** leaves out drinks on the Pi as well as in the app, and out-of-date juice no longer counts as water past its date.
+- **Water is worked out in runs** (a lot going off, the drinks running low, the water running out) rather than a day at a time: ten years of water is a few steps, not 3,660. The app and the Pi still agree, checked on thousands of made-up stores.
+- **A barcode photo** is first read at 1,600 pixels (quicker when there's no barcode in it), and "Looking for the barcode…" stays up until it's done.
+- **Home Assistant's AI Task** is checked in the background, so the app never waits for it, and a failed check keeps the last answer.
+- **The daily briefing** isn't told streets, postcodes, gauge or borehole names, or how far things are from home: "Power cut near home", "River Esk near home".
+
 ## 1.14.0
 
 **Stores review**
