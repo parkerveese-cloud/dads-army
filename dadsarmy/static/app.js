@@ -1539,7 +1539,8 @@
     ukhsa: 'UKHSA', who: 'WHO', rivers: 'Environment Agency', power: 'Power networks', grid: 'NESO', gas: 'National Gas',
     air: 'Defra UK-AIR', space: 'NOAA', pound: 'Bank of England', threat: 'GOV.UK', cyber: 'NCSC', travel: 'FCDO',
     drought: 'Environment Agency', water: 'Your water company', floodrisk: 'Flood Forecasting Centre', rain: 'Environment Agency',
-    ground: 'Environment Agency', gridnow: 'NESO / Elexon', gridstress: 'Elexon / NESO', roads: 'National Highways' };
+    ground: 'Environment Agency', gridnow: 'NESO / Elexon', gridstress: 'Elexon / NESO', roads: 'National Highways',
+    supply: 'UK Power Networks' };
   var LIVE_KEYS = ['rivers', 'power', 'grid', 'gas', 'air', 'space', 'pound'];
   var LIVE_MORE = 'threat';   // 1.15.0's sources start here in the settings
   function W() {
@@ -2022,6 +2023,31 @@
       h += '<p>Tightest in the next 14 hours: <b>' + esc(fq(Math.round(r.margin_mw / 100) / 10)) + ' GW spare</b>.' + (r.low_mw != null ? ' Lowest in the next two weeks: ' + esc(fq(Math.round(r.low_mw / 100) / 10)) + ' GW on ' + esc(fmtDate(r.low_on)) + '.' : '') + '</p>' +
         ((r.dfs || []).length ? '<p>Demand Flexibility Service: ' + r.dfs.map(function (e) { return esc(fmtDate(e.day) + ' ' + e.from + '–' + e.to); }).join(', ') + '. If your supplier takes part, you may be paid to use less then.</p>' : '') +
         '<p class="small muted">The de-rated margin is the spare generating capacity once likely breakdowns are allowed for. Above about 3 GW is comfortable.</p>';
+    } else if (key === 'supply') {
+      // 1.21.0: the substation that supplies home, and how often that part of the network has had faults
+      if (!r.found) return '<p class="small muted">UK Power Networks\' records don\'t show a substation for home\'s location. Check the location in the warnings settings.</p>';
+      var mw = function (m) { m = Math.round(m || 0); return m < 60 ? m + ' min' : m >= 360 ? Math.round(m / 60) + ' hours' : Math.floor(m / 60) + ' h ' + (m % 60 < 10 ? '0' : '') + (m % 60) + ' min'; };
+      h += '<table class="live-table"><tbody>' +
+        '<tr><td>Your local substation</td><td>' + esc(r.substation || '–') + (r.customers ? '<br><span class="small muted">' + esc(fq(r.customers)) + ' customers</span>' : '') + '</td></tr>' +
+        (r.utilisation ? '<tr><td>How much of it is used</td><td>' + esc(r.utilisation) + (r.headroom ? '<br><span class="small muted">' + esc(r.headroom) + ' spare</span>' : '') + '</td></tr>' : '') +
+        (r.reinforce ? '<tr><td>Upgrade expected</td><td>' + esc(r.reinforce) + '</td></tr>' : '') +
+        '<tr><td>Fed from</td><td>' + esc(r.primary || '–') + (r.primary_customers ? '<br><span class="small muted">about ' + esc(fq(r.primary_customers)) + ' customers</span>' : '') +
+        (r.gsp ? '<br><span class="small muted">via ' + esc(r.gsp) + '</span>' : '') + '</td></tr>' +
+        (r.typical_mins ? '<tr><td>A typical cut</td><td>' + esc(mw(r.typical_mins)) + '</td></tr>' : '') +
+        (r.longest_mins ? '<tr><td>The longest recent cut</td><td>' + esc(mw(r.longest_mins)) + '<br><span class="small muted">' + esc(fmtDate(r.longest_on)) +
+          (r.longest_homes ? ', ' + esc(fq(r.longest_homes)) + ' home' + (r.longest_homes === 1 ? '' : 's') : '') + '</span></td></tr>' : '') +
+        '</tbody></table>';
+      if ((r.years || []).length) {
+        h += '<table class="live-table"><thead><tr><th>Year</th><th>Faults</th><th>Network average</th></tr></thead><tbody>' +
+          r.years.slice().reverse().map(function (y) {
+            return '<tr><td>' + esc(y.year) + '</td><td class="num">' + esc(fq(y.faults)) +
+              '</td><td class="num">' + (y.average != null ? esc(fq(y.average)) : '–') + '</td></tr>';
+          }).join('') + '</tbody></table>';
+      }
+      if (r.compare) h += '<p>That\'s ' + esc(r.compare) + ' the network\'s average' + (r.per_customer != null ? ', about ' + esc(fq(r.per_customer)) + ' power cuts per customer in ' + esc(r.year) : '') + '.</p>';
+      h += '<p class="small muted">A power cut in the area your local substation supplies counts as yours, wherever its pin is. The fault records are UK Power Networks\' yearly ' +
+        'returns to Ofgem (the Interruptions Incentive Scheme)' + (r.history_to ? ', up to ' + esc(fmtDate(r.history_to)) : '') + ', so this is checked once a day. ' +
+        '<a href="' + esc(r.url || 'https://ukpowernetworks.opendatasoft.com/') + '" target="_blank" rel="noopener noreferrer">The data</a>.</p>';
     } else if (key === 'roads') {
       // 1.20.0: the warnings (a road shut) are listed above; the rest near home are here, planned work included.
       var others = (r.closures || []).filter(function (c) { return !c.severity; });
@@ -2238,6 +2264,16 @@
       '<label class="field"><span>National Highways API key</span><input type="password" name="nh_key" autocomplete="off" spellcheck="false" maxlength="100" placeholder="' +
       (c.nh_key_set ? 'Saved. Paste a new key to replace it' : 'Paste your key here') + '"></label>' +
       (c.nh_key_set ? '<label class="opt"><input type="checkbox" name="nh_key_remove"><span>Remove the saved key</span></label>' : '') +
+      '<h3>Your power supply</h3>' +
+      '<p class="small muted">For homes on UK Power Networks\' network (London, the South East and the East of England): the substation that supplies you, how loaded it is, ' +
+      'and how often that part of the network has had faults against the average. A power cut in your substation\'s area then counts as yours. ' +
+      'It needs your own free API key: make an account on <a href="https://ukpowernetworks.opendatasoft.com/" target="_blank" rel="noopener noreferrer">UK Power Networks\' Open Data Portal</a>, ' +
+      'copy the API key from your account, and paste it here. It\'s kept on this Pi, never shown again and never put in a backup.</p>' +
+      '<p class="small callout info"><b>This sends your home\'s location to UK Power Networks to find the substation that supplies you</b> (rounded to about 10 m, once a day, with your key). ' +
+      'It\'s the only source that does. Nothing is sent until you add a key.</p>' +
+      '<label class="field"><span>UK Power Networks API key</span><input type="password" name="ukpn_key" autocomplete="off" spellcheck="false" maxlength="100" placeholder="' +
+      (c.ukpn_key_set ? 'Saved. Paste a new key to replace it' : 'Paste your key here') + '"></label>' +
+      (c.ukpn_key_set ? '<label class="opt"><input type="checkbox" name="ukpn_key_remove"><span>Remove the saved key</span></label>' : '') +
       '<h3>Where you are</h3>' +
       '<div class="grid2"><label class="field"><span>Environment Agency area</span><select name="ea_area"><option value="">Not set (England\'s totals)</option>' +
       (w.ea_areas || []).map(function (a) { return '<option' + (c.ea_area === a ? ' selected' : '') + '>' + esc(a) + '</option>'; }).join('') + '</select>' +
@@ -2275,8 +2311,8 @@
       'SEPA (Scotland\'s flood warnings, river levels, rain gauges and the Scottish Flood Forecast), Natural Resources Wales (Wales\' flood warnings and rain gauges), ' +
       'GOV.UK Emergency Alerts, GDACS, NASA FIRMS (fire detections), UK Health Security Agency, the World Health Organization, ' +
       'UK Power Networks, National Grid, SSEN, Northern Powergrid, Electricity North West and NIE Networks (power cuts), NESO and Elexon (grid notices), National Gas (gas storage), ' +
-      'Defra UK-AIR (air quality), NOAA (space weather), the Bank of England (the pound and Bank Rate), your water company, and road closures ' +
-      'Powered by National Highways\' Transport Data Feeds. The DOCS list each one\'s licence.</p>' +
+      'Defra UK-AIR (air quality), NOAA (space weather), the Bank of England (the pound and Bank Rate), your water company, road closures ' +
+      'Powered by National Highways\' Transport Data Feeds, and your power supply from UK Power Networks\' Open Data Portal (CC BY 4.0). The DOCS list each one\'s licence.</p>' +
       '<div class="sheet-actions"><button class="btn primary block" type="submit">Save and check now</button></div></form>';
   }
 
@@ -4685,6 +4721,8 @@
       W().source_list.forEach(function (s) { wbody.sources[s[0]] = f.elements['src_' + s[0]].checked; });
       if (f.elements.nh_key_remove && f.elements.nh_key_remove.checked) wbody.nh_key = null;   // 1.20.0
       else if ((f.elements.nh_key.value || '').trim()) wbody.nh_key = f.elements.nh_key.value.trim();   // empty: keep the saved one
+      if (f.elements.ukpn_key_remove && f.elements.ukpn_key_remove.checked) wbody.ukpn_key = null;   // 1.21.0
+      else if ((f.elements.ukpn_key.value || '').trim()) wbody.ukpn_key = f.elements.ukpn_key.value.trim();
       // The page's security policy only lets map pictures in while the map is on, and it's set when the page loads.
       var mapChanged = !!(W().config.map && wbody.on) !== !!(wbody.map && wbody.on);
       if ((d.lat === '') !== (d.lon === '')) { toast('Give both a latitude and a longitude, or leave both empty', { error: true }); return; }

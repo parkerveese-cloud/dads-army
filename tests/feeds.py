@@ -3,6 +3,7 @@ tests can check that nothing about where you live is ever sent."""
 import datetime as dt
 import json
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 NOW = dt.datetime.now(dt.timezone.utc)
@@ -134,7 +135,7 @@ class FakeFeeds(object):
                     feeds.missed.append(self.path)
                     return self.send(404, b"no", "text/plain")
                 fn, ctype = feeds.routes[key]
-                self.send(200, fn(), ctype)
+                self.send(200, fn(self.path) if getattr(fn, "takes_path", False) else fn(), ctype)   # 1.21.0
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.httpd.daemon_threads = True
@@ -358,6 +359,55 @@ def nh_payload(*recs):
     return {"D2Payload": {"situation": [{"idG": "s%d" % n, "situationRecord": [r]} for n, r in enumerate(recs)]}}
 
 
+# 1.21.0: UK Power Networks' Open Data Portal (Explore API v2.1), answering each dataset as it did in November 2026.
+# Home is central London: its local substation's area is a small square round it, made-up names throughout.
+SUPPLY_SQUARE = {"type": "Polygon", "coordinates": [[[-0.135, 51.503], [-0.120, 51.503], [-0.120, 51.512],
+                                                     [-0.135, 51.512], [-0.135, 51.503]]]}
+SUPPLY_ANSWERS = {
+    "secondary": [{"sitefunctionallocation": "SEC-0001", "substationalias": "Riverside Row", "customer_count": 350,
+                   "utilisation_band": "60-80%", "demand_headroom": "20-40%", "predicted_year_of_reinforcement": "2031",
+                   "geo_shape": {"type": "Feature", "geometry": SUPPLY_SQUARE, "properties": {}}}],
+    "primary": [{"sitename": "RIVERSIDE PRIMARY 33/11kV", "primary_floc": "LPN-PRI-01", "grid_supply_point": "Example GSP"}],
+    "years": [{"regulatory_year": "2023-24", "faults": 30, "ci": 1200}, {"regulatory_year": "2024-25", "faults": 60, "ci": 4000}],
+    "average": [{"regulatory_year": "2023-24", "faults": 36000, "subs": 1000},
+                {"regulatory_year": "2024-25", "faults": 40000, "subs": 1000}],
+    "recent": [
+        {"incident_reference": "INC-A", "start_date_time": "2024-12-24T10:00:00+00:00", "end_date_time": "2024-12-24T14:30:00+00:00", "customers_restored": 100},
+        {"incident_reference": "INC-A", "start_date_time": "2024-12-24T10:00:00+00:00", "end_date_time": "2024-12-24T12:00:00+00:00", "customers_restored": 20},
+        {"incident_reference": "INC-B", "start_date_time": "2025-02-22T10:00:00+00:00", "end_date_time": "2025-02-22T12:30:00+00:00", "customers_restored": 70},
+        {"incident_reference": "INC-C", "start_date_time": "2025-03-01T08:00:00+00:00", "end_date_time": "2025-03-01T18:00:00+00:00", "customers_restored": 0}],
+    "sites": [{"c": 8000}],
+}
+
+
+def ukpn_portal_answer(path, answers=None):
+    """What the portal says to one request: by dataset, and for the fault records by what's asked."""
+    a = answers or SUPPLY_ANSWERS
+    q = urllib.parse.unquote_plus(path)
+    ds = path.split("?")[0].rstrip("/").split("/")[-2]
+    if ds == "ukpn_secondary_postcode_area":
+        rows = a["secondary"]
+    elif ds == "ukpn-local-authority-by-primary":
+        rows = a["primary"]
+    elif ds == "ukpn-secondary-sites":
+        rows = a["sites"]
+    elif ds == "ukpn-iis" and "count(distinct substation)" in q:
+        rows = a["average"]
+    elif ds == "ukpn-iis" and "group_by" in q:
+        rows = a["years"] if a.get("match", "LPN-PRI-01") in q else []
+    elif ds == "ukpn-iis":
+        rows = a["recent"] if a.get("match", "LPN-PRI-01") in q else []
+    else:
+        rows = []
+    return json.dumps({"total_count": len(rows), "results": rows}).encode()
+
+
+def ukpn_portal(answers=None):
+    fn = lambda path: ukpn_portal_answer(path, answers)   # noqa: E731
+    fn.takes_path = True
+    return fn
+
+
 def wider_routes():
     return {"threat": (threat, "application/xml"), "ncsc": (ncsc, "application/xml"), "fcdo": (fcdo, "application/xml"),
             "dsearch": (dsearch, "application/json"), "govuk": (govuk, "application/json"),
@@ -369,7 +419,8 @@ def wider_routes():
             "places": (places, "application/json"),
             # 1.20.0: home's carbon intensity region and the next day's forecasts, and National Highways' closures
             "ciregion": (ciregion, "application/json"), "ciregionfw": (ciregionfw, "application/json"),
-            "cifw": (cifw, "application/json"), "nh": (lambda: json.dumps(nh_payload(nh_record())).encode(), "application/json")}
+            "cifw": (cifw, "application/json"), "nh": (lambda: json.dumps(nh_payload(nh_record())).encode(), "application/json"),
+            "ukpnodp": (ukpn_portal(), "application/json")}   # 1.21.0: your power supply
 
 
 def wider_urls(b):
@@ -380,7 +431,7 @@ def wider_urls(b):
             "margin": b + "margin?from={start}&to={end}", "margin_daily": b + "margind", "dfs": b + "dfs?",
             "water": b + "water", "places": b + "places",
             "ci_region": b + "ciregion/{id}", "ci_region_fw24h": b + "ciregionfw/{start}/{id}", "ci_fw24h": b + "cifw/{start}",
-            "roads": b + "nh"}
+            "roads": b + "nh", "supply": b + "ukpnodp/"}
 
 
 # -- The rest of the UK (1.15.0): stand-ins for the regional providers, in the shapes their real feeds had on

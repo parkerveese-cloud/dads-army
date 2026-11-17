@@ -297,7 +297,7 @@ Being ready isn't just food and water. Dads Army looks at ten areas, and food an
 |:-:|:--|:--|
 | 💧 | Water | 3 days of drinking water, a way to make water safe, knowing where the stopcock is |
 | 🥫 | Food & cooking | 3 days of food that needs no fridge, a tin opener, a camping stove and fuel |
-| 🔋 | Power & light | Torches and batteries, a charged power bank, a UPS for the router and Home Assistant, the Priority Services Register |
+| 🔋 | Power & light | Torches and batteries, a charged power bank, a UPS for the router and Home Assistant (a step higher if *Your power supply* shows your local network has more faults than most), the Priority Services Register |
 | 🧣 | Warmth | Blankets or sleeping bags, warm layers, a room you can keep warm |
 | 📻 | Communications | A battery or wind-up radio, numbers on paper, Emergency Alerts, a battery backup for a digital landline, walkie-talkies |
 | 🩹 | Health & medicines | A first aid kit, spare medicines, a written list of medicines, ICE contacts on phones |
@@ -472,6 +472,22 @@ Closures on England's motorways and major A roads (National Highways' Strategic 
 
 Data: Powered by National Highways' Transport Data Feeds.
 
+### Your power supply (1.21.0)
+
+For homes on UK Power Networks' network (London, the South East and the East of England): the substation that supplies home, and how often that part of the network has had faults. Under **Your power supply** in the warnings settings. Elsewhere its switch says it's not for your area.
+
+| Feed | What you get | Warns when |
+|---|---|---|
+| Your power supply (UK Power Networks' Open Data Portal, with your own key) | Your local substation, how many customers it serves and how much of its capacity is used; the primary substation it's fed from; that part of the network's faults each year against the network's average per substation, power cuts per customer, and the typical and longest recent cut | Never by itself. A power cut in your substation's area counts as yours (below) |
+
+- **It needs your own free key.** Make an account on [UK Power Networks' Open Data Portal](https://ukpowernetworks.opendatasoft.com/), copy the API key from your account settings, and paste it in the warnings settings. Adding it switches the source on. Like the National Highways key, it stays on the Pi, is never shown back, and is left out of backup files and the automatic copies (paste it in again after a restore). Tick **Remove the saved key** to take it off.
+- **It sends home's location to UK Power Networks.** This is the one source that does: home's location, rounded to 4 decimal places (about 10 m), goes to UK Power Networks' portal with your key, to find which substation areas home is in. Nothing is sent until you add a key, and never for a home off its network. See *What leaves your network*.
+- **A power cut at your substation is yours.** Once the area your local substation supplies is known, a live power cut inside it is a warning (*Power cut at your substation*), in Affecting you and on the map, wherever its pin is. The area's outline stays on the Pi.
+- **Resilience.** If your local network had more faults than most last year (a fifth more than the average or worse), or a recent cut lasted 6 hours or more, the UPS and longer-lasting power recommendations go up a step (recommended to essential, extra to recommended), and say why.
+- Checked once a day: the fault records are UK Power Networks' yearly returns to Ofgem (the Interruptions Incentive Scheme), and the network's average is asked for once a day too. The line is under Power and energy; the daily briefing isn't told the substation's name.
+
+Data: UK Power Networks Open Data Portal (substation areas and utilisation, and the Interruptions Incentive Scheme's fault records), under the Creative Commons Attribution 4.0 licence (CC BY 4.0).
+
 ### Trends in the wider picture (1.17.0)
 
 Each warnings check keeps a few counts, one a day for two weeks (the day's highest), and compares today's with the usual: the middle of the days before.
@@ -562,7 +578,7 @@ Without an AI set up, the buttons that need one are hidden, and adding an item s
 **Which AI reads the photos.** In **HQ → Scanning**:
 
 - **Home Assistant AI Task** (the default) uses whatever AI you've set up in Home Assistant under **Settings → Devices & services**: Google Gemini, Anthropic or OpenAI. Gemini is tried first, then the others.
-- Or choose **Anthropic Claude** (Claude Haiku 5.5), **Google Gemini** or **OpenAI** and paste an API key. The key stays on the Pi, is never shown back, and is left out of backup files and the automatic database copies (paste it in again after a restore). The National Highways key for road closures is kept the same way.
+- Or choose **Anthropic Claude** (Claude Haiku 5.5), **Google Gemini** or **OpenAI** and paste an API key. The key stays on the Pi, is never shown back, and is left out of backup files and the automatic database copies (paste it in again after a restore). The National Highways key for road closures, and the UK Power Networks key for your power supply, are kept the same way.
 
 It costs about 0.1p a photo. The photo is put in Home Assistant's media folder only while the AI reads it, then deleted.
 
@@ -634,6 +650,7 @@ What goes, and when:
 
 - **Emergency Alerts (when switched on):** home's location rounded to about 100 m goes once to postcodes.io (ONS data), to find your district, county, region and constituency, so that an alert for somewhere else doesn't raise your alert level. Again if you move.
 - **Road closures (when switched on, with your key):** your National Highways key goes to National Highways' API (`api.data.nationalhighways.co.uk`) in a header, with England's whole list asked for by time only. Home's location isn't sent.
+- **Your power supply (when switched on, with your key, for a home on UK Power Networks' network):** **home's location, rounded to about 10 m (4 decimal places), goes to UK Power Networks' Open Data Portal (`ukpowernetworks.opendatasoft.com`)**, with your key in a header, to find the substation that supplies you. Then the substation's id and name are asked for, to find its fault records. Once a day. It's the only source that sends home's location, and nothing goes until you add your key.
 - **The grid now (when switched on):** your carbon intensity region's number (one of 14, worked out on the Pi) goes to NESO's Carbon Intensity API. That says roughly which part of Great Britain home is in, and nothing finer.
 - **Rainfall near you (when switched on):** each of the three nearest rain gauges' readings is asked for by the gauge's id, at the Environment Agency, SEPA or Natural Resources Wales. That says home is within 25 km of those gauges.
 - **Scanning:** a new barcode goes to Open Food Facts (only the barcode), unless you use the offline list. A photo of a date or label goes to the AI you choose.

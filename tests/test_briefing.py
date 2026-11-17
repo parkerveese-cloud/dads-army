@@ -296,7 +296,7 @@ class CoverageTest(AppTest):
 
     def test_everything_else_covers_everyone(self):
         for k in server.LIVE_KEYS:
-            if k != "water":
+            if k not in ("water", "supply"):   # 1.21.0: your power supply is UK Power Networks' only (test_supply)
                 self.assertEqual(server.source_covers(k, {}, DEVON), (True, ""), k)
                 self.assertEqual(server.source_covers(k, {}, None), (True, ""), k)
 
@@ -307,9 +307,9 @@ class CoverageTest(AppTest):
         server.warnings_run()
         w = server.warn_public()
         self.assertNotIn("water", w["live"])
-        self.assertEqual(w["unavailable"], {"water": server.WATER_CHOOSE})
+        self.assertEqual(w["unavailable"], {"water": server.WATER_CHOOSE, "supply": server.UKPN_ONLY})   # Devon
         self.assertNotIn("water", w["sources"])
         server.api_warnings_set({"water_co": "Thames Water"}, {})
-        self.assertEqual(server.warn_public()["unavailable"], {"water": server.WATER_ONLY})
+        self.assertEqual(server.warn_public()["unavailable"], {"water": server.WATER_ONLY, "supply": server.UKPN_ONLY})
         server.api_warnings_set({"lat": "", "lon": ""}, {})
         self.assertEqual(server.warn_public()["unavailable"], {"water": "Needs your home location"})

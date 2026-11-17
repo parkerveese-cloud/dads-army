@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.20.0"
+VERSION = "1.21.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -3667,9 +3667,15 @@ def resilience(c):
             frac = 1.0
         status = "na" if ans == "na" else "done" if frac >= 0.999 else "partly" if frac > 0 else "todo"
         src, body = RES_SOURCES[r["src"]]
-        m = {"id": r["id"], "area": r["area"], "priority": r["priority"], "priority_word": PRIORITY_WORD[r["priority"]],
+        prio, why = r["priority"], r["why"]
+        sup = c.get("supply")
+        if r["id"] in ("power_ups", "power_backup") and supply_risky(sup):
+            # 1.21.0: home's part of the network loses power more often, or for longer, than most: a step up.
+            prio = min(ESSENTIAL, prio + 1)
+            why += " " + supply_why(sup)
+        m = {"id": r["id"], "area": r["area"], "priority": prio, "priority_word": PRIORITY_WORD[prio],
              "title": r["title"].format(target=c["target"]), "brief": r["brief"].format(target=c["target"]),
-             "why": r["why"], "source": src, "label": src + (" · " + body if body else ""),
+             "why": why, "source": src, "label": src + (" · " + body if body else ""),
              "frac": round(frac, 3), "status": status, "detail": detail, "answer": ans,
              "act": None if status in ("done", "na") else act, "manual": r["test"] == MANUAL}
         out.append(m)
@@ -3695,12 +3701,34 @@ def resilience(c):
             "areas": areas, "next": [m["id"] for m in nxt[:8]], "items": out}
 
 
+def supply_reading():
+    """The last "Your power supply" reading (1.21.0), while warnings and that source are on, for Resilience."""
+    cfg = warn_cfg()
+    if not (cfg["on"] and cfg["sources"].get("supply")):
+        return None
+    with WARN_LOCK:
+        r = (WARN_STATE.get("live") or {}).get("supply")
+    return dict((k, v) for k, v in r.items() if k != "area") if isinstance(r, dict) and r.get("found") else None
+
+
+def supply_why(sup):
+    """Why Resilience says backup power matters more for this home."""
+    bits = []
+    if (sup.get("ratio") or 0) >= SUPPLY_RISKY_RATIO:
+        bits.append("had more faults than most last year (%s, against the network's average of %s)" % (
+            sup.get("faults"), fq(round(sup.get("average") or 0))))
+    if (sup.get("longest_mins") or 0) >= SUPPLY_RISKY_MINS:
+        bits.append("had a cut lasting %s recently" % mins_words(sup["longest_mins"]))
+    return "Your local network (%s) %s." % (sup.get("primary") or "your primary substation", " and ".join(bits))
+
+
 def res_context(items, st, plan, checks, warnings_on, food_days, water_days, today):
     with LOCK:
         answers = res_answers()
         home = home_cfg() if HA_TOKEN else {}
+        supply = supply_reading()
     return {"items": items, "plan": plan, "checks": checks, "warnings_on": warnings_on, "home": home,
-            "ha": bool(HA_TOKEN), "answers": answers, "food_days": food_days, "water_days": water_days,
+            "ha": bool(HA_TOKEN), "answers": answers, "supply": supply, "food_days": food_days, "water_days": water_days,
             "target": st["target_days"], "children": st["children"], "today": today,
             "pets": bool(plan.get("pets")) or pets_count(st) > 0 or any(it["category"] == "pets" for it in items)}
 
@@ -4181,7 +4209,7 @@ def scrub_secrets(con):
                 con.execute("UPDATE settings SET value = ? WHERE key = 'scan_ai'", (json.dumps(raw),))
         except ValueError:
             pass
-    con.execute("DELETE FROM settings WHERE key = 'live_keys'")   # 1.20.0: the National Highways key
+    con.execute("DELETE FROM settings WHERE key = 'live_keys'")   # 1.20.0: National Highways' key; 1.21.0: UK Power Networks'
     con.commit()
     con.execute("VACUUM")   # and no old copies left in free pages
 
@@ -5865,6 +5893,8 @@ FEED_URLS = {
     "ci_region_fw24h": "https://api.carbonintensity.org.uk/regional/intensity/{start}/fw24h/regionid/{id}",
     "ci_fw24h": "https://api.carbonintensity.org.uk/intensity/{start}/fw24h",
     "roads": "https://api.data.nationalhighways.co.uk/roads/v2.0/closures",
+    # 1.21.0: UK Power Networks' Open Data Portal (its datasets, each asked for by name), with your own key
+    "supply": "https://ukpowernetworks.opendatasoft.com/api/explore/v2.1/catalog/datasets/",
     "water": "https://utility.arcgis.com/usrsvcs/servers/c69af802939748e29f9d650a7dcde21a/rest/services/PUBLIC/"
              "Aptumo_Contacts_PUBLIC/FeatureServer/0/query?where=1%3D1&outFields=JobGroup__c,JobType__c,"
              "Region__c,ReportedDate__c&returnGeometry=true&outSR=4326&resultRecordCount=2000&f=json",
@@ -5934,6 +5964,7 @@ WARN_SOURCES = [  # key, what it is, on by default
     ("gridnow", "The grid now: carbon and frequency (Great Britain)", False),
     ("gridstress", "Electricity margin and demand flexibility (Great Britain)", True),
     ("roads", "Road closures near you (England's motorways and major A roads)", False),   # 1.20.0: needs your own key
+    ("supply", "Your power supply (UK Power Networks' area)", False),   # 1.21.0: needs your own key, sends home's location
 ]
 WARN_SOURCE_NAMES = {"metoffice": "Met Office", "floods": "Environment Agency", "govalerts": "GOV.UK Emergency Alerts",
                      "gdacs": "GDACS", "fires": "NASA FIRMS", "ukhsa": "UKHSA", "who": "WHO",
@@ -5941,7 +5972,8 @@ WARN_SOURCE_NAMES = {"metoffice": "Met Office", "floods": "Environment Agency", 
                      "gas": "National Gas", "air": "Defra UK-AIR", "space": "NOAA", "pound": "Bank of England",
                      "threat": "GOV.UK", "cyber": "NCSC", "travel": "FCDO", "drought": "Environment Agency", "water": "your water company",
                      "floodrisk": "Flood Forecasting Centre", "rain": "Environment Agency", "ground": "Environment Agency",
-                     "gridnow": "NESO / Elexon", "gridstress": "Elexon / NESO", "roads": "National Highways"}
+                     "gridnow": "NESO / Elexon", "gridstress": "Elexon / NESO", "roads": "National Highways",
+                     "supply": "UK Power Networks"}
 # A warning from a regional provider says who it's from ("by": "SEPA"), which beats these.
 MET_REGIONS = [  # code, name, rough middle (to guess yours from Home Assistant's location)
     ("os", "Orkney & Shetland", 59.6, -2.0), ("he", "Highlands & Eilean Siar", 57.5, -5.0),
@@ -6006,6 +6038,7 @@ def warn_cfg():
         cfg["water_co"] = raw["water_co"]
     MAP_TILES_ON["on"] = cfg["on"] and cfg["map"]   # the web server's CSP lets map pictures in only while it's on
     cfg["nh_key_set"] = bool(live_keys().get("nh"))   # 1.20.0: whether there's a National Highways key, never the key
+    cfg["ukpn_key_set"] = bool(live_keys().get("ukpn"))   # 1.21.0: and a UK Power Networks one
     return cfg
 
 
@@ -7048,11 +7081,12 @@ def fires_near(home, km, hist, now, ignore=()):
 # picks out what's near home itself. Each turns into a reading for the app and, when something's
 # up, a warning. Trend warnings ("emptying faster than last year") come from the feeds' own history.
 LIVE_KEYS = ("rivers", "power", "grid", "gas", "air", "space", "pound",
-             "threat", "cyber", "travel", "drought", "water", "floodrisk", "rain", "ground", "gridnow", "gridstress", "roads")
+             "threat", "cyber", "travel", "drought", "water", "floodrisk", "rain", "ground", "gridnow", "gridstress", "roads", "supply")
 LIVE_EVERY = {"rivers": 14 * 60, "power": 14 * 60, "grid": 14 * 60, "gas": 3 * 3600, "air": 55 * 60,
               "space": 29 * 60, "pound": 6 * 3600,     # seconds between fetches: no more often than they change
               "threat": 3 * 3600, "cyber": 3 * 3600, "travel": 3 * 3600, "drought": 12 * 3600, "water": 14 * 60, "floodrisk": 3 * 3600,
-              "rain": 55 * 60, "ground": 24 * 3600, "gridnow": 14 * 60, "gridstress": 55 * 60, "roads": 14 * 60}
+              "rain": 55 * 60, "ground": 24 * 3600, "gridnow": 14 * 60, "gridstress": 55 * 60, "roads": 14 * 60,
+              "supply": 24 * 3600}   # 1.21.0: the fault records are updated once a year
 LIVE_CREDIT = {
     "rivers": "Environment Agency flood and river level data from the real-time data API (Beta), and SEPA's water "
               "levels in Scotland, under the Open Government Licence",
@@ -7083,6 +7117,8 @@ LIVE_CREDIT = {
              "A roads (not council roads), with your own free key",
     "gridstress": "Margin forecasts from Elexon's BMRS (Insights) and Demand Flexibility Service events from the NESO "
                   "Data Portal",
+    "supply": "UK Power Networks Open Data Portal (substation areas and utilisation, and the Interruptions Incentive "
+              "Scheme's fault records), under CC BY 4.0, with your own free key",
 }
 RIVER_KM = 10          # rivers this close count as near home
 RIVER_KEEP_KM = 30     # station details kept for this far, so a small move of home doesn't need a refetch
@@ -7471,23 +7507,49 @@ def when_words(s):
         local.day, local.strftime("%b"), local.strftime("%H:%M"))
 
 
-def power_live(cuts, home, failed=(), no_feed="", km=POWER_KM):
+def power_live(cuts, home, failed=(), no_feed="", km=POWER_KM, area=()):
     """failed: networks whose feed didn't come through this time (the others still show). no_feed: home's own network,
     if it doesn't publish its live power cuts. km: how far they're listed (the "near you" distance); only one within
-    POWER_NEAR_KM is a warning, whatever that is."""
+    POWER_NEAR_KM is a warning, whatever that is. area (1.21.0): the outline of the area home's own substation supplies,
+    from "Your power supply": a cut inside it is yours, however far its point is from home."""
     rows, items = [], []
     for c in cuts:
+        spots = c.get("spots") or [(c["lat"], c["lon"])]
+        own = bool(area) and any(in_rings(area, p[0], p[1]) for p in spots)
         if c.get("spots"):   # a cut with a spot for each postcode: how near is the nearest of them
             c = dict(c)
             c["lat"], c["lon"] = min(c.pop("spots"), key=lambda p: km_between(home["lat"], home["lon"], p[0], p[1]))
         d = km_between(home["lat"], home["lon"], c["lat"], c["lon"])
-        if d > km:
+        if d > km and not own:
             continue
         c = dict(c, km=round(d, 1), dir=DIR_SHORT.get(compass(home["lat"], home["lon"], c["lat"], c["lon"]), ""))
         c["text"] = "%s%s, %s %s%s" % ("Planned: " if c["planned"] else "", c["where"] or c["dno"], _km_words(d), c["dir"],
                                        (" · back by " + when_words(c["etr"])) if c["etr"] and not c["planned"] else "")
+        if own:
+            c["own"] = True
+            c["text"] = "Your substation · " + c["text"]
         rows.append(c)
-        if d <= POWER_NEAR_KM:
+        if own:
+            homes = ("%d homes" % c["customers"]) if c["customers"] > 1 else "a home" if c["customers"] == 1 else ""
+            if c["planned"]:
+                title = "Planned power cut at your substation"
+                text = ("%s plans to switch the power off in the area your local substation supplies%s, so it's likely "
+                        "to be yours. They'll have written to you if it is. Charge phones and power banks before it "
+                        "starts." % (c["dno"], (" (" + homes + ")") if homes else ""))
+            else:
+                title = "Power cut at your substation"
+                text = ("%s is working on a power cut in the area your local substation supplies%s, so your power is "
+                        "likely to be off too%s. Call 105 to report it or check for updates." % (
+                            c["dno"], (", affecting " + homes) if homes else "",
+                            (". It expects it back by " + when_words(c["etr"])) if c["etr"] else ""))
+            items.append({"id": "power:%s:%s" % (c["dno"], c["ref"]), "source": "power", "kind": "power",
+                          "severity": 1 if c["planned"] else 2, "level": "Planned" if c["planned"] else "Power cut",
+                          "title": title, "text": text, "area": c["where"], "distance_km": int(round(d)),
+                          "back_by": when_words(c["etr"]) if c["etr"] and not c["planned"] else "", "when": "",
+                          "url": "https://www.powercut105.com/",
+                          "issued": iso_utc(parse_when(c["started"]) or dt.datetime.now(dt.timezone.utc)),
+                          "lat": c["lat"], "lon": c["lon"], "own_substation": True})
+        elif d <= POWER_NEAR_KM:
             homes = ("%d homes" % c["customers"]) if c["customers"] > 1 else "a home" if c["customers"] == 1 else ""
             if c["planned"]:
                 title = "Planned power cut %s away" % _km_words(d)
@@ -7503,12 +7565,14 @@ def power_live(cuts, home, failed=(), no_feed="", km=POWER_KM):
                           "title": title, "text": text, "area": c["where"], "distance_km": int(round(d)),
                           "back_by": when_words(c["etr"]) if c["etr"] and not c["planned"] else "", "when": "", "url": "https://www.powercut105.com/", "issued": iso_utc(parse_when(c["started"]) or dt.datetime.now(dt.timezone.utc)),
                           "lat": c["lat"], "lon": c["lon"]})   # for the map (1.19.0)
-    rows.sort(key=lambda r: r["km"])
+    rows.sort(key=lambda r: (not r.get("own"), r["km"]))   # one at your substation first, then the nearest
     unplanned = [r for r in rows if not r["planned"]]
     return items, {"cuts": rows[:6], "count": len(unplanned), "planned": len(rows) - len(unplanned),
                    # every power cut on the networks checked, near or not: for the trends (1.17.0)
                    "networks": sum(1 for c in cuts if not c.get("planned")),
-                   "homes": sum(r["customers"] for r in unplanned), "near": sum(1 for r in unplanned if r["km"] <= POWER_NEAR_KM),
+                   "homes": sum(r["customers"] for r in unplanned),
+                   "near": sum(1 for r in unplanned if r["km"] <= POWER_NEAR_KM or r.get("own")),
+                   "own": sum(1 for r in unplanned if r.get("own")),
                    "failed": list(failed), "no_feed": no_feed, "no_feed_url": NO_LIVE_FEED.get(no_feed, ""), "within_km": km}
 
 
@@ -9074,6 +9138,232 @@ def fetch_roads(home, mem, now, km):
     return roads_live(closures, home, now, km)
 
 
+# Your power supply (1.21.0): the substation that supplies home, how loaded it is, and how often that part of the
+# network has had faults against the network's average, from UK Power Networks' Open Data Portal. Only for homes on
+# its three networks (Eastern, London and South Eastern), and only with the household's own free key. This is the
+# one source that sends home's location anywhere: rounded to 4 decimal places (about 10 m), to UK Power Networks'
+# portal, to find the substation areas home is in. Nothing goes until a key is added and the source is on.
+UKPN_AREAS = (10, 12, 19)          # Eastern, London and South Eastern (MPAN distributor ids, as DNO_NAMES)
+UKPN_KEY_RE = re.compile(r"[A-Za-z0-9]{20,100}")
+UKPN_NEEDS_KEY = "Needs your own UK Power Networks API key: add it in the warnings settings, under Your power supply"
+UKPN_ONLY = "Only covers homes on UK Power Networks' network (London, the South East and the East of England)"
+UKPN_IIS_URL = "https://ukpowernetworks.opendatasoft.com/explore/dataset/ukpn-iis/"
+UKPN_AVG = {}                      # {day: {regulatory year: average faults per substation}}: asked for once a day
+UKPN_PLACE_DP = 4                  # home's location goes to UK Power Networks to this many decimal places
+UKPN_RING_MOST = 400               # points kept in each ring of home's substation area
+SUPPLY_RISKY_RATIO, SUPPLY_RISKY_MINS = 1.2, 360   # more faults than most, or a cut of 6 hours or more
+# Words in a substation's name that aren't its place: "ALDGATE PRIMARY 33/11kV" is matched as "ALDGATE".
+UKPN_NAME_NOISE = re.compile(r"\b(?:\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)*\s*kv|primary|substation|sub\s*stn|s/?stn|s/s|"
+                             r"grid|switching station|p/s)\b", re.I)
+UKPN_VAGUE = ("NORTH", "SOUTH", "EAST", "WEST", "NEW", "OLD", "GREAT", "LITTLE", "UPPER", "LOWER", "HIGH", "LONG",
+              "UPTON", "SAINT", "PARK", "ROAD", "STREET", "LANE", "HILL", "GREEN", "CROSS", "MARKET", "CHURCH")
+
+
+def ukpn_home(home):
+    """Is home on one of UK Power Networks' three networks? (Not if it can't be told: home's location only goes to
+    UK Power Networks when it's sure to be theirs.)"""
+    return bool(home) and dno_area(home["lat"], home["lon"]) in UKPN_AREAS
+
+
+def supply_coverage(cfg, home):
+    if not home or ukpn_home(home):
+        return True, ""   # without a location, the source says it needs one
+    return False, UKPN_ONLY
+
+
+def ukpn_get(url, key):
+    """One answer from UK Power Networks' portal. The key goes in a header, and only to UK Power Networks."""
+    base = urlparse(FEED_URLS["supply"])
+    if not url.startswith("%s://%s/" % (base.scheme, base.netloc)):
+        raise ValueError("unexpected UK Power Networks link")
+    try:
+        data = http_get(url, timeout=40, headers={"Accept": "application/json", "Authorization": "Apikey " + key})
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise FeedRefused("UK Power Networks didn't accept the API key (HTTP %d)" % e.code)
+        raise
+    return _json(data) if data.strip() else {}
+
+
+def ukpn_data(dataset, key, **params):
+    """The records of one of the portal's datasets (its Explore API v2.1), as a list of dicts."""
+    url = FEED_URLS["supply"].rstrip("/") + "/" + dataset + "/records?" + urllib.parse.urlencode(params)
+    got = ukpn_get(url, key)
+    rows = got.get("results") if isinstance(got, dict) else None
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def ukpn_rings(shape):
+    """A GeoJSON (Multi)Polygon, or a portal geo_shape holding one -> its outer rings of [lon, lat], thinned out."""
+    g = shape if isinstance(shape, dict) else {}
+    if isinstance(g.get("geometry"), dict):
+        g = g["geometry"]
+    polys = [g.get("coordinates")] if g.get("type") == "Polygon" else g.get("coordinates") \
+        if g.get("type") == "MultiPolygon" else []
+    out = []
+    for p in polys if isinstance(polys, list) else []:
+        ring = p[0] if isinstance(p, list) and p and isinstance(p[0], list) else []
+        pts = [[round(float(q[0]), 5), round(float(q[1]), 5)] for q in ring
+               if isinstance(q, list) and len(q) >= 2 and all(isinstance(v, (int, float)) for v in q[:2])]
+        if len(pts) >= 3:
+            step = max(1, -(-len(pts) // UKPN_RING_MOST))
+            out.append(pts[::step])
+    return out
+
+
+def ukpn_names(sitename):
+    """A primary substation's name, as UK Power Networks writes it, to (its name to show, [names to look for in the
+    fault records, best first]). "ALDGATE PRIMARY 33/11kV" -> ("Aldgate Primary", ["ALDGATE"]). A one-word place that
+    could be part of many names ("NORTH", "NEW") is never looked for on its own."""
+    raw = re.sub(r"\s+", " ", str(sitename or "")).strip()
+    shown = re.sub(r"\s*\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)*\s*kv$", "", raw, flags=re.I).strip().title()
+    bare = re.sub(r"[^A-Z0-9 '&.-]", " ", UKPN_NAME_NOISE.sub(" ", raw.upper()))
+    bare = re.sub(r"\s+", " ", bare).strip(" .-")
+    out = [bare] if bare and (" " in bare or bare not in UKPN_VAGUE) and len(bare) >= 3 else []
+    first = bare.split(" ")[0] if bare else ""
+    if first and first != bare and len(first) >= 4 and first not in UKPN_VAGUE and first not in ("ST", "ST."):
+        out.append(first)
+    return shown[:60], out
+
+
+def _ukpn_int(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def mins_words(m):
+    """40 -> '40 min', 270 -> '4 h 30 min', 400 -> '7 hours' (from 6 hours on, to the hour)."""
+    m = int(round(m or 0))
+    return "%d min" % m if m < 60 else ("%d hours" % int(m / 60.0 + 0.5) if m >= 360 else "%d h %02d min" % (m // 60, m % 60))
+
+
+def ukpn_year_rows(rows):
+    out = []
+    for r in rows:
+        y, f = str(r.get("regulatory_year") or "")[:9], _ukpn_int(r.get("faults"))
+        if re.match(r"^\d{4}", y) and f is not None:
+            out.append({"year": y, "faults": f, "ci": _ukpn_int(r.get("ci")) or 0})
+    return sorted(out, key=lambda r: r["year"])
+
+
+def ukpn_averages(key, today):
+    """{regulatory year: average faults per substation} across UK Power Networks' fault records, asked for once a day."""
+    day = today.isoformat()
+    if day not in UKPN_AVG:
+        rows = ukpn_data("ukpn-iis", key, group_by="regulatory_year", limit=20,
+                         select="regulatory_year,count(distinct incident_reference) as faults,"
+                                "count(distinct substation) as subs")
+        got = {}
+        for r in rows:
+            subs, faults = _ukpn_int(r.get("subs")), _ukpn_int(r.get("faults"))
+            if subs and faults is not None and r.get("regulatory_year"):
+                got[str(r["regulatory_year"])[:9]] = faults / float(subs)
+        UKPN_AVG.clear()
+        UKPN_AVG[day] = got
+    return UKPN_AVG[day]
+
+
+def ukpn_cuts(rows):
+    """The fault records' rows (one per stage of each fault) -> one per fault: start, longest minutes off, homes."""
+    cuts = {}
+    for r in rows:
+        a, b = parse_when(r.get("start_date_time")), parse_when(r.get("end_date_time"))
+        ref = str(r.get("incident_reference") or "")
+        if not (a and b and ref):
+            continue
+        c = cuts.setdefault(ref, {"start": a, "mins": 0.0, "homes": 0})
+        c["start"] = min(c["start"], a)
+        c["mins"] = max(c["mins"], (b - a).total_seconds() / 60.0)
+        c["homes"] += _ukpn_int(r.get("customers_restored")) or 0
+    return sorted(cuts.values(), key=lambda c: c["start"], reverse=True)
+
+
+def supply_live(sec, prim, years, avg, cuts, customers, home):
+    """The reading for "Your power supply" from what UK Power Networks' portal said. No warnings of its own: a power
+    cut in home's substation area is one (see power_live)."""
+    if not sec and not prim:
+        return [], {"found": False}
+    shown, _ = ukpn_names(prim.get("sitename"))
+    last = years[-1] if years else None
+    mean = avg.get(last["year"]) if last else None
+    ratio = last["faults"] / mean if last and mean else None
+    compare = "" if ratio is None else "more than" if ratio >= SUPPLY_RISKY_RATIO else "fewer than" if ratio <= 0.8 \
+        else "about the same as"
+    felt = [c for c in cuts if c["homes"] > 0 and c["mins"] > 3]   # some records restore no one: left out
+    durs = sorted(c["mins"] for c in felt)
+    longest = max(felt, key=lambda c: c["mins"]) if felt else None
+    area = ukpn_rings(sec.get("geo_shape"))
+    return [], {
+        "found": True, "substation": plain(sec.get("substationalias"), 60), "customers": _ukpn_int(sec.get("customer_count")),
+        "utilisation": plain(sec.get("utilisation_band"), 20), "headroom": plain(sec.get("demand_headroom"), 20),
+        "reinforce": plain(sec.get("predicted_year_of_reinforcement"), 12),
+        "primary": shown, "primary_customers": customers, "gsp": plain(prim.get("grid_supply_point"), 60),
+        "year": last["year"] if last else "", "faults": last["faults"] if last else None,
+        "average": round(mean, 1) if mean else None, "ratio": round(ratio, 2) if ratio is not None else None,
+        "compare": compare,
+        "per_customer": round(last["ci"] / float(customers), 1) if last and customers else None,
+        "typical_mins": round(durs[len(durs) // 2]) if durs else None,
+        "longest_mins": round(longest["mins"]) if longest else None,
+        "longest_on": longest["start"].date().isoformat() if longest else "",
+        "longest_homes": longest["homes"] if longest else None,
+        "history_to": cuts[0]["start"].date().isoformat() if cuts else "",
+        "years": [{"year": y["year"], "faults": y["faults"], "ci": y["ci"],
+                   "average": round(avg[y["year"]], 1) if avg.get(y["year"]) else None} for y in years],
+        "area": area if home and in_rings(area, home["lat"], home["lon"]) else [],   # kept here, never sent to the app
+        "url": UKPN_IIS_URL}
+
+
+def fetch_supply(home, mem, now):
+    key = mem.get("ukpn_key") or ""
+    if not key:
+        raise FeedRefused(UKPN_NEEDS_KEY)
+    if not ukpn_home(home):
+        raise FeedRefused(UKPN_ONLY)   # never sent to UK Power Networks unless it's theirs
+    where = "intersects(geo_shape, geom'POINT(%.*f %.*f)')" % (UKPN_PLACE_DP, home["lon"], UKPN_PLACE_DP, home["lat"])
+    sec = ukpn_data("ukpn_secondary_postcode_area", key, where=where, limit=1,
+                    select="sitefunctionallocation,substationalias,customer_count,utilisation_band,demand_headroom,"
+                           "predicted_year_of_reinforcement,geo_shape")
+    prim = ukpn_data("ukpn-local-authority-by-primary", key, where=where, limit=1,
+                     select="sitename,primary_floc,grid_supply_point")
+    if not sec and not prim:
+        return supply_live({}, {}, [], {}, [], None, home)
+    sec, prim = (sec or [{}])[0], (prim or [{}])[0]
+    _, names = ukpn_names(prim.get("sitename"))
+    by_year = "regulatory_year,count(distinct incident_reference) as faults,sum(customers_restored) as ci"
+    floc = re.sub(r"[^A-Za-z0-9_-]", "", str(prim.get("primary_floc") or ""))[:40]
+    tries = (['sitefunctionallocation="%s"' % floc] if floc else []) + ['substation like "%s*"' % n for n in names]
+    match, years = None, []
+    for m in tries:   # the primary's own id first, then its name in the fault records
+        years = ukpn_year_rows(ukpn_data("ukpn-iis", key, where=m, group_by="regulatory_year",
+                                         order_by="regulatory_year", limit=20, select=by_year))
+        if years:
+            match = m
+            break
+    avg = ukpn_averages(key, now.date())
+    cuts = ukpn_cuts(ukpn_data("ukpn-iis", key, where=match, order_by="start_date_time desc", limit=100,
+                               select="incident_reference,start_date_time,end_date_time,customers_restored")) if match else []
+    customers = None
+    if names:
+        got = ukpn_data("ukpn-secondary-sites", key, where='primaryfeeder like "%s*"' % names[0],
+                        select="sum(customer_count) as c")
+        customers = _ukpn_int((got or [{}])[0].get("c")) or None
+    return supply_live(sec, prim, years, avg, cuts, customers, home)
+
+
+def supply_risky(sup):
+    """More faults than most on home's part of the network, or a recent cut of 6 hours or more."""
+    return bool(sup) and bool(sup.get("found")) and ((sup.get("ratio") or 0) >= SUPPLY_RISKY_RATIO
+                                                      or (sup.get("longest_mins") or 0) >= SUPPLY_RISKY_MINS)
+
+
+def supply_area(live, home):
+    """Home's substation area from the last reading, if it's still home's (a move leaves it out)."""
+    area = ((live or {}).get("supply") or {}).get("area") or []
+    return area if area and home and in_rings(area, home["lat"], home["lon"]) else []
+
+
 DFS_RESOURCE = "3635fd80-49d7-4d02-964d-cc8c08d50302"
 
 
@@ -9083,7 +9373,8 @@ LIVE_LOOK = {"rivers": ("🏞️", "Rivers"), "power": ("🔌", "Power cuts"), "
              "pound": ("💷", "The pound"), "threat": ("🛡️", "Threat level"), "cyber": ("💻", "Cyber security"),
              "travel": ("✈️", "Travel advice"), "drought": ("💧", "Drought and reservoirs"), "water": ("🚰", "Water supply"),
              "floodrisk": ("🌧️", "Flood risk forecast"), "rain": ("☔", "Rainfall"), "ground": ("🕳️", "Groundwater"),
-             "gridnow": ("🔋", "The grid now"), "gridstress": ("📉", "Grid margin"), "roads": ("🚧", "Road closures")}
+             "gridnow": ("🔋", "The grid now"), "gridstress": ("📉", "Grid margin"), "roads": ("🚧", "Road closures"),
+             "supply": ("💡", "Your power supply")}
 TREND_WORDS = {"rising": "rising", "falling": "falling", "steady": "steady"}
 
 
@@ -9122,12 +9413,14 @@ def live_rows(live, items, trends=()):
                     brief += " · %d gauges nearby" % r["count"]
         elif key == "power":
             if r["count"]:
-                c = [x for x in r["cuts"] if not x["planned"]][0] if any(not x["planned"] for x in r["cuts"]) else None
+                c = min([x for x in r["cuts"] if not x["planned"]] or [None], key=lambda x: x["km"] if x else 0)
                 text = "%d power cut%s within %d km%s" % (r["count"], "" if r["count"] == 1 else "s", r.get("within_km", POWER_KM),
                                                           (", nearest %s %s" % (_km_words(c["km"]), c["dir"])) if c else "")
                 state = "warn"
             else:
                 text = "None within %d km" % r.get("within_km", POWER_KM)
+            if r.get("own"):   # 1.21.0: on the substation that supplies home
+                text = "Power cut at your substation · " + text
             if r.get("planned"):
                 text += " · %d planned" % r["planned"]
             brief = re.sub(r", nearest [^·]*?(?= ·|$)", "", text)   # how far the nearest is says where home is
@@ -9136,6 +9429,20 @@ def live_rows(live, items, trends=()):
                 state = "warn" if state == "good" else state
             if r.get("failed"):
                 text += " · couldn't check " + and_join(r["failed"])
+        elif key == "supply":   # 1.21.0: slow figures, never a warning of their own
+            if not r.get("found"):
+                text = "Home isn't in UK Power Networks' substation records"
+            else:
+                if r.get("faults") is not None:
+                    text = "%d fault%s in %s" % (r["faults"], "" if r["faults"] == 1 else "s", r["year"]) + (
+                        ", %s the network's average of %s" % (r["compare"], fq(round(r["average"]))) if r.get("compare") else "")
+                else:
+                    text = "No fault records found"
+                brief = "Your local network: " + text[:1].lower() + text[1:]   # the briefing isn't told the substation
+                if r.get("utilisation"):
+                    text += " · local substation %s used" % r["utilisation"]
+                    brief += " · local substation %s used" % r["utilisation"]
+                text = (r.get("primary") or "Your primary substation") + ": " + text
         elif key == "grid":
             text = r["text"]
             state = {"normal": "good", "notice": "warn", "demand": "bad"}.get(r["status"], "good")
@@ -9269,7 +9576,7 @@ AFFECT_STARTED = ("water", "power", "floods", "govalerts", "roads")   # where "i
 KM_AWAY = re.compile(r"\s*(?:·\s*)?[\d.]+ km away\s*$")
 LIVE_GROUPS = [   # the wider picture's lines that need no attention, under these headings, in this order
     ("Water and weather", ("rivers", "floodrisk", "rain", "ground", "drought")),
-    ("Power and energy", ("power", "grid", "gridnow", "gridstress", "gas")),
+    ("Power and energy", ("power", "supply", "grid", "gridnow", "gridstress", "gas")),
     ("Home", ("water", "air", "roads")),
     ("The wider world", ("threat", "cyber", "travel", "space", "pound")),
 ]
@@ -9307,7 +9614,7 @@ def affecting(items, live):
     near, more = [], 0
     p = live.get("power")
     if p:
-        cuts = [c for c in p.get("cuts") or [] if not c.get("planned") and c["km"] > POWER_NEAR_KM]
+        cuts = [c for c in p.get("cuts") or [] if not c.get("planned") and c["km"] > POWER_NEAR_KM and not c.get("own")]
         more += max(len(cuts), (p.get("count") or 0) - (p.get("near") or 0))   # only the nearest six are kept
         near += [{"source": "power", "kind": "power", "key": "power", "title": "Power cut", "severity": 0, "level": "",
                   "distance_km": c["km"], "postcodes": c.get("where") or "",
@@ -9375,8 +9682,8 @@ def live_map(cfg, loc, items, live):
             **({"lines": i.get("lines") or [], "road": "unplanned"} if i.get("source") == "roads" else {}))
     p = live.get("power") or {}
     for c in p.get("cuts") or []:
-        if c.get("km") is None or c["km"] <= POWER_NEAR_KM:
-            continue   # within 2 km, it's a warning: on the map already
+        if c.get("km") is None or c["km"] <= POWER_NEAR_KM or c.get("own"):
+            continue   # within 2 km, or at your substation, it's a warning: on the map already
         add(c.get("lat"), c.get("lon"), key="power", source="power", kind="power",
             title="Planned power cut" if c.get("planned") else "Power cut", level="Planned" if c.get("planned") else "",
             severity=0, distance_km=c["km"], scope="near", routine=bool(c.get("planned")), area=c.get("where") or "")
@@ -9474,7 +9781,8 @@ def fetch_live(key, cfg, home, mem, now):
         if not worked and err:
             raise err
         mine = DNO_NAMES.get(dno_area(home["lat"], home["lon"]))
-        return power_live(cuts, home, failed, mine if mine in NO_LIVE_FEED else "", cfg["near_km"])
+        area = supply_area(mem.get("live"), home) if cfg["sources"].get("supply") else []   # 1.21.0
+        return power_live(cuts, home, failed, mine if mine in NO_LIVE_FEED else "", cfg["near_km"], area)
     if key == "air":
         sites = parse_air_sites(http_get(FEED_URLS["air"]))
         fc = mem["air_forecast"]
@@ -9495,6 +9803,8 @@ def fetch_live(key, cfg, home, mem, now):
         return fetch_ground(home, mem, now)
     if key == "roads":
         return fetch_roads(home, mem, now, cfg["near_km"])
+    if key == "supply":
+        return fetch_supply(home, mem, now)
     raise ValueError("unknown source")
 
 
@@ -9545,7 +9855,8 @@ def warnings_run():
         mem = {"areas": setting_raw("flood_areas", {}) or {}, "fire_cells": setting_raw("fire_cells", {}) or {},
                "fire_ignore": fire_ignore_list(), "river_stations": setting_raw("river_stations", {}) or {},
                "river_history": setting_raw("river_history", {}) or {}, "air_forecast": setting_raw("air_forecast", {}) or {},
-               "rain_stations": setting_raw("rain_stations", {}) or {}, "nh_key": live_keys().get("nh") or ""}
+               "rain_stations": setting_raw("rain_stations", {}) or {}, "nh_key": live_keys().get("nh") or "",
+               "ukpn_key": live_keys().get("ukpn") or ""}
     if not cfg["on"]:
         return
     home = home_location(cfg)
@@ -9692,6 +10003,7 @@ SOURCE_COVERAGE = {
     "drought": nation_coverage(("england",), "Only covers England (the Environment Agency's weekly drought report)"),
     "grid": nation_coverage(GB, GB_ONLY), "gridnow": nation_coverage(GB, GB_ONLY), "gridstress": nation_coverage(GB, GB_ONLY),
     "roads": nation_coverage(("england",), "Only covers England (National Highways' motorways and major A roads)"),
+    "supply": supply_coverage,   # 1.21.0: UK Power Networks' three networks
 }
 
 
@@ -9837,6 +10149,8 @@ def warn_public():
     on = cfg["on"]
     unavailable = {k: source_covers(k, cfg, loc)[1] for k in SOURCE_COVERAGE if not source_covers(k, cfg, loc)[0]}
     live = dict((k, v) for k, v in (st.get("live") or {}).items() if on and cfg["sources"].get(k) and k not in unavailable)
+    if live.get("supply"):   # home's substation area stays on the Pi: it's only for telling a cut there is yours
+        live["supply"] = dict((k, v) for k, v in live["supply"].items() if k != "area")
     if unavailable:
         st["items"] = [i for i in st["items"] if i.get("source") not in unavailable]
     trends = find_trends(set(k for k, v in cfg["sources"].items() if v and k not in unavailable)) if on else []
@@ -9924,7 +10238,18 @@ def api_warnings_set(body, query):
             keys["nh"] = v
         elif body.get("nh_key") is None:
             keys.pop("nh", None)
+    if "ukpn_key" in body:   # 1.21.0: the same for UK Power Networks' key
+        v = str(body.get("ukpn_key") or "").strip()
+        if v and not UKPN_KEY_RE.fullmatch(v):
+            raise ApiError(400, "That doesn't look like a UK Power Networks API key (20 to 100 letters and numbers)")
+        if v:
+            if not keys.get("ukpn"):
+                cur["sources"]["supply"] = True   # adding a key is asking for your power supply
+            keys["ukpn"] = v
+        elif body.get("ukpn_key") is None:
+            keys.pop("ukpn", None)
     cur.pop("nh_key_set", None)
+    cur.pop("ukpn_key_set", None)
     with tx() as db:
         set_setting_raw(db, "live_keys", keys)
         set_setting_raw(db, "warnings", cur)
