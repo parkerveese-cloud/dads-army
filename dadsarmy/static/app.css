@@ -1074,6 +1074,18 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
 .brief-social p { margin: 2px 0 0; font-size: .95rem; line-height: 1.55; }
 .brief-tag { display: inline-block; font-size: .75rem; line-height: 1.4; padding: 0 7px; border-radius: 999px;
              background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line); vertical-align: 1px; }
+/* 1.24.0: the first lines of the briefing, with the rest behind View more; and Read to me */
+.brief-card:not(.open) .brief-x { display: none; }
+.brief-card.open .brief-src { margin-bottom: 4px; }
+.brief-acts { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: 0 0 10px; }
+.brief-more { display: inline-flex; align-items: center; gap: 7px; min-height: 38px; color: var(--olive); font-size: 14.5px; font-weight: 650; text-decoration: none; }
+.brief-more::after { content: ""; width: 6px; height: 6px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: translateY(-2px) rotate(45deg); }
+.brief-card.open .brief-more::after { transform: translateY(2px) rotate(-135deg); }
+.read-btn { gap: 6px; white-space: nowrap; }
+.read-btn svg { width: 18px; height: 18px; }
+.read-btn.is-on { background: var(--olive); color: var(--on-olive); border-color: var(--olive); }
+.read-btn.is-on svg { fill: currentColor; }
+.level-btns { display: flex; align-items: center; gap: 8px; }
 /* 1.22.0: Google's search suggestions under a Gemini briefing, in a sandboxed frame, as Google made them */
 .brief-google { display: block; width: 100%; height: 56px; border: 0; margin: 0 0 8px; background: transparent; }
 .opt.is-off > span { opacity: .65; }

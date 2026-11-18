@@ -65,7 +65,9 @@
     trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
     edit: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4z"/></svg>',
     list: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>',
-    phone: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 3.5h3l1.5 4.5-2 1.3a11 11 0 0 0 5.7 5.7l1.3-2 4.5 1.5v3a2 2 0 0 1-2 2A16.5 16.5 0 0 1 4.5 5.5a2 2 0 0 1 2-2z"/></svg>'
+    phone: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 3.5h3l1.5 4.5-2 1.3a11 11 0 0 0 5.7 5.7l1.3-2 4.5 1.5v3a2 2 0 0 1-2 2A16.5 16.5 0 0 1 4.5 5.5a2 2 0 0 1 2-2z"/></svg>',
+    speaker: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9.2a4 4 0 0 1 0 5.6M18.2 6.6a7.6 7.6 0 0 1 0 10.8"/></svg>',
+    stop: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>'
   };
 
   // ------------------------------------------------------------------
@@ -767,6 +769,25 @@
     return '<span class="brief-chip" data-state="' + (BRIEF_STATE[n] || 'good') + '"><b>' + esc(label) + '</b> ' + esc(B.levels[n] || n) +
       (vs && vs !== 'same' ? ' <span class="brief-vs">' + (vs === 'higher' ? '↑ above usual' : '↓ below usual') + '</span>' : '') + '</span>';
   }
+  // Sentences, for the briefing's first lines and for reading aloud. A full stop only ends one before a space and then
+  // a capital, a digit or a quote, so "PM2.5" and "2.5 metres" stay whole.
+  function sentences(t) {
+    var out = [], re = /[.!?]+["'’”)]*\s+(?=["'‘“(£]?[A-Z0-9])/g, last = 0;
+    t = String(t || '').replace(/\s+/g, ' ').trim();
+    while (re.exec(t)) { out.push(t.slice(last, re.lastIndex).trim()); last = re.lastIndex; }
+    if (last < t.length) out.push(t.slice(last).trim());
+    return out.filter(Boolean);
+  }
+  // 1.24.0: the first sentence or two are shown, and the rest behind View more (unless the rest is only a few words).
+  function briefSplit(text) {
+    var ss = sentences(text), head = ss.length ? ss[0] : '', i = 1;
+    while (i < ss.length && head.length < 140 && head.length + ss[i].length < 260) head += ' ' + ss[i++];
+    var rest = ss.slice(i).join(' ');
+    return rest.length < 60 ? { head: ss.join(' '), rest: '' } : { head: head, rest: rest };
+  }
+  // Is the briefing card showing a briefing? Then Read to me is on it; otherwise it's on the alert level.
+  function briefShown() { var B = S.briefing; return !!(B && B.config.on && B.available && B.latest); }
+  var BRIEF_OPEN = '';   // the briefing opened with View more (when it was written), so it stays open as the Sitrep redraws
   function briefCard() {
     var B = S.briefing;
     if (!B || !B.config.on || !B.available) return '';
@@ -788,18 +809,25 @@
     var nsocial = (b.sources || []).filter(function (x) { return x.social; }).length;
     // Gemini's searches are Google's, shown as Google's own search suggestions (its terms), so not listed again below.
     var searched = !gemini && b.searched && b.searched.length;
-    return '<section class="card brief-card">' + head +
+    // 1.24.0: the rest of it, social media and the sources (the .brief-x parts) are behind View more. Google's search
+    // suggestions under a Gemini briefing are always shown with it (Google's terms).
+    var part = briefSplit(b.text), key = String(b.made_at || b.day);
+    var more = !!(part.rest || b.social || src), open = more && BRIEF_OPEN === key, read = readBtn();
+    return '<section class="card brief-card' + (open ? ' open' : '') + '">' + head +
       '<div class="brief-chips">' + briefChip(B, b, 'local', 'Local') + briefChip(B, b, 'national', 'UK') + briefChip(B, b, 'global', 'World') + '</div>' +
-      '<p class="brief-text">' + esc(b.text) + '</p>' +
+      '<p class="brief-text">' + esc(part.head) + (part.rest ? '<span class="brief-x"> ' + esc(part.rest) + '</span>' : '') + '</p>' +
       // 1.23.0: what people are posting, apart from the official picture and marked as unconfirmed
-      (b.social ? '<div class="brief-social"><div class="brief-social-head">On social media <span class="muted">· unconfirmed</span></div>' +
+      (b.social ? '<div class="brief-social brief-x"><div class="brief-social-head">On social media <span class="muted">· unconfirmed</span></div>' +
         '<p>' + esc(b.social) + '</p></div>' : '') +
       (gemini && b.suggestions ? '<iframe class="brief-google" src="api/briefing/suggestions?day=' + encodeURIComponent(b.day) + '" title="Google Search suggestions" ' +
         'sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" loading="lazy"></iframe>' : '') +
       (B.busy ? '<p class="small muted">Writing a new one…</p>' : stale && B.error ? '<p class="small err">Today\'s didn\'t come through: ' + esc(B.error) + '</p>' : '') +
-      (src ? '<details class="brief-src"><summary>Sources (' + (b.sources || []).length + (nsocial ? ', ' + nsocial + ' from social media' : '') + ')' +
+      (src ? '<details class="brief-src brief-x"><summary>Sources (' + (b.sources || []).length + (nsocial ? ', ' + nsocial + ' from social media' : '') + ')' +
         (searched ? ' and searches' : '') + '</summary><ul>' + src + '</ul>' +
         (searched ? '<p class="small muted">Searched: ' + b.searched.map(esc).join(' · ') + '</p>' : '') + '</details>' : '') +
+      (more || read ? '<div class="brief-acts">' +
+        (more ? '<button class="link brief-more" data-act="brief-more" data-key="' + esc(key) + '" aria-expanded="' + open + '">' + (open ? 'View less' : 'View more') + '</button>' : '<span></span>') +
+        read + '</div>' : '') +
       '<p class="small muted brief-foot">Written by ' + (gemini ? 'Gemini, with Google Search,' : 'Claude') + ' from the news' + (b.social ? ', social media' : '') +
       ' and Dads Army\'s live data. Check anything important with the official source.</p></section>';
   }
@@ -878,6 +906,231 @@
     });
   });
 
+  // The Sitrep's tiles: expired, expiring soon, below target.
+  function storeCounts() {
+    var cnt = { bad: 0, warn: 0, low: 0 };
+    S.items.forEach(function (it) {
+      var i = info(it);
+      if (i.exp === 'bad') cnt.bad++; else if (i.exp === 'warn') cnt.warn++;
+      if (i.low) cnt.low++;
+    });
+    return cnt;
+  }
+
+  // ------------------------------------------------------------------
+  // Read to me (1.24.0): the alert level, the daily briefing in full and the rest of the Sitrep, read aloud by this
+  // device with one of its own voices that works without the internet. Nothing is sent anywhere: a voice that needs
+  // the internet would send the words to Google, Microsoft or Apple to be spoken, so those are never used.
+  // ------------------------------------------------------------------
+  var SPEAK = { on: false, id: 0, parts: [], timer: null, voice: '', rate: 1, ready: false };
+  try {
+    SPEAK.voice = localStorage.getItem('da-read-voice') || '';
+    SPEAK.rate = +localStorage.getItem('da-read-rate') || 1;
+  } catch (e) { /* the device's usual voice, at the usual speed */ }
+  function synth() { return window.speechSynthesis && window.SpeechSynthesisUtterance ? window.speechSynthesis : null; }
+  function voiceLang(v) { return String(v.lang || '').toLowerCase().replace('_', '-'); }
+  // This device's voices that work without the internet: British English first, then other English, then the rest
+  // (only English is offered when there is some: an iPad has dozens of voices).
+  function offlineVoices() {
+    var s = synth(), vs = s ? s.getVoices().filter(function (v) { return v.localService; }) : [];
+    function rank(v) { var l = voiceLang(v); return l === 'en-gb' ? 0 : l.indexOf('en') === 0 ? 1 : 2; }
+    vs.sort(function (a, b) { return rank(a) - rank(b) || (b['default'] ? 1 : 0) - (a['default'] ? 1 : 0) || a.name.localeCompare(b.name); });
+    return vs.length && rank(vs[0]) < 2 ? vs.filter(function (v) { return rank(v) < 2; }) : vs;
+  }
+  function voiceId(v) { return v.voiceURI || v.name; }
+  function pickVoice() {
+    var vs = offlineVoices();
+    return vs.filter(function (v) { return voiceId(v) === SPEAK.voice; })[0] || vs[0] || null;
+  }
+  // Some browsers find their voices a moment after the page opens: HQ's card waits for them.
+  if (synth()) {
+    synth().getVoices();
+    synth().onvoiceschanged = function () { voicesReady(); };
+    setTimeout(voicesReady, 2000);
+    window.addEventListener('pagehide', function () { synth().cancel(); });   // Chrome would carry on after a reload
+  }
+  function voicesReady() {
+    var first = !SPEAK.ready;
+    SPEAK.ready = true;
+    var el = $('#readCard');
+    if (el && (first || !$('select', el))) el.outerHTML = readHqCard();
+  }
+
+  function readBtn() {
+    if (!synth()) return '';
+    return '<button class="btn small read-btn' + (SPEAK.on ? ' is-on' : '') + '" data-act="read-aloud" ' +
+      'title="Reads out the alert level, the daily briefing, what\'s affecting you and how the stores are doing">' + readBtnInner() + '</button>';
+  }
+  function readBtnInner() { return SPEAK.on ? ICON.stop + ' Stop reading' : ICON.speaker + ' Read to me'; }
+  function syncReadBtns() {
+    $$('[data-act="read-aloud"]').forEach(function (b) { b.classList.toggle('is-on', SPEAK.on); b.innerHTML = readBtnInner(); });
+  }
+
+  // Words as they're shown, made easy to say: no emoji or arrows, "km" as kilometres, "·" as a pause.
+  function sayable(t) {
+    return String(t || '')
+      .replace(/https?:\/\/\S+/g, '')
+      .replace(/[\uD83C-\uD83E][\uDC00-\uDFFF]|[←-⇿⌀-⏿─-➿⬀-⯿️‍]/g, '')
+      .replace(/\s*·\s*/g, ', ')
+      .replace(/−(?=\d)/g, 'minus ')
+      .replace(/°C\b/g, ' degrees')
+      .replace(/µg\/m³/g, 'micrograms per cubic metre')
+      .replace(/(\d+(?:\.\d+)?)\s?km\b/g, function (m, n) { return n + (n === '1' ? ' kilometre' : ' kilometres'); })
+      .replace(/\s&\s/g, ' and ')
+      .replace(/\s+([,.;:!?])/g, '$1')
+      .replace(/\s+/g, ' ').trim();
+  }
+  // A sentence at a time (some voices stop partway through a long stretch), and a long sentence at a comma.
+  function speechChunks(text) {
+    var out = [];
+    sentences(sayable(text)).forEach(function (s) {
+      while (s.length > 220) {
+        var cut = Math.max(s.lastIndexOf(', ', 200), s.lastIndexOf('; ', 200), s.lastIndexOf(': ', 200));
+        if (cut < 60) cut = s.lastIndexOf(' ', 200);
+        if (cut < 60) break;
+        out.push(s.slice(0, cut + 1).trim());
+        s = s.slice(cut + 1).trim();
+      }
+      if (s) out.push(s);
+    });
+    return out;
+  }
+  function endStop(s) { s = String(s || '').trim(); return !s || /[.!?]$/.test(s) ? s : s + '.'; }
+  function levelWord(name) { name = String(name || ''); return name.charAt(0) + name.slice(1).toLowerCase(); }   // MODERATE: Moderate
+
+  // What Read to me says: the alert level, the briefing in full, then what's affecting you, the stores and the plan.
+  function sitrepWords() {
+    var out = [], sit = S.situation, B = S.briefing, w = W();
+    function longDate(d) { return d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }); }   // said in full
+    out.push('Here\'s your sitrep for ' + longDate(new Date()) + '.');
+    if (sit) {
+      out.push('The household alert level is ' + levelWord(sit.name) + ', ' + sit.level + ' of 5. ' + sit.meaning);
+      var why = sit.reasons.map(function (r) { return r.title; });
+      if (why.length) out.push('Why: ' + nameList(why, 4) + '.');
+      if (sit.escalated) out.push('It\'s raised to Severe because ' + (sit.escalated_why || 'the stores wouldn\'t last 3 days') + '.');
+    }
+    var watch = w.on ? (w.trends || []) : [];
+    if (watch.length) out.push('Things to watch: ' + nameList(watch.map(function (x) { return x.title; }), 3) + '.');
+    var b = briefShown() ? B.latest : null;
+    if (b) {
+      out.push('The daily briefing' + (b.day === new Date().toISOString().slice(0, 10) ? '' : ', from ' + longDate(parseYmd(b.day))) + '.');
+      var lv = b.levels || {}, vs = b.vs_usual || {};
+      var rated = [['local', 'Local'], ['national', 'UK'], ['global', 'World']].filter(function (k) { return lv[k[0]]; }).map(function (k) {
+        return k[1] + ': ' + (B.levels[lv[k[0]]] || lv[k[0]]) + (vs[k[0]] === 'higher' ? ', above usual' : vs[k[0]] === 'lower' ? ', below usual' : '');
+      });
+      if (rated.length) out.push(rated.join('. ') + '.');
+      out.push(b.text);
+      if (b.social) out.push('On social media, and unconfirmed: ' + b.social);
+    }
+    if (w.on) {
+      if (w.location) {
+        var yours = ((w.affecting || {}).yours || []).map(function (x) { return x.title; });
+        out.push(yours.length ? 'Affecting you: ' + nameList(yours, 4) + '.' : 'Nothing is affecting your area right now.');
+      } else {
+        var ws = w.items.filter(function (x) { return !(x.source === 'govalerts' && x.severity < 2); }).map(function (x) { return x.title; });
+        out.push(ws.length ? 'Warnings in force: ' + nameList(ws, 3) + '.' : 'No warnings for ' + regionName(w.region) + '.');
+      }
+    }
+    if (S.items.length) {
+      var r = readiness(), cnt = storeCounts(), said = [];
+      if (r.people > 0) {
+        var d = r.hold >= 1000 ? 'over 999' : fmtDays(r.hold);
+        out.push('Your stores would last ' + d + (d === '1' ? ' day' : ' days') + ', against a target of ' + S.settings.target_days + ' days.' +
+          (r.limit ? ' ' + (r.limit === 'food' ? 'Food' : 'Water') + ' runs out first.' : ''));
+      }
+      [[cnt.bad, 'has expired', 'have expired'], [cnt.warn, 'is expiring soon', 'are expiring soon'], [cnt.low, 'is below target', 'are below target']].forEach(function (x) {
+        if (x[0]) said.push(x[0] + (said.length ? ' ' : x[0] === 1 ? ' item ' : ' items ') + (x[0] === 1 ? x[1] : x[2]));
+      });
+      if (said.length) out.push(nameList(said, 3) + '.');
+    }
+    var due = checksDue();
+    if (due) out.push(due + (due === 1 ? ' routine check is due.' : ' routine checks are due.'));
+    var rs = RS();
+    if (rs.areas.length) {
+      var next = rs.next.length ? resById(rs.next[0]) : null;
+      out.push('You\'re ' + rs.pct + '% ready across ' + rs.areas.length + ' areas.' + (next ? ' Next step: ' + endStop(next.title) : ''));
+    }
+    out.push('That\'s the sitrep.');
+    return out;
+  }
+
+  // Reads the words out, a sentence at a time, with this device's offline voice. Pressed again, it stops.
+  function readAloud(words, tries) {
+    var s = synth();
+    if (!s) return toast('This browser can\'t read aloud. Chrome, Edge, Safari and Firefox can.', { error: true });
+    var v = pickVoice();
+    if (!v && !s.getVoices().length && (tries || 0) < 10) {   // its voices aren't loaded yet: a moment more
+      return setTimeout(function () { readAloud(words, (tries || 0) + 1); }, 150);
+    }
+    if (!v) return toast('This device has no voice that works without the internet. Add one in its text-to-speech settings, then try again.', { error: true, ms: 8000 });
+    stopReading();
+    var id = ++SPEAK.id, list = [];
+    words.forEach(function (x) { list = list.concat(speechChunks(x)); });
+    if (!list.length) return;
+    SPEAK.on = true;
+    list.forEach(function (text, i) {
+      var u = new SpeechSynthesisUtterance(text);
+      u.voice = v; u.lang = v.lang; u.rate = SPEAK.rate;
+      if (i === list.length - 1) u.onend = function () { if (id === SPEAK.id) doneReading(); };
+      u.onerror = function (e) {
+        if (id !== SPEAK.id || e.error === 'interrupted' || e.error === 'canceled') return;
+        stopReading();
+        toast('It stopped reading' + (e.error ? ' (' + e.error + ')' : '') + '. Try another voice in HQ.', { error: true });
+      };
+      SPEAK.parts.push(u);   // kept, or some browsers lose it partway
+      s.speak(u);
+    });
+    // If the end is never heard of (it happens), it's done when the device has stopped speaking for two seconds.
+    var idle = 0;
+    SPEAK.timer = setInterval(function () { idle = s.speaking || s.pending ? 0 : idle + 1; if (idle >= 2 && id === SPEAK.id) doneReading(); }, 1000);
+    syncReadBtns();
+  }
+  function doneReading() {
+    clearInterval(SPEAK.timer);
+    SPEAK.on = false; SPEAK.parts = [];
+    syncReadBtns();
+  }
+  function stopReading() {
+    SPEAK.id++;
+    var s = synth();
+    if (s && (s.speaking || s.pending)) s.cancel();
+    doneReading();
+  }
+
+  // HQ: which voice, and how fast. Set on each device, as each has its own voices.
+  function readHqCard() {
+    var s = synth();
+    var html = '<section class="card" id="readCard"><div class="card-head"><h2>Read to me</h2></div>' +
+      '<p class="small muted"><b>Read to me</b> on the Sitrep reads out the household alert level, the daily briefing in full, what\'s affecting you, ' +
+      'and how the stores and the plan are doing. This device does the reading, with one of its own voices that works without the internet, ' +
+      'so nothing is sent anywhere.</p>';
+    if (!s) return html + '<p class="small">This browser can\'t read aloud (some apps\' built-in browsers can\'t). Open Dads Army in Chrome, Edge, Safari or Firefox to use it.</p></section>';
+    var vs = offlineVoices(), cur = pickVoice();
+    if (!vs.length) {
+      return html + '<p class="small">' + (!SPEAK.ready ? 'Looking for this device\'s voices…' : s.getVoices().length
+        ? 'This device\'s voices all need the internet, so Dads Army doesn\'t use them. Add one that works offline in its text-to-speech settings ' +
+          '(on Windows: Settings, Time &amp; language, Speech; on Android: Settings, Text-to-speech output, then download a voice).'
+        : 'This device has no voices to read with. Add one in its text-to-speech settings.') + '</p></section>';
+    }
+    return html + '<label class="field"><span>Voice</span><select data-read="voice">' + vs.map(function (v) {
+      return '<option value="' + esc(voiceId(v)) + '"' + (cur && voiceId(v) === voiceId(cur) ? ' selected' : '') + '>' + esc(v.name + ' (' + v.lang + ')') + '</option>';
+    }).join('') + '</select><div class="hint">Only voices that work without the internet are listed. Each phone, tablet and computer has its own, ' +
+      'so the voice and speed are set on each one.</div></label>' +
+      '<div class="field"><span>Speed</span><div class="seg" role="group" aria-label="Reading speed">' +
+      [[0.85, 'Slower'], [1, 'Normal'], [1.15, 'Faster']].map(function (x) {
+        return '<button type="button" data-act="read-rate" data-val="' + x[0] + '" aria-pressed="' + (SPEAK.rate === x[0]) + '">' + x[1] + '</button>';
+      }).join('') + '</div></div>' +
+      '<div class="btn-row"><button class="btn" data-act="read-try">' + ICON.speaker + ' Try it</button></div></section>';
+  }
+  var READ_SAMPLE = 'This is how Dads Army sounds on this device. Press Read to me on the Sitrep to hear the alert level, the daily briefing and your stores.';
+  document.addEventListener('change', function (e) {
+    var t = e.target;
+    if (!t.dataset || t.dataset.read !== 'voice') return;
+    SPEAK.voice = t.value;
+    try { localStorage.setItem('da-read-voice', t.value); } catch (x) { /* for this visit */ }
+    readAloud([READ_SAMPLE]);
+  });
+
   function renderSitrep(el) {
     if (!S.items.length) { el.innerHTML = watchCard() + briefCard() + levelCard() + warnCard(false) + liveCard() + emptyCard() + resilienceCard(); return; }
     var st = S.settings, r = readiness(), target = st.target_days;
@@ -919,12 +1172,7 @@
     html += trendsCard();
 
     // Alert tiles
-    var cnt = { bad: 0, warn: 0, low: 0 };
-    S.items.forEach(function (it) {
-      var i = info(it);
-      if (i.exp === 'bad') cnt.bad++; else if (i.exp === 'warn') cnt.warn++;
-      if (i.low) cnt.low++;
-    });
+    var cnt = storeCounts();
     html += '<div class="tiles">' +
       tile(cnt.bad, 'Expired', 'bad', 'expired') +
       tile(cnt.warn, Object.keys(st.warn_by_cat || {}).length ? 'Expiring soon' : 'Expiring in ' + st.warn_days + ' days', 'warn', 'soon') +
@@ -2403,8 +2651,9 @@
     var why = sit.reasons.slice(0, 3).map(function (r) { return r.title; });
     var more = sit.reasons.length - why.length;
     return '<section class="card level-card lv' + sit.level + '">' +
-      '<div class="level-top"><span class="eyebrow">Household alert level</span>' +
-      '<button class="info-btn" data-act="level-help" aria-label="What the alert levels mean">i</button></div>' +
+      '<div class="level-top"><span class="eyebrow">Household alert level</span><span class="level-btns">' +
+      (briefShown() ? '' : readBtn()) +   // 1.24.0: on the briefing when there is one
+      '<button class="info-btn" data-act="level-help" aria-label="What the alert levels mean">i</button></span></div>' +
       '<button class="level-main" data-act="level-open"><span class="level-name">' + esc(sit.name) + '</span>' +
       '<span class="level-meaning">' + esc(sit.meaning) + '</span></button>' +
       levelScale(sit) +
@@ -2905,7 +3154,7 @@
     html += '<section class="card"><div class="card-head"><h2>Appearance</h2></div><div class="seg" role="group" aria-label="Theme">' +
       [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']].map(function (t) {
         return '<button data-act="theme" data-val="' + t[0] + '" aria-pressed="' + (theme === t[0]) + '">' + t[1] + '</button>';
-      }).join('') + '</div></section>';
+      }).join('') + '</div></section>' + readHqCard();
 
     html += '<section class="card"><div class="card-head"><h2>Activity log</h2><span class="small muted">last ' + S.log.length + '</span></div>' +
       (S.log.length ? logHtml(S.log) : '<p class="small muted">Nothing yet.</p>') + '</section>';
@@ -4323,6 +4572,24 @@
           function (err) { a.disabled = false; toast(err.message, { error: true }); });
       case 'warn-set':
         return openSheet({ type: 'warnset' });
+      case 'brief-more': {   // 1.24.0
+        var bc = a.closest('.brief-card'), bopen = !bc.classList.contains('open');
+        bc.classList.toggle('open', bopen);
+        BRIEF_OPEN = bopen ? a.dataset.key : '';
+        a.setAttribute('aria-expanded', String(bopen));
+        a.textContent = bopen ? 'View less' : 'View more';
+        if (!bopen && bc.getBoundingClientRect().top < 0) bc.scrollIntoView({ block: 'start' });   // back to its start
+        return;
+      }
+      case 'read-aloud':   // 1.24.0: pressed again, it stops
+        return SPEAK.on ? stopReading() : readAloud(sitrepWords());
+      case 'read-try':
+        return readAloud([READ_SAMPLE]);
+      case 'read-rate':
+        SPEAK.rate = +a.dataset.val;
+        try { localStorage.setItem('da-read-rate', String(SPEAK.rate)); } catch (e) { /* for this visit */ }
+        $$('[data-act="read-rate"]').forEach(function (x) { x.setAttribute('aria-pressed', String(x === a)); });
+        return readAloud([READ_SAMPLE]);
       case 'trend-metric':
         HIST.metric = a.dataset.val;
         try { localStorage.setItem('da-trend-metric', HIST.metric); } catch (e) { /* fine */ }

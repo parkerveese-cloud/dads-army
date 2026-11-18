@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.24.0
+
+**Read to me, and a shorter briefing card**
+
+- **View more.** The daily briefing on the Sitrep shows its ratings and the first sentence or two. **View more** shows the rest of it, what's on social media and the sources; **View less** puts it away again. It stays open while the Sitrep updates, and a new briefing starts closed. Google's search suggestions under a Gemini briefing are always shown.
+- **Read to me.** A new button on the daily briefing (or on the household alert level, when there's no briefing) reads the Sitrep out loud: the alert level, what it means and why; things to watch; the briefing in full, with social media said to be unconfirmed; what's affecting you; how long the stores would last and what's expired or running low; checks that are due; and how ready you are. Press it again to stop.
+- **No internet needed.** Your phone, tablet or computer reads it with one of its own offline voices, so nothing is sent anywhere. Voices that need the internet (they send the words to Google or Microsoft) are never used.
+- **Choose the voice and speed** in HQ's new **Read to me** card, on each device. If a device has no offline voice, the card says how to add one.
+
 ## 1.23.0
 
 **The daily briefing checks social media too**
