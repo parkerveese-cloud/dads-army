@@ -782,19 +782,26 @@
     var gemini = b.ai === 'google';
     var src = (b.sources || []).map(function (x) {
       var u = safeHref(x.url);
-      return u ? '<li><a href="' + esc(u) + '" target="_blank" rel="noopener noreferrer">' + esc(x.title) + '</a></li>' : '';
+      return u ? '<li><a href="' + esc(u) + '" target="_blank" rel="noopener noreferrer">' + esc(x.title) + '</a>' +
+        (x.social ? ' <span class="brief-tag">' + esc(x.social) + '</span>' : '') + '</li>' : '';
     }).join('');
+    var nsocial = (b.sources || []).filter(function (x) { return x.social; }).length;
     // Gemini's searches are Google's, shown as Google's own search suggestions (its terms), so not listed again below.
     var searched = !gemini && b.searched && b.searched.length;
     return '<section class="card brief-card">' + head +
       '<div class="brief-chips">' + briefChip(B, b, 'local', 'Local') + briefChip(B, b, 'national', 'UK') + briefChip(B, b, 'global', 'World') + '</div>' +
       '<p class="brief-text">' + esc(b.text) + '</p>' +
+      // 1.23.0: what people are posting, apart from the official picture and marked as unconfirmed
+      (b.social ? '<div class="brief-social"><div class="brief-social-head">On social media <span class="muted">· unconfirmed</span></div>' +
+        '<p>' + esc(b.social) + '</p></div>' : '') +
       (gemini && b.suggestions ? '<iframe class="brief-google" src="api/briefing/suggestions?day=' + encodeURIComponent(b.day) + '" title="Google Search suggestions" ' +
         'sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" loading="lazy"></iframe>' : '') +
       (B.busy ? '<p class="small muted">Writing a new one…</p>' : stale && B.error ? '<p class="small err">Today\'s didn\'t come through: ' + esc(B.error) + '</p>' : '') +
-      (src ? '<details class="brief-src"><summary>Sources (' + (b.sources || []).length + ')' + (searched ? ' and searches' : '') + '</summary><ul>' + src + '</ul>' +
+      (src ? '<details class="brief-src"><summary>Sources (' + (b.sources || []).length + (nsocial ? ', ' + nsocial + ' from social media' : '') + ')' +
+        (searched ? ' and searches' : '') + '</summary><ul>' + src + '</ul>' +
         (searched ? '<p class="small muted">Searched: ' + b.searched.map(esc).join(' · ') + '</p>' : '') + '</details>' : '') +
-      '<p class="small muted brief-foot">Written by ' + (gemini ? 'Gemini, with Google Search,' : 'Claude') + ' from the news and Dads Army\'s live data. Check anything important with the official source.</p></section>';
+      '<p class="small muted brief-foot">Written by ' + (gemini ? 'Gemini, with Google Search,' : 'Claude') + ' from the news' + (b.social ? ', social media' : '') +
+      ' and Dads Army\'s live data. Check anything important with the official source.</p></section>';
   }
   // HQ: switch it on, choose how thorough, and where "local" is.
   function briefHqCard() {
@@ -803,7 +810,8 @@
     var c = B.config;
     var html = '<section class="card" id="briefCard"><div class="card-head"><h2>Daily briefing</h2>' + (c.on && B.available ? pill('good', 'On') : pill('plain', 'Off')) + '</div>' +
       '<p class="small muted">Every morning at ' + B.hour + 'am, Claude or Gemini (your choice) reads your warnings and the wider picture, searches the news, and writes one paragraph on threats and risks to be aware of: ' +
-      'locally, across the UK and in the world (weather, conflict, cyber, health, power, supply and more), compared with what\'s been usual lately. It\'s shown at the top of the Sitrep.</p>';
+      'locally, across the UK and in the world (weather, conflict, cyber, health, power, supply and more), compared with what\'s been usual lately. ' +
+      'It can add what people near you are saying on social media, too. It\'s shown at the top of the Sitrep.</p>';
     if (!B.available) {
       return html + '<p class="small">Needs an Anthropic or Google Gemini API key: choose <b>Anthropic Claude</b> or <b>Google Gemini</b> under Scanning above and paste your key. ' +
         'You can switch Scanning back afterwards: the key stays saved. (The news search runs on Anthropic\'s or Google\'s side, so OpenAI and Home Assistant\'s AI can\'t do this.)</p></section>';
@@ -826,6 +834,10 @@
         'Each search is counted at Google\'s price (1.4¢), though the first 5,000 a month are free, so it usually costs less than shown. ' +
         'Google\'s terms say its answer is shown with Google\'s search suggestions, so a Gemini briefing is only shown here in Dads Army: Home Assistant\'s sensor just says there\'s one to read.</div>' : '') +
       '</label>' +
+      // 1.23.0: for the next one, like the area, so it isn't greyed out while one's being written
+      '<label class="opt"><input type="checkbox" data-brief="social"' + (c.social ? ' checked' : '') + '><span><b>Social media too</b>' +
+      '<span class="small muted">Also searches public posts (Reddit, X, Facebook pages and groups, Bluesky, local forums) for what people near you are reporting. ' +
+      'It\'s shown on its own, marked unconfirmed, and never raises the ratings by itself. Up to 2 more searches: a few pence a day more.</span></span></label>' +
       '<label class="field"><span>Local news for</span><input type="text" data-brief="area" autocomplete="off" maxlength="60" value="' + esc(c.area) + '" placeholder="' + esc(B.area_auto) + '">' +
       '<div class="hint">A town or county. Left empty, it\'s ' + esc(B.area_auto) + ' (your Met Office region). This name, the day\'s warnings and wider picture, and how long your stores last are sent to ' + who + '.</div></label>';
     if (c.on) {
@@ -854,14 +866,15 @@
     var t = e.target, k = t.dataset && t.dataset.brief;
     if (!k) return;
     var body = {};
-    body[k] = k === 'on' ? t.checked : t.value;
+    body[k] = t.type === 'checkbox' ? t.checked : t.value;
     if (k !== 'area') t.disabled = true;   // one change at a time: the card is drawn afresh from the answer
     api('PUT', 'api/briefing', body).then(function (r) {
       S.briefing = r; redrawBrief();
-      toast(k === 'on' ? (r.config.on ? (r.busy ? 'On: writing today\'s briefing now' : 'Daily briefing on') : 'Daily briefing off') : 'Saved');
+      toast(k === 'on' ? (r.config.on ? (r.busy ? 'On: writing today\'s briefing now' : 'Daily briefing on') : 'Daily briefing off') :
+        k === 'social' ? (r.config.social ? 'Social media included from the next briefing' : 'Social media left out from the next briefing') : 'Saved');
     }, function (err) {
       toast(err.message, { error: true });
-      reloadBrief().catch(function () { t.disabled = false; if (k === 'on') t.checked = !t.checked; });   // back as it is on the Pi
+      reloadBrief().catch(function () { t.disabled = false; if (t.type === 'checkbox') t.checked = !t.checked; });   // back as it is on the Pi
     });
   });
 

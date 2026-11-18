@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.23.0
+
+**The daily briefing checks social media too**
+
+- **What people near you are posting, alongside the official picture.** The briefing now also searches public posts on Reddit, X, Facebook pages and groups, Bluesky, Nextdoor and local forums for what people in and around your area are reporting: power or water cuts, flooding, fires, roads closed, trouble, or shops running short.
+- **Kept apart, and marked unconfirmed.** The paragraph, headline and ratings still come from official and reputable sources. What people are posting has its own **On social media** paragraph underneath, saying whether an official source backs it up. Social media on its own never raises a rating, and no one posting is named or quoted. Sources from social media are marked with the site's name.
+- **Social media too** in HQ's Daily briefing card switches it off or on (it's on to start with), from the next briefing. It's up to two more searches a day: a few pence a day more.
+- In Home Assistant, Claude's briefing has a new `social_media` attribute.
+- Footnote numbers like "[2]" no longer leave a stray space behind when they're taken out of the briefing.
+
 ## 1.22.1
 
 **Things happening at once**

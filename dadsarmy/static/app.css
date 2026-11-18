@@ -1067,6 +1067,13 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
 .brief-src ul { margin: 6px 0; padding-left: 18px; font-size: .9rem; }
 .brief-src li { margin: 3px 0; overflow-wrap: anywhere; }
 .brief-foot { margin-bottom: 0; }
+/* 1.23.0: what people are posting, set apart from the official picture */
+.brief-social { margin: 0 0 10px; padding: 2px 0 2px 12px; border-left: 3px solid var(--line-strong); }
+.brief-social-head { font-size: .85rem; font-weight: 600; color: var(--ink-2); }
+.brief-social-head .muted { font-weight: 400; }
+.brief-social p { margin: 2px 0 0; font-size: .95rem; line-height: 1.55; }
+.brief-tag { display: inline-block; font-size: .75rem; line-height: 1.4; padding: 0 7px; border-radius: 999px;
+             background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line); vertical-align: 1px; }
 /* 1.22.0: Google's search suggestions under a Gemini briefing, in a sandboxed frame, as Google made them */
 .brief-google { display: block; width: 100%; height: 56px; border: 0; margin: 0 0 8px; background: transparent; }
 .opt.is-off > span { opacity: .65; }
