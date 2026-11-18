@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.21.0"
+VERSION = "1.22.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -416,12 +416,13 @@ class ApiError(Exception):
 
 
 class Raw(object):
-    """A non-JSON API response (CSV, file download)."""
+    """A non-JSON API response (CSV, file download, a page for a frame), with any headers of its own."""
 
-    def __init__(self, data, content_type, filename=None):
+    def __init__(self, data, content_type, filename=None, headers=None):
         self.data = data
         self.content_type = content_type
         self.filename = filename
+        self.headers = headers or {}
 
 
 ROUTES = []
@@ -1734,7 +1735,9 @@ AI_PROVIDERS = {
 AI_PRICES = {"claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.0, 10.0), "claude-opus-5-5": (4.0, 20.0),
              "claude-haiku-4-5": (1.0, 5.0), "claude-sonnet-5": (2.0, 10.0),
              # Google's and OpenAI's list prices for the default models, rounded up (check their pricing pages).
-             "gemini-flash-latest": (0.30, 2.50), "gpt-4.1-mini": (0.40, 1.60)}
+             "gemini-flash-latest": (0.30, 2.50), "gpt-4.1-mini": (0.40, 1.60),
+             # The daily briefing's Gemini models (1.22.0). Argon's price doubles on 1 December 2026: the new one.
+             "gemini-4-hydrogen": (1.50, 7.50), "gemini-4-argon": (4.0, 20.0)}
 # Any other model is costed at this, on the high side, so the monthly limit still stops it.
 AI_PRICE_UNKNOWN = (3.0, 15.0)
 AI_NAMES = (("anthropic", "Claude"), ("claude", "Claude"), ("google", "Gemini"), ("gemini", "Gemini"), ("openai", "OpenAI"))
@@ -2160,6 +2163,17 @@ def _post_json(url, body, headers, timeout=60):
         raise IOError("HTTP %d%s" % (e.code, (": " + str(msg)[:120]) if msg else ""))
 
 
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
+
+
+def gemini_usage(out):
+    """Tokens in and out of one Gemini answer, as Google bills them: what it read from its searches counts as tokens
+    in, and its thinking as tokens out."""
+    u = out.get("usageMetadata") or {}
+    return {"in": int(u.get("promptTokenCount") or 0) + int(u.get("toolUsePromptTokenCount") or 0),
+            "out": int(u.get("candidatesTokenCount") or 0) + int(u.get("thoughtsTokenCount") or 0)}
+
+
 def ai_direct(provider, key, model, prompt, img_b64=None, usage=None, max_tokens=2048):
     """Ask one provider directly, with an optional JPEG. Returns the model's reply text; tokens go in `usage`."""
     usage = usage if usage is not None else {}
@@ -2179,12 +2193,11 @@ def ai_direct(provider, key, model, prompt, img_b64=None, usage=None, max_tokens
         return " ".join(b.get("text", "") for b in out.get("content") or [] if b.get("type") == "text")
     if provider == "google":
         parts = ([{"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}] if img_b64 else []) + [{"text": prompt}]
-        out = _post_json("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" %
-                         urllib.parse.quote(model or AI_PROVIDERS["google"]["model"]), {"contents": [{"parts": parts}]},
+        out = _post_json(GEMINI_URL % urllib.parse.quote(model or AI_PROVIDERS["google"]["model"]), {"contents": [{"parts": parts}]},
                          {"x-goog-api-key": key})
-        u = out.get("usageMetadata") or {}
-        usage.update({"in": u.get("promptTokenCount", 0), "out": u.get("candidatesTokenCount", 0)})
-        return " ".join(p.get("text", "") for c in out.get("candidates") or [] for p in (c.get("content") or {}).get("parts") or [])
+        usage.update(gemini_usage(out))
+        return " ".join(p.get("text", "") for c in out.get("candidates") or [] for p in (c.get("content") or {}).get("parts") or []
+                        if not p.get("thought"))
     if provider == "openai":
         content = [{"type": "text", "text": prompt}] + ([{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + img_b64}}]
                                                        if img_b64 else [])
@@ -4476,7 +4489,14 @@ def ha_entities(s):
     except sqlite3.Error:
         pass
     bl = brief_list()
-    if brief_cfg()["on"] and bl:
+    if brief_cfg()["on"] and bl and bl[-1].get("ai") == "google":
+        # 1.22.0: Google's terms only let a Gemini briefing (searched with Google Search) be shown with Google's search
+        # suggestions, which a sensor can't carry, so it says when there's one to read, and nothing of what it says.
+        b = bl[-1]
+        put("sensor.dads_army_briefing", "Written by Gemini: read it in Dads Army", "Dads Army briefing",
+            "mdi:newspaper-variant-outline", None, {"day": b.get("day"), "made_at": b.get("made_at"), "written_by": "Gemini"},
+            measurement=False)
+    elif brief_cfg()["on"] and bl:
         b = bl[-1]
         put("sensor.dads_army_briefing", (b.get("headline") or "Daily briefing")[:250], "Dads Army briefing",
             "mdi:newspaper-variant-outline", None, {
@@ -11366,6 +11386,7 @@ class Handler(BaseHTTPRequestHandler):
                     extra = {"Cache-Control": "no-store"}
                     if result.filename:
                         extra["Content-Disposition"] = 'attachment; filename="%s"' % result.filename
+                    extra.update(result.headers)
                     self.send_bytes(200, result.data, result.content_type, extra)
                 else:
                     self.send_json(200, result)
@@ -11405,27 +11426,48 @@ def local_addresses():
     return addrs
 
 
-# -- The daily briefing (1.15.0) ------------------------------------------------------------------
-# At 6am Claude reads what Dads Army already knows (the warnings, the wider picture, health news and how long
-# the stores last), searches the news, and writes one paragraph on what to be aware of locally, across the UK
-# and in the world, against what's been usual lately. It needs your own Anthropic API key (HQ → Scanning), as
-# the web search runs on Anthropic's side. Off until you switch it on.
+# -- The daily briefing (1.15.0; Gemini 1.22.0) ---------------------------------------------------
+# At 6am Claude or Gemini (your choice) reads what Dads Army already knows (the warnings, the wider picture, health
+# news and how long the stores last), searches the news, and writes one paragraph on what to be aware of locally,
+# across the UK and in the world, against what's been usual lately. It needs your own Anthropic or Google Gemini API
+# key (HQ → Scanning), as the search runs on their side: Anthropic's web search, or Google's Grounding with Google
+# Search. Off until you switch it on.
 BRIEF_HOUR = 6
 BRIEF_KEEP = 60                    # days of briefings kept, for the baseline and to look back on
 BRIEF_TRIES = 4                    # attempts a day at most (each one costs), 20 minutes apart
-BRIEF_SEARCH_USD = 0.01            # Anthropic web search: $10 per 1,000 searches
-BRIEF_MODELS = {"claude-haiku-5-5": ("Standard", "Claude Haiku 5.5: about 7p a day", "web_search_20250305"),
-                "claude-sonnet-5-5": ("Thorough", "Claude Sonnet 5.5: about 25p a day", "web_search_20260209")}
+# Each search, on top of the tokens. Anthropic: $10 per 1,000. Google: $14 per 1,000 once the first 5,000 a month
+# (free, shared by everything using the key) are used: counted at $14, so the monthly limit errs on the safe side.
+BRIEF_SEARCH_USD = {"anthropic": 0.01, "google": 0.014}
+BRIEF_AIS = {"anthropic": "Anthropic", "google": "Google Gemini"}   # which of Scanning's keys can write it
+BRIEF_MODELS = {
+    "claude-haiku-5-5": {"ai": "anthropic", "name": "Standard", "label": "Claude Haiku 5.5",
+                         "about": "Claude Haiku 5.5: about 7p a day", "tool": "web_search_20250305"},
+    "claude-sonnet-5-5": {"ai": "anthropic", "name": "Thorough", "label": "Claude Sonnet 5.5",
+                          "about": "Claude Sonnet 5.5: about 25p a day", "tool": "web_search_20260209"},
+    # Searches counted at $14 per 1,000 (see above): while the free ones last, about 5p and 15p.
+    "gemini-4-hydrogen": {"ai": "google", "name": "Standard", "label": "Gemini 4 Hydrogen",
+                          "about": "Gemini 4 Hydrogen: about 10p a day"},
+    "gemini-4-argon": {"ai": "google", "name": "Thorough", "label": "Gemini 4 Argon",
+                       "about": "Gemini 4 Argon: about 20p a day"},
+}
 BRIEF_LEVELS = {1: "Quiet", 2: "Normal", 3: "Raised", 4: "High", 5: "Severe"}
 BRIEF = {"busy": False, "error": "", "day": "", "tries": 0, "last_try": 0.0}
 BRIEF_LOCK = threading.Lock()
 BRIEF_WAKE = threading.Event()
 
 
+def brief_default_model():
+    """Standard, from whichever AI has a key saved: the one chosen under Scanning first, then Claude, then Gemini."""
+    c = scan_ai_cfg()
+    order = ([c["provider"]] if c["provider"] in BRIEF_AIS else []) + list(BRIEF_AIS)
+    ai = next((a for a in order if c["keys"].get(a)), "anthropic")
+    return next(m for m, v in BRIEF_MODELS.items() if v["ai"] == ai)
+
+
 def brief_cfg():
     raw = setting_raw("briefing", {}) or {}
     raw = raw if isinstance(raw, dict) else {}
-    model = raw.get("model") if raw.get("model") in BRIEF_MODELS else "claude-haiku-5-5"
+    model = raw.get("model") if raw.get("model") in BRIEF_MODELS else brief_default_model()
     return {"on": bool(raw.get("on")), "model": model, "area": clean_text(str(raw.get("area")), 60) if raw.get("area") else ""}
 
 
@@ -11444,8 +11486,18 @@ def brief_area(c=None):
     return MET_NAME.get(cfg["region"] or guess_region(home_location(cfg)) or "", "") or "the UK"
 
 
-def brief_key():
-    return scan_ai_cfg()["keys"].get("anthropic") or ""
+def brief_key(c=None):
+    """The key for the AI that writes it (Anthropic's or Google's, saved under Scanning), or ""."""
+    c = c or brief_cfg()
+    return scan_ai_cfg()["keys"].get(BRIEF_MODELS[c["model"]]["ai"]) or ""
+
+
+def brief_no_key(c):
+    """Why it can't be written: no key at all, or none for the AI chosen."""
+    if not any(scan_ai_cfg()["keys"].get(a) for a in BRIEF_AIS):
+        return "The daily briefing needs an Anthropic or Google Gemini API key: add one in HQ → Scanning"
+    m = BRIEF_MODELS[c["model"]]
+    return "%s needs your %s API key: add it in HQ → Scanning, or choose the other AI" % (m["label"], BRIEF_AIS[m["ai"]])
 
 
 BRIEF_PROMPT = """You are writing the daily threat and risk briefing for a UK household's preparedness app, Dads Army. \
@@ -11528,8 +11580,10 @@ def brief_known(sm=None):
     return text[:7000]
 
 
-def brief_baseline(past, today):
-    rows = [b for b in past if b["day"] < today][-14:]
+def brief_baseline(past, today, ai="anthropic"):
+    # A Gemini briefing is a "Grounded Result", which Google's terms don't let go on to another AI: Claude isn't told
+    # what Gemini wrote or rated, if you switch.
+    rows = [b for b in past if b["day"] < today and (b.get("ai") != "google" or ai == "google")][-14:]
     if not rows:
         return "No earlier briefings yet: judge 'usual' from what is normal for the UK."
     out = ["%s: local %s, national %s, global %s" % (b["day"], *((b.get("levels") or {}).get(k, "?")
@@ -11539,12 +11593,20 @@ def brief_baseline(past, today):
     return "\n".join(out)
 
 
+def brief_prompt(ai, today, c, past):
+    p = BRIEF_PROMPT.format(today=today.strftime("%A %-d %B %Y"), area=brief_area(c), searches=6,
+                            known=brief_known(), baseline=brief_baseline(past, today.isoformat(), ai))
+    if ai == "google":   # Gemini's sources come back with its answer, from Google, so it isn't asked to name them
+        p = p.rsplit("\nSOURCES:", 1)[0]
+    return p
+
+
 def parse_brief_reply(text):
     """The paragraph, headline, levels and named sources out of the reply. ValueError if there's no paragraph."""
-    t = (text or "").strip()
-    m = re.search(r"BRIEFING:\s*(.+?)(?=\n\s*HEADLINE:|\n\s*LEVELS:|\n\s*SOURCES:|\Z)", t, re.S | re.I)
+    t = re.sub(r"\*\*|__", "", (text or "")).strip()   # **HEADLINE:** in bold is still the headline
+    m = re.search(r"BRIEFING:\s*(.+?)(?=\n\s*HEADLINE:|\n\s*LEVELS:|\n\s*VS_USUAL:|\n\s*SOURCES:|\Z)", t, re.S | re.I)
     para = re.sub(r"\s+", " ", (m.group(1) if m else "")).strip()
-    para = re.sub(r"\[\d+\]|\*\*|__", "", para).strip()
+    para = re.sub(r"\[\d+\]", "", para).strip()
     if len(para) < 40:
         raise ValueError("The briefing came back empty")
     h = re.search(r"HEADLINE:\s*(.+)", t, re.I)
@@ -11566,7 +11628,7 @@ def parse_brief_reply(text):
 def brief_call(key, model, prompt, usage, searches=6):
     """One Messages API call with web search, following pause_turn. Returns (final text, cited sources,
     searches made, {url: title} of every search result)."""
-    tool = {"type": BRIEF_MODELS[model][2], "name": "web_search", "max_uses": searches,
+    tool = {"type": BRIEF_MODELS[model]["tool"], "name": "web_search", "max_uses": searches,
             "user_location": {"type": "approximate", "country": "GB", "timezone": "Europe/London"}}
     messages = [{"role": "user", "content": prompt}]
     content = []
@@ -11608,6 +11670,56 @@ def brief_call(key, model, prompt, usage, searches=6):
     return "".join(final), sources[:10], queries[:10], results
 
 
+# Why Gemini stopped without an answer worth showing, from the candidate's finishReason.
+GEMINI_DECLINED = ("SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "LANGUAGE")
+SUGGESTIONS_MAX = 60000   # characters of Google's search suggestions kept (a few kB, normally)
+# Google's free tier for Gemini doesn't include Grounding with Google Search.
+BRIEF_GOOGLE_PAID = ("(If your key is on Google's free tier: searching the news needs billing switched on for it, in "
+                     "Google AI Studio.)")
+
+
+def gemini_link(u):
+    """A source's link exactly as Google gave it (its terms: no changing it), if it's a plain web address."""
+    u = (u or "").strip() if isinstance(u, str) else ""
+    return u if len(u) <= 2048 and re.match(r"^https?://[^\s\"'<>]+$", u) else ""
+
+
+def brief_call_gemini(key, model, prompt, usage):
+    """One generateContent call with Grounding with Google Search: Google runs the searches itself. Only the prompt
+    goes, with no location. Returns (the answer, the sources it rests on, what it searched for, {url: title} of every
+    result, Google's search suggestions: HTML that Google's terms say is shown with the answer)."""
+    out = _post_json(GEMINI_URL % urllib.parse.quote(model), {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"maxOutputTokens": 16384}}, {"x-goog-api-key": key}, timeout=240)
+    cand = (out.get("candidates") or [{}])[0] or {}
+    meta = cand.get("groundingMetadata") or {}
+    queries = [clean_text(q, 120) for q in meta.get("webSearchQueries") or [] if isinstance(q, str) and q.strip()]
+    u = gemini_usage(out)
+    usage.update({"in": usage.get("in", 0) + u["in"], "out": usage.get("out", 0) + u["out"],
+                  "searches": usage.get("searches", 0) + len(queries)})   # Google bills each search it runs
+    if (out.get("promptFeedback") or {}).get("blockReason") or cand.get("finishReason") in GEMINI_DECLINED:
+        raise IOError("Gemini declined to write the briefing")
+    text = "".join(p.get("text", "") for p in (cand.get("content") or {}).get("parts") or []
+                   if isinstance(p, dict) and not p.get("thought"))
+    chunks = []
+    for ch in meta.get("groundingChunks") or []:
+        web = (ch.get("web") if isinstance(ch, dict) else None) or {}
+        url = gemini_link(web.get("uri"))
+        chunks.append({"url": url, "title": clean_text(web.get("title") or "", 160) or "Source"} if url else None)
+    results = dict((x["url"], x["title"]) for x in chunks if x)
+    # The sources the answer rests on (Google's groundingSupports), first used first; else every one it found.
+    used = []
+    for s in meta.get("groundingSupports") or []:
+        for i in (s.get("groundingChunkIndices") or []) if isinstance(s, dict) else []:
+            if isinstance(i, int) and 0 <= i < len(chunks) and chunks[i] and chunks[i] not in used:
+                used.append(chunks[i])
+    sources = used or [x for x in chunks if x]
+    html = (meta.get("searchEntryPoint") or {}).get("renderedContent") or ""
+    html = html if isinstance(html, str) and len(html) <= SUGGESTIONS_MAX else ""
+    return text, sources[:10], queries[:10], results, html
+
+
 def make_briefing(by="schedule"):
     """Write today's briefing. Returns it, or raises ApiError."""
     with BRIEF_LOCK:
@@ -11616,17 +11728,21 @@ def make_briefing(by="schedule"):
         BRIEF["busy"], BRIEF["last_try"] = True, time.time()
     c, usage = brief_cfg(), {}
     model = c["model"]
+    ai = BRIEF_MODELS[model]["ai"]
     try:
-        key = brief_key()
+        key = brief_key(c)
         if not key:
-            raise ApiError(400, "The daily briefing needs an Anthropic API key: add one in HQ → Scanning")
+            raise ApiError(400, brief_no_key(c))
         ai_limit_check(scan_ai_cfg())
         today = dt.date.today()
         past = brief_list()
-        prompt = BRIEF_PROMPT.format(today=today.strftime("%A %-d %B %Y"), area=brief_area(c), searches=6,
-                                     known=brief_known(), baseline=brief_baseline(past, today.isoformat()))
+        prompt = brief_prompt(ai, today, c, past)
+        suggestions = ""
         try:
-            reply, sources, queries, results = brief_call(key, model, prompt, usage)
+            if ai == "google":
+                reply, sources, queries, results, suggestions = brief_call_gemini(key, model, prompt, usage)
+            else:
+                reply, sources, queries, results = brief_call(key, model, prompt, usage)
             got = parse_brief_reply(reply)
             # The sources it names, but only ones that really came back from its searches.
             for u in got.pop("source_urls", []):
@@ -11634,18 +11750,24 @@ def make_briefing(by="schedule"):
                     sources.append({"url": u, "title": results[u]})
             sources = sources[:8]
         except (urllib.error.URLError, IOError, ValueError, socket.timeout) as e:
-            msg = friendly_ai_error("anthropic", str(getattr(e, "reason", e)))
-            record_ai("anthropic", model, "Dads Army briefing", usage, False, msg,
-                      extra_usd=usage.get("searches", 0) * BRIEF_SEARCH_USD)
+            said = str(getattr(e, "reason", e))
+            msg = friendly_ai_error(ai, said)
+            record_ai(ai, model, "Dads Army briefing", usage, False, msg,
+                      extra_usd=usage.get("searches", 0) * BRIEF_SEARCH_USD[ai])
             if "didn't accept the API key" in msg:   # not a working key: switch it off rather than try every day
                 with tx() as db:
                     set_setting_raw(db, "briefing", dict(c, on=False))
                 msg += " The daily briefing has been switched off until you add a working key."
+            if ai == "google" and re.search(r"(?<!\d)(?:403|429)(?!\d)|quota|resource_exhausted|billing|free tier|"
+                                            r"permission", said, re.I):
+                msg += " " + BRIEF_GOOGLE_PAID
             raise ApiError(502, msg)
-        cost = record_ai("anthropic", model, "Dads Army briefing", usage, True,
-                         extra_usd=usage.get("searches", 0) * BRIEF_SEARCH_USD)
-        entry = dict(got, day=today.isoformat(), made_at=now_iso(), model=model, by=by, area=brief_area(c),
+        cost = record_ai(ai, model, "Dads Army briefing", usage, True,
+                         extra_usd=usage.get("searches", 0) * BRIEF_SEARCH_USD[ai])
+        entry = dict(got, day=today.isoformat(), made_at=now_iso(), model=model, ai=ai, by=by, area=brief_area(c),
                      sources=sources, searched=queries, searches=usage.get("searches", 0), cost_usd=cost)
+        if suggestions:
+            entry["suggestions"] = suggestions
         keep = [b for b in past if b["day"] != entry["day"]] + [entry]
         with tx() as db:
             set_setting_raw(db, "briefings", keep[-BRIEF_KEEP:])
@@ -11663,7 +11785,7 @@ def make_briefing(by="schedule"):
 
 def brief_due(c, now=None):
     now = now or dt.datetime.now()
-    if not c["on"] or BRIEF["busy"] or now.hour < BRIEF_HOUR or not brief_key():
+    if not c["on"] or BRIEF["busy"] or now.hour < BRIEF_HOUR or not brief_key(c):
         return False
     day = now.date().isoformat()
     if any(b["day"] == day for b in brief_list()):
@@ -11691,11 +11813,18 @@ def briefing_loop():
 def brief_public():
     c = brief_cfg()
     past = brief_list()
-    latest = past[-1] if past else None
-    return {"config": c, "available": bool(brief_key()), "busy": BRIEF["busy"], "error": BRIEF["error"],
+    keys = scan_ai_cfg()["keys"]
+    # Google's search suggestions are fetched by their own frame (/api/briefing/suggestions), not sent every time.
+    latest = dict(past[-1], suggestions=bool(past[-1].get("suggestions"))) if past else None
+    ready = bool(keys.get(BRIEF_MODELS[c["model"]]["ai"]))
+    return {"config": c, "available": any(keys.get(a) for a in BRIEF_AIS), "ready": ready,
+            "need_key": "" if ready else brief_no_key(c), "busy": BRIEF["busy"], "error": BRIEF["error"],
             "latest": latest if c["on"] else None, "hour": BRIEF_HOUR, "area_auto": brief_area(dict(c, area="")),
-            "models": {k: {"name": v[0], "about": v[1]} for k, v in BRIEF_MODELS.items()}, "levels": BRIEF_LEVELS,
-            "history": [{k: b.get(k) for k in ("day", "headline", "levels")} for b in past[-30:]] if c["on"] else []}
+            "models": {k: {"name": v["name"], "about": v["about"], "ai": v["ai"], "key": bool(keys.get(v["ai"]))}
+                       for k, v in BRIEF_MODELS.items()},
+            "ais": BRIEF_AIS, "levels": BRIEF_LEVELS,
+            "history": [{k: b.get(k) for k in ("day", "headline", "levels")} for b in past[-30:]
+                        if b.get("ai") != "google"] if c["on"] else []}
 
 
 @route("GET", "/api/briefing")
@@ -11703,17 +11832,35 @@ def api_briefing(body, query):
     return brief_public()
 
 
+# The page Google's search suggestions are shown in, under a Gemini briefing. Google's HTML goes in as it came (its
+# terms: shown with the answer, unchanged), in a sandboxed frame: no scripts run, nothing loads from elsewhere, and its
+# links open Google in a new tab.
+SUGGESTIONS_PAGE = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="color-scheme" '
+                    'content="light dark"><base target="_blank"><style>html,body{margin:0;padding:0;background:'
+                    'transparent;overflow:hidden}</style></head><body>%s</body></html>')
+
+
+@route("GET", "/api/briefing/suggestions")
+def api_briefing_suggestions(body, query):
+    day = (query.get("day") or [""])[0]
+    b = next((x for x in reversed(brief_list()) if not day or x["day"] == day), None)
+    if not b or not b.get("suggestions") or not brief_cfg()["on"]:
+        raise ApiError(404, "No search suggestions for that briefing")
+    return Raw((SUGGESTIONS_PAGE % b["suggestions"]).encode("utf-8"), "text/html; charset=utf-8",
+               headers={"Content-Security-Policy": "sandbox allow-popups allow-popups-to-escape-sandbox"})
+
+
 @route("PUT", "/api/briefing")
 def api_briefing_put(body, query):
     c = brief_cfg()
-    if "on" in body:
-        if body["on"] and not brief_key():
-            raise ApiError(400, "The daily briefing needs an Anthropic API key: add one under Scanning")
-        c["on"] = bool(body["on"])
     if "model" in body:
         if body["model"] not in BRIEF_MODELS:
             raise ApiError(400, "Unknown model")
         c["model"] = body["model"]
+    if "on" in body:
+        c["on"] = bool(body["on"])
+    if c["on"] and ("on" in body or "model" in body) and not brief_key(c):
+        raise ApiError(400, brief_no_key(c))
     if "area" in body:
         c["area"] = clean_text(str(body["area"] or ""), 60) if str(body["area"] or "").strip() else ""
     with tx() as db:
@@ -11740,7 +11887,7 @@ def api_briefing_now(body, query):
     if BRIEF["busy"]:
         raise ApiError(409, "A briefing is already being written")
     if not brief_key():
-        raise ApiError(400, "The daily briefing needs an Anthropic API key")
+        raise ApiError(400, brief_no_key(brief_cfg()))
     threading.Thread(target=lambda: _brief_quiet("by hand"), name="briefing-now", daemon=True).start()
     time.sleep(0.2)
     return brief_public()

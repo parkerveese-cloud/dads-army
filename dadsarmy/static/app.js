@@ -779,17 +779,22 @@
         (B.busy ? 'Writing your first briefing: searching the news. This takes a minute or two…' : B.error ? esc(B.error) : 'Your first briefing comes at ' + B.hour + 'am.') + '</p></section>';
     }
     var stale = b.day !== new Date().toISOString().slice(0, 10) && new Date().getHours() >= B.hour;
+    var gemini = b.ai === 'google';
     var src = (b.sources || []).map(function (x) {
       var u = safeHref(x.url);
       return u ? '<li><a href="' + esc(u) + '" target="_blank" rel="noopener noreferrer">' + esc(x.title) + '</a></li>' : '';
     }).join('');
+    // Gemini's searches are Google's, shown as Google's own search suggestions (its terms), so not listed again below.
+    var searched = !gemini && b.searched && b.searched.length;
     return '<section class="card brief-card">' + head +
       '<div class="brief-chips">' + briefChip(B, b, 'local', 'Local') + briefChip(B, b, 'national', 'UK') + briefChip(B, b, 'global', 'World') + '</div>' +
       '<p class="brief-text">' + esc(b.text) + '</p>' +
+      (gemini && b.suggestions ? '<iframe class="brief-google" src="api/briefing/suggestions?day=' + encodeURIComponent(b.day) + '" title="Google Search suggestions" ' +
+        'sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" loading="lazy"></iframe>' : '') +
       (B.busy ? '<p class="small muted">Writing a new one…</p>' : stale && B.error ? '<p class="small err">Today\'s didn\'t come through: ' + esc(B.error) + '</p>' : '') +
-      (src ? '<details class="brief-src"><summary>Sources (' + (b.sources || []).length + ')' + (b.searched && b.searched.length ? ' and searches' : '') + '</summary><ul>' + src + '</ul>' +
-        (b.searched && b.searched.length ? '<p class="small muted">Searched: ' + b.searched.map(esc).join(' · ') + '</p>' : '') + '</details>' : '') +
-      '<p class="small muted brief-foot">Written by AI from the news and Dads Army\'s live data. Check anything important with the official source.</p></section>';
+      (src ? '<details class="brief-src"><summary>Sources (' + (b.sources || []).length + ')' + (searched ? ' and searches' : '') + '</summary><ul>' + src + '</ul>' +
+        (searched ? '<p class="small muted">Searched: ' + b.searched.map(esc).join(' · ') + '</p>' : '') + '</details>' : '') +
+      '<p class="small muted brief-foot">Written by ' + (gemini ? 'Gemini, with Google Search,' : 'Claude') + ' from the news and Dads Army\'s live data. Check anything important with the official source.</p></section>';
   }
   // HQ: switch it on, choose how thorough, and where "local" is.
   function briefHqCard() {
@@ -797,22 +802,33 @@
     if (!B) return '';
     var c = B.config;
     var html = '<section class="card" id="briefCard"><div class="card-head"><h2>Daily briefing</h2>' + (c.on && B.available ? pill('good', 'On') : pill('plain', 'Off')) + '</div>' +
-      '<p class="small muted">Every morning at ' + B.hour + 'am, Claude reads your warnings and the wider picture, searches the news, and writes one paragraph on threats and risks to be aware of: ' +
+      '<p class="small muted">Every morning at ' + B.hour + 'am, Claude or Gemini (your choice) reads your warnings and the wider picture, searches the news, and writes one paragraph on threats and risks to be aware of: ' +
       'locally, across the UK and in the world (weather, conflict, cyber, health, power, supply and more), compared with what\'s been usual lately. It\'s shown at the top of the Sitrep.</p>';
     if (!B.available) {
-      return html + '<p class="small">Needs an Anthropic API key: choose <b>Anthropic Claude</b> under Scanning above and paste your key. (The news search runs on Anthropic\'s side, so the other AIs can\'t do this.)</p></section>';
+      return html + '<p class="small">Needs an Anthropic or Google Gemini API key: choose <b>Anthropic Claude</b> or <b>Google Gemini</b> under Scanning above and paste your key. ' +
+        'You can switch Scanning back afterwards: the key stays saved. (The news search runs on Anthropic\'s or Google\'s side, so OpenAI and Home Assistant\'s AI can\'t do this.)</p></section>';
     }
+    var gemini = B.models[c.model].ai === 'google', who = gemini ? 'Google' : 'Anthropic';
+    var opts = Object.keys(B.ais).map(function (ai) {
+      return '<optgroup label="' + esc(B.ais[ai]) + '">' + Object.keys(B.models).filter(function (k) { return B.models[k].ai === ai; }).map(function (k) {
+        var m = B.models[k];
+        return '<option value="' + k + '"' + (k === c.model ? ' selected' : '') + (!m.key && k !== c.model ? ' disabled' : '') + '>' +
+          esc(m.name + ': ' + m.about + (m.key ? '' : ' (add its key under Scanning)')) + '</option>';
+      }).join('') + '</optgroup>';
+    }).join('');
     html += '<label class="opt"><input type="checkbox" data-brief="on"' + (c.on ? ' checked' : '') + '><span><b>Daily briefing</b>' +
-      '<span class="small muted">Uses your Anthropic key and counts towards the monthly AI limit above.</span></span></label>' +
-      '<label class="field"><span>How thorough</span><select data-brief="model">' +
-      Object.keys(B.models).map(function (k) { return '<option value="' + k + '"' + (k === c.model ? ' selected' : '') + '>' + esc(B.models[k].name + ': ' + B.models[k].about) + '</option>'; }).join('') +
-      '</select></label>' +
+      '<span class="small muted">Uses your ' + who + ' key and counts towards the monthly AI limit above.</span></span></label>' +
+      '<label class="field"><span>Written by</span><select data-brief="model">' + opts + '</select>' +
+      (gemini ? '<div class="hint">Gemini searches the news with Google Search, which needs billing switched on for your Gemini key: Google\'s free tier doesn\'t include it. ' +
+        'Each search is counted at Google\'s price (1.4¢), though the first 5,000 a month are free, so it usually costs less than shown. ' +
+        'Google\'s terms say its answer is shown with Google\'s search suggestions, so a Gemini briefing is only shown here in Dads Army: Home Assistant\'s sensor just says there\'s one to read.</div>' : '') +
+      '</label>' +
       '<label class="field"><span>Local news for</span><input type="text" data-brief="area" autocomplete="off" maxlength="60" value="' + esc(c.area) + '" placeholder="' + esc(B.area_auto) + '">' +
-      '<div class="hint">A town or county. Left empty, it\'s ' + esc(B.area_auto) + ' (your Met Office region). This name, the day\'s warnings and wider picture, and how long your stores last are sent to Anthropic.</div></label>';
+      '<div class="hint">A town or county. Left empty, it\'s ' + esc(B.area_auto) + ' (your Met Office region). This name, the day\'s warnings and wider picture, and how long your stores last are sent to ' + who + '.</div></label>';
     if (c.on) {
       var b = B.latest;
       html += '<p class="small muted">' + (B.busy ? 'Writing one now…' : b ? 'Last one: ' + esc(briefWhen(b)) + ', ' + (b.searches || 0) + ' searches, ' + esc(usd(b.cost_usd)) + '.' : 'None yet.') + '</p>' +
-        (B.error ? '<p class="small ha-error">' + esc(B.error) + '</p>' : '') +
+        (!B.ready ? '<p class="small ha-error">' + esc(B.need_key) + '</p>' : B.error ? '<p class="small ha-error">' + esc(B.error) + '</p>' : '') +
         '<div class="btn-row"><button class="btn" data-act="brief-now"' + (B.busy ? ' disabled' : '') + '>Write one now</button></div>';
     }
     return html + '</section>';
@@ -3860,8 +3876,10 @@
   });
 
   function saveScanAi(body) {
-    return api('PUT', 'api/scan/ai', body).then(function (r) { SCAN_AI = r; var el = $('#scanAiCard'); if (el) el.outerHTML = scanHqCard(); toast('Saved'); },
-      function (e) { toast(e.message, { error: true }); });
+    return api('PUT', 'api/scan/ai', body).then(function (r) {
+      SCAN_AI = r; var el = $('#scanAiCard'); if (el) el.outerHTML = scanHqCard(); toast('Saved');
+      api('GET', 'api/briefing').then(function (br) { S.briefing = br; redrawBrief(); }, function () { /* offline */ });   // a new key can write the briefing
+    }, function (e) { toast(e.message, { error: true }); });
   }
   document.addEventListener('change', function (e) {
     var t = e.target, k = t.dataset && t.dataset.scanai;

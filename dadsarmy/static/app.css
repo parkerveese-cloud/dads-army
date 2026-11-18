@@ -1066,6 +1066,8 @@ svg text { stroke: none; fill: currentColor; }   /* the svg rule above is for ic
 .brief-src ul { margin: 6px 0; padding-left: 18px; font-size: .9rem; }
 .brief-src li { margin: 3px 0; overflow-wrap: anywhere; }
 .brief-foot { margin-bottom: 0; }
+/* 1.22.0: Google's search suggestions under a Gemini briefing, in a sandboxed frame, as Google made them */
+.brief-google { display: block; width: 100%; height: 56px; border: 0; margin: 0 0 8px; background: transparent; }
 .opt.is-off > span { opacity: .65; }
 
 /* Expiry timeline (1.16.0): a column a month, stacked out of date / expiring soon / fine */

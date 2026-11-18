@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.22.0
+
+**Gemini can write the daily briefing**
+
+- **Claude or Gemini.** The daily briefing can now be written by Google's Gemini, searching the news with Google Search (Grounding with Google Search), as well as by Claude. It uses the Google Gemini key saved under Scanning: with only that key, Gemini is chosen; with both, the AI chosen under Scanning, until you choose. **Written by** in HQ's Daily briefing card offers Gemini 4 Hydrogen (Standard, about 10p a day) and Gemini 4 Argon (Thorough, about 20p a day) next to Claude Haiku 5.5 and Claude Sonnet 5.5. Options without a key say so.
+- **It needs billing switched on for the Gemini key.** Google's free tier doesn't include Google Search; if that's why it fails, the error says so.
+- **Searches are counted at Google's price,** 1.4¢ each, though Google gives the first 5,000 a month free, so the monthly AI limit errs on the safe side. Gemini's thinking and the search results it reads are counted as Google bills them.
+- **Shown as Google's terms ask.** Under a Gemini briefing are Google's search suggestions, exactly as Google sent them, in a sandboxed frame that can't run anything; tapping one opens Google in a new tab. The sources' links are left as Google gave them. Home Assistant's `sensor.dads_army_briefing` says *Written by Gemini: read it in Dads Army*, without the text, and a Gemini briefing isn't passed on to Claude if you switch.
+- **What leaves your network** says Anthropic or Google, whichever writes it. Gemini isn't given a location for its searches.
+
+**Also**
+
+- **Scanning with Gemini counts its thinking** in what each photo cost, as Google bills it, so the monthly limit is closer to the bill.
+- Saving a key under Scanning updates the Daily briefing card straight away.
+- A reply with its labels in bold (**HEADLINE:**) is read properly.
+- **What leaves your network** no longer says your power supply is the only source that sends home's location: *Only alerts for my area* does too, when ticked.
+
 ## 1.21.0
 
 **Your location stays at home unless you say so**

@@ -163,6 +163,199 @@ class BriefingTest(AppTest):
         self.assertIn(("GET", "/api/briefing"), [(r[0], r[1].pattern.strip("^$")) for r in server.ROUTES])
 
 
+GEMINI_REPLY = REPLY.rsplit("\nSOURCES:", 1)[0].replace("HEADLINE:", "**HEADLINE:**")   # Gemini likes bold
+REDIRECT = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQ" + "x" * 300   # Google's links: long
+CHIPS = ('<style>.container{display:flex}</style><div class="container"><a class="chip" '
+         'href="https://www.google.com/search?q=London+news+today">London news today</a></div>')
+
+
+def gemini_answer(text=GEMINI_REPLY, finish="STOP", queries=("London news today", "UK cyber news"), chips=CHIPS):
+    return {"candidates": [{"content": {"role": "model", "parts": [{"text": "Thinking it over", "thought": True},
+                                                                  {"text": text}]},
+                            "finishReason": finish,
+                            "groundingMetadata": {
+                                "webSearchQueries": list(queries),
+                                "searchEntryPoint": {"renderedContent": chips},
+                                "groundingChunks": [{"web": {"uri": REDIRECT + "1", "title": "bbc.co.uk"}},
+                                                    {"web": {"uri": REDIRECT + "2", "title": "ncsc.gov.uk"}},
+                                                    {"web": {"uri": "javascript:alert(1)", "title": "bad"}}],
+                                "groundingSupports": [{"segment": {"startIndex": 0, "endIndex": 40}, "groundingChunkIndices": [1]},
+                                                      {"segment": {"startIndex": 41, "endIndex": 90}, "groundingChunkIndices": [1, 0, 2]}]}}],
+            "usageMetadata": {"promptTokenCount": 2000, "toolUsePromptTokenCount": 3000, "candidatesTokenCount": 300,
+                              "thoughtsTokenCount": 700, "totalTokenCount": 6000}}
+
+
+class GeminiBriefingTest(AppTest):
+    """1.22.0: Gemini writes it, searching with Grounding with Google Search, on a Google key saved under Scanning."""
+
+    def setUp(self):
+        super().setUp()
+        with server.tx() as db:
+            server.set_setting_raw(db, "scan_ai", {"provider": "google", "keys": {"google": "AIza-test-key-0123456789"}})
+        server.BRIEF.update(busy=False, error="", day="", tries=0, last_try=0.0)
+        self.real_post = server._post_json
+        self.calls = []
+
+    def tearDown(self):
+        server._post_json = self.real_post
+        super().tearDown()
+
+    def fake(self, answers):
+        def post(url, body, headers, timeout=60):
+            self.calls.append({"url": url, "body": body, "headers": headers})
+            a = answers.pop(0)
+            if isinstance(a, Exception):
+                raise a
+            return a
+        server._post_json = post
+
+    def switch_on(self, **cfg):
+        with server.tx() as db:
+            server.set_setting_raw(db, "briefing", dict({"on": True, "area": "Greenwich"}, **cfg))
+
+    def test_a_google_key_is_enough(self):
+        self.assertEqual(server.brief_cfg()["model"], "gemini-4-hydrogen")   # the key there is decides
+        pub = server.brief_public()
+        self.assertTrue(pub["available"] and pub["ready"])
+        self.assertFalse(pub["models"]["claude-haiku-5-5"]["key"])
+        with server.tx() as db:   # today's is written, so switching on doesn't write one in the background
+            server.set_setting_raw(db, "briefings", [{"day": server.dt.date.today().isoformat(), "text": "x", "ai": "google"}])
+        server.api_briefing_put({"on": True}, {})
+        self.assertTrue(server.brief_cfg()["on"])
+        self.assertEqual(server.brief_cfg()["model"], "gemini-4-hydrogen")   # saved
+        with self.assertRaises(server.ApiError) as e:   # Claude, without an Anthropic key
+            server.api_briefing_put({"model": "claude-haiku-5-5"}, {})
+        self.assertIn("Anthropic API key", e.exception.message)
+
+    def test_writing_one(self):
+        self.switch_on()
+        self.fake([gemini_answer()])
+        b = server.make_briefing("test")
+        call = self.calls[0]
+        self.assertIn("/models/gemini-4-hydrogen:generateContent", call["url"])
+        self.assertEqual(call["headers"], {"x-goog-api-key": "AIza-test-key-0123456789"})   # in a header, not the URL
+        self.assertNotIn("key=", call["url"])
+        self.assertEqual(call["body"]["tools"], [{"google_search": {}}])
+        prompt = call["body"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("Greenwich", prompt)
+        self.assertNotIn("SOURCES:", prompt)   # Google says what the sources were
+        self.assertNotIn("toolConfig", call["body"])   # no location goes with it
+        self.assertTrue(b["text"].startswith("Overnight things are quiet"))
+        self.assertNotIn("Thinking it over", b["text"])
+        self.assertEqual(b["headline"], "Wind warning tomorrow; router security update advised")
+        self.assertEqual(b["levels"], {"local": 2, "national": 3, "global": 3})
+        self.assertEqual((b["ai"], b["model"], b["searches"]), ("google", "gemini-4-hydrogen", 2))
+        # The sources it rests on, first used first, with Google's links exactly as they came; never a script link
+        self.assertEqual([(x["title"], x["url"]) for x in b["sources"]], [("ncsc.gov.uk", REDIRECT + "2"), ("bbc.co.uk", REDIRECT + "1")])
+        self.assertEqual(b["searched"], ["London news today", "UK cyber news"])
+        self.assertEqual(b["suggestions"], CHIPS)
+        # Hydrogen: 5000 in (prompt and search results), 1000 out (answer and thinking), and 2 searches at 1.4 cents
+        self.assertAlmostEqual(b["cost_usd"], 5000 * 1.50 / 1e6 + 1000 * 7.50 / 1e6 + 2 * 0.014, places=6)
+        row = server.DB.execute("SELECT ai, model, tokens_in, tokens_out FROM ai_calls").fetchone()
+        self.assertEqual(tuple(row), ("google", "gemini-4-hydrogen", 5000, 1000))
+        self.assertEqual(server.ai_stats()["tasks"]["briefing"], 1)
+        latest = server.brief_public()["latest"]
+        self.assertIs(latest["suggestions"], True)   # the HTML itself comes from its own page
+
+    def test_the_search_suggestions_page(self):
+        self.switch_on()
+        self.fake([gemini_answer()])
+        b = server.make_briefing("test")
+        page = server.api_briefing_suggestions({}, {"day": [b["day"]]})
+        self.assertIsInstance(page, server.Raw)
+        self.assertTrue(page.content_type.startswith("text/html"))
+        self.assertIn(CHIPS, page.data.decode("utf-8"))   # as Google made it
+        self.assertIn('<base target="_blank">', page.data.decode("utf-8"))
+        self.assertEqual(page.headers["Content-Security-Policy"], "sandbox allow-popups allow-popups-to-escape-sandbox")
+        with self.assertRaises(server.ApiError):
+            server.api_briefing_suggestions({}, {"day": ["2001-01-01"]})
+        self.switch_on(on=False)
+        with self.assertRaises(server.ApiError):
+            server.api_briefing_suggestions({}, {"day": [b["day"]]})
+
+    def test_the_suggestions_page_over_http(self):
+        """Through the real server: the page's own sandbox policy, on top of the app's."""
+        import threading
+        import urllib.request
+        self.switch_on()
+        self.fake([gemini_answer()])
+        b = server.make_briefing("test")
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/api/briefing/suggestions?day=%s" % (httpd.server_port, b["day"])) as r:
+                policies = r.headers.get_all("Content-Security-Policy")
+                body = r.read().decode("utf-8")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertIn("sandbox allow-popups allow-popups-to-escape-sandbox", policies)
+        self.assertTrue(any("script-src 'self'" in p for p in policies))   # and no inline script runs
+        self.assertIn(CHIPS, body)
+
+    def test_home_assistant_isnt_given_the_text(self):
+        self.switch_on()
+        self.fake([gemini_answer()])
+        server.make_briefing("test")
+        s = server.ha_entities(server.summary())["sensor.dads_army_briefing"]
+        self.assertEqual(s["state"], "Written by Gemini: read it in Dads Army")
+        self.assertNotIn("briefing", s["attributes"])
+        self.assertNotIn("local", s["attributes"])
+        self.assertEqual(s["attributes"]["written_by"], "Gemini")
+        self.assertEqual(server.brief_public()["history"], [])
+
+    def test_claude_isnt_told_what_gemini_wrote(self):
+        past = [{"day": "2026-01-03", "ai": "google", "levels": {"local": 2, "national": 3, "global": 3}, "text": "Gemini's day"},
+                {"day": "2026-01-02", "levels": {"local": 1, "national": 2, "global": 2}, "text": "Claude's day"}]
+        past.reverse()
+        self.assertNotIn("Gemini's day", server.brief_baseline(past, "2026-01-04", "anthropic"))
+        self.assertIn("Claude's day", server.brief_baseline(past, "2026-01-04", "anthropic"))
+        self.assertIn("Gemini's day", server.brief_baseline(past, "2026-01-04", "google"))
+
+    def test_declined(self):
+        self.switch_on()
+        self.fake([gemini_answer(finish="SAFETY")])
+        with self.assertRaises(server.ApiError) as e:
+            server.make_briefing()
+        self.assertIn("Gemini", e.exception.message)
+        self.assertEqual(server.DB.execute("SELECT ok FROM ai_calls").fetchone()[0], 0)
+
+    def test_the_free_tier(self):
+        """Google's free tier has no Google Search: the error says what to do."""
+        self.switch_on()
+        self.fake([IOError("HTTP 429: Quota exceeded for metric: search grounding, limit: 0")])
+        with self.assertRaises(server.ApiError) as e:
+            server.make_briefing()
+        self.assertIn("allowance is used up", e.exception.message)
+        self.assertIn("billing switched on", e.exception.message)
+        self.assertTrue(server.brief_cfg()["on"])   # not the key's fault: it stays on
+
+    def test_a_refused_key_switches_it_off(self):
+        self.switch_on()
+        self.fake([IOError("HTTP 400: API key not valid. Please pass a valid API key.")])
+        with self.assertRaises(server.ApiError):
+            server.make_briefing()
+        self.assertFalse(server.brief_cfg()["on"])
+        self.assertIn("Gemini didn't accept the API key", server.BRIEF["error"])
+
+    def test_both_keys(self):
+        """With both keys saved, the AI chosen under Scanning writes it, until you choose; a choice stays."""
+        with server.tx() as db:
+            server.set_setting_raw(db, "scan_ai", {"provider": "anthropic", "keys": {"google": "AIza-test-key-0123456789",
+                                                                                      "anthropic": "test-key"}})
+        self.assertEqual(server.brief_cfg()["model"], "claude-haiku-5-5")
+        server.api_briefing_put({"model": "gemini-4-argon"}, {})
+        self.assertEqual(server.brief_cfg()["model"], "gemini-4-argon")
+        self.assertEqual(server.brief_public()["models"]["gemini-4-argon"]["about"], "Gemini 4 Argon: about 20p a day")
+
+    def test_scanning_counts_geminis_thinking(self):
+        """Gemini's thinking is billed as output, for scanning too."""
+        self.fake([gemini_answer(text="2027-03-31")])
+        usage = {}
+        self.assertEqual(server.ai_direct("google", "k", "", "prompt", usage=usage), "2027-03-31")
+        self.assertEqual(usage, {"in": 5000, "out": 1000})
+
+
 class SourcesTest(AppTest):
     """The parsers, with small stand-in feeds."""
 
