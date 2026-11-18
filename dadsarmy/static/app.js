@@ -816,9 +816,12 @@
           esc(m.name + ': ' + m.about + (m.key ? '' : ' (add its key under Scanning)')) + '</option>';
       }).join('') + '</optgroup>';
     }).join('');
-    html += '<label class="opt"><input type="checkbox" data-brief="on"' + (c.on ? ' checked' : '') + '><span><b>Daily briefing</b>' +
+    // 1.22.1: while one's being written, it can't be switched or another AI chosen; back as soon as it's done.
+    var lock = B.busy ? ' disabled' : '';
+    if (B.busy) briefWatch();
+    html += '<label class="opt' + (B.busy ? ' is-off' : '') + '"><input type="checkbox" data-brief="on"' + (c.on ? ' checked' : '') + lock + '><span><b>Daily briefing</b>' +
       '<span class="small muted">Uses your ' + who + ' key and counts towards the monthly AI limit above.</span></span></label>' +
-      '<label class="field"><span>Written by</span><select data-brief="model">' + opts + '</select>' +
+      '<label class="field"><span>Written by</span><select data-brief="model"' + lock + '>' + opts + '</select>' +
       (gemini ? '<div class="hint">Gemini searches the news with Google Search, which needs billing switched on for your Gemini key: Google\'s free tier doesn\'t include it. ' +
         'Each search is counted at Google\'s price (1.4¢), though the first 5,000 a month are free, so it usually costs less than shown. ' +
         'Google\'s terms say its answer is shown with Google\'s search suggestions, so a Gemini briefing is only shown here in Dads Army: Home Assistant\'s sensor just says there\'s one to read.</div>' : '') +
@@ -827,23 +830,39 @@
       '<div class="hint">A town or county. Left empty, it\'s ' + esc(B.area_auto) + ' (your Met Office region). This name, the day\'s warnings and wider picture, and how long your stores last are sent to ' + who + '.</div></label>';
     if (c.on) {
       var b = B.latest;
-      html += '<p class="small muted">' + (B.busy ? 'Writing one now…' : b ? 'Last one: ' + esc(briefWhen(b)) + ', ' + (b.searches || 0) + ' searches, ' + esc(usd(b.cost_usd)) + '.' : 'None yet.') + '</p>' +
+      html += '<p class="small muted">' + (B.busy ? 'Writing one now: it takes a minute or two. The switch and the choice of AI come back when it\'s done.' :
+        b ? 'Last one: ' + esc(briefWhen(b)) + ', ' + (b.searches || 0) + ' searches, ' + esc(usd(b.cost_usd)) + '.' : 'None yet.') + '</p>' +
         (!B.ready ? '<p class="small ha-error">' + esc(B.need_key) + '</p>' : B.error ? '<p class="small ha-error">' + esc(B.error) + '</p>' : '') +
         '<div class="btn-row"><button class="btn" data-act="brief-now"' + (B.busy ? ' disabled' : '') + '>Write one now</button></div>';
     }
     return html + '</section>';
   }
   function redrawBrief() { var el = $('#briefCard'); if (el) el.outerHTML = briefHqCard(); }
+  function reloadBrief() { return api('GET', 'api/briefing').then(function (r) { S.briefing = r; redrawBrief(); return r; }); }
+  // While one's being written, HQ asks every 5 seconds, so the switch comes back (and says so) as soon as it's done.
+  var briefHqTimer = null;
+  function briefWatch() {
+    clearTimeout(briefHqTimer);
+    briefHqTimer = setTimeout(function () {
+      if (!$('#briefCard')) return;   // gone from HQ: the Sitrep's own refresh takes over
+      reloadBrief().then(function (r) {
+        if (!r.busy) toast(r.error || 'Today\'s briefing is ready: it\'s at the top of the Sitrep', r.error ? { error: true } : undefined);
+      }, briefWatch);   // no answer just now: ask again
+    }, 5000);
+  }
   document.addEventListener('change', function (e) {
     var t = e.target, k = t.dataset && t.dataset.brief;
     if (!k) return;
     var body = {};
     body[k] = k === 'on' ? t.checked : t.value;
+    if (k !== 'area') t.disabled = true;   // one change at a time: the card is drawn afresh from the answer
     api('PUT', 'api/briefing', body).then(function (r) {
       S.briefing = r; redrawBrief();
       toast(k === 'on' ? (r.config.on ? (r.busy ? 'On: writing today\'s briefing now' : 'Daily briefing on') : 'Daily briefing off') : 'Saved');
-      if (r.busy) setTimeout(refresh, 8000);
-    }, function (err) { toast(err.message, { error: true }); if (k === 'on') t.checked = !t.checked; });
+    }, function (err) {
+      toast(err.message, { error: true });
+      reloadBrief().catch(function () { t.disabled = false; if (k === 'on') t.checked = !t.checked; });   // back as it is on the Pi
+    });
   });
 
   function renderSitrep(el) {
@@ -3868,11 +3887,13 @@
   }
   function redrawScanCard() { var el = $("#scanAiCard"); if (el) el.outerHTML = scanHqCard(); }
   document.addEventListener('change', function (e) {
-    if (!e.target.dataset || !e.target.dataset.offline) return;
-    api('PUT', 'api/scan/offline', { enabled: e.target.checked }).then(function (r) {
+    var t = e.target;
+    if (!t.dataset || !t.dataset.offline) return;
+    t.disabled = true;   // 1.22.1: one change at a time (switching it off while it downloads still stops the download)
+    api('PUT', 'api/scan/offline', { enabled: t.checked }).then(function (r) {
       OFFLINE_ST = r; redrawScanCard();
       toast(r.enabled ? (r.building ? 'Downloading the UK list: it takes a while' : 'Offline list on') : 'Offline list off');
-    }, function (err) { toast(err.message, { error: true }); });
+    }, function (err) { toast(err.message, { error: true }); t.disabled = false; t.checked = !t.checked; });
   });
 
   function saveScanAi(body) {

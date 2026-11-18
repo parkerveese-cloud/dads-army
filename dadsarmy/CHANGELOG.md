@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.22.1
+
+**Things happening at once**
+
+- **No more "Something went wrong on the Pi" when two things happen at once.** Every part of Dads Army (the pages on each phone, the daily briefing, the warnings, Home Assistant) shared one connection to the database, and two of them reading at the same moment could fail with *bad parameter or other API misuse*. Switching the daily briefing on was the likeliest time: the page and the briefing both read the settings straight away. Each part now has its own connection; changes are still made one at a time.
+- **The daily briefing can't get stuck "being written".** If something went wrong on the Pi just as one started, it stayed "being written" until Dads Army restarted, and no more were written. Now it says what happened and tries again later as usual.
+- **While a briefing is being written, its switch and Written by are greyed out** (Write one now already was), and come back as soon as it's done, when HQ says it's ready. Switching it on says it's writing one straight away, rather than a moment later.
+- **One change at a time.** The daily briefing's and the offline barcode list's switches are greyed out for the moment it takes to save each change, so a quick double tap can't send two. Switching the offline list off while it downloads still stops the download. The other tick boxes (warnings, home sensors, and the rest) are saved with a **Save** button, which already waits for each save.
+
 ## 1.22.0
 
 **Gemini can write the daily briefing**

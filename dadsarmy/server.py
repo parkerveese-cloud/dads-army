@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.22.0"
+VERSION = "1.22.1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -442,6 +442,51 @@ DB = None
 LAST_BACKUP = {"at": None}
 
 
+class Database(object):
+    """The database, with an SQLite connection of its own for each thread (1.22.1).
+
+    One connection shared by every thread isn't safe in Python's sqlite3: two threads asking at the same moment got
+    "bad parameter or other API misuse", which failed the request (switching the daily briefing on while the page
+    asked for its state, say) or killed the briefing as it started, leaving it "being written" until a restart. Each
+    thread now opens its own the first time it needs one, and it closes when the thread ends. Writes are still one at
+    a time (tx() holds LOCK); WAL lets reads carry on meanwhile, and a write outside tx() waits for one inside it."""
+
+    def __init__(self, path):
+        self.path = path
+        self.local = threading.local()
+        self.closed = False
+
+    def conn(self):
+        c = getattr(self.local, "conn", None)
+        if c is None:
+            if self.closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+            c = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=30)
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA foreign_keys = ON")
+            self.local.conn = c
+        return c
+
+    def execute(self, *a):
+        return self.conn().execute(*a)
+
+    def executemany(self, *a):
+        return self.conn().executemany(*a)
+
+    def executescript(self, *a):
+        return self.conn().executescript(*a)
+
+    def backup(self, *a, **kw):
+        return self.conn().backup(*a, **kw)
+
+    def close(self):
+        """For good: this thread's connection now, and no thread opens another (theirs close as they end)."""
+        self.closed = True
+        c, self.local.conn = getattr(self.local, "conn", None), None
+        if c is not None:
+            c.close()
+
+
 def now_iso():
     return dt.datetime.now().replace(microsecond=0).isoformat(sep=" ")
 
@@ -469,10 +514,8 @@ class tx(object):
 def init_db():
     global DB
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    DB = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
-    DB.row_factory = sqlite3.Row
-    DB.execute("PRAGMA foreign_keys = ON")
-    DB.execute("PRAGMA journal_mode = WAL")
+    DB = Database(DB_PATH)
+    DB.execute("PRAGMA journal_mode = WAL")   # kept in the file: every thread's connection reads alongside a write
     DB.executescript(SCHEMA)
     have = set(r[1] for r in DB.execute("PRAGMA table_info(items)"))
     for col, decl in ITEM_UPGRADES:
@@ -2461,12 +2504,28 @@ class _Counted(object):
         return True
 
 
-def build_offline(url=None):
-    """Download the export, keep the UK products, and swap the new list in. Runs on its own thread."""
+def offline_claim():
+    """Mark the list as being built, if it isn't already. True if this caller has it."""
     with OFFLINE_LOCK:
         if OFFLINE["building"]:
             return False
         OFFLINE.update(building=True, read_mb=0, total_mb=0, rows=0, kept=0)
+        return True
+
+
+def offline_start():
+    """Build it in the background. It's "updating" from now, before the thread starts, so the answer the app gets
+    back says so (1.22.1). False if it's already being built."""
+    if not offline_claim():
+        return False
+    threading.Thread(target=build_offline, kwargs={"claimed": True}, name="offline-barcodes", daemon=True).start()
+    return True
+
+
+def build_offline(url=None, claimed=False):
+    """Download the export, keep the UK products, and swap the new list in. Runs on its own thread."""
+    if not claimed and not offline_claim():
+        return False
     tmp = offline_db() + ".new"
     try:
         try:
@@ -2585,7 +2644,7 @@ def api_scan_offline_set(body, query):
         raise ApiError(400, "Say on or off")
     offline_save(enabled=bool(body["enabled"]), tried_at=None if body["enabled"] else offline_cfg()["tried_at"])
     if body["enabled"] and not offline_cfg()["built_at"]:
-        threading.Thread(target=build_offline, name="offline-barcodes", daemon=True).start()   # the first one now
+        offline_start()   # the first one now
     add_log("settings", "", "Offline barcode list %s" % ("on" if body["enabled"] else "off"))
     return offline_status()
 
@@ -2594,8 +2653,7 @@ def api_scan_offline_set(body, query):
 def api_scan_offline_update(body, query):
     if not offline_cfg()["enabled"]:
         raise ApiError(400, "Switch the offline list on first")
-    if not OFFLINE["building"]:
-        threading.Thread(target=build_offline, name="offline-barcodes", daemon=True).start()
+    offline_start()
     return dict(offline_status(), building=True)
 
 
@@ -11720,16 +11778,35 @@ def brief_call_gemini(key, model, prompt, usage):
     return text, sources[:10], queries[:10], results, html
 
 
-def make_briefing(by="schedule"):
-    """Write today's briefing. Returns it, or raises ApiError."""
+BRIEF_BUSY = "A briefing is being written: you can change this when it's done, in a minute or two"
+
+
+def brief_claim():
+    """Mark a briefing as being written, if one isn't already. True if this caller has it."""
     with BRIEF_LOCK:
         if BRIEF["busy"]:
-            raise ApiError(409, "Today's briefing is already being written")
+            return False
         BRIEF["busy"], BRIEF["last_try"] = True, time.time()
-    c, usage = brief_cfg(), {}
-    model = c["model"]
-    ai = BRIEF_MODELS[model]["ai"]
-    try:
+        return True
+
+
+def brief_start(by):
+    """Write one in the background. It's "being written" from now, before the thread starts, so the answer the app
+    gets back says so. False if one's already being written."""
+    if not brief_claim():
+        return False
+    threading.Thread(target=_brief_quiet, args=(by,), name="briefing-now", daemon=True).start()
+    return True
+
+
+def make_briefing(by="schedule", claimed=False):
+    """Write today's briefing. Returns it, or raises ApiError. claimed: brief_claim() was already called for it."""
+    if not claimed and not brief_claim():
+        raise ApiError(409, "Today's briefing is already being written")
+    try:   # everything in here, so whatever happens it's no longer "being written" afterwards
+        c, usage = brief_cfg(), {}
+        model = c["model"]
+        ai = BRIEF_MODELS[model]["ai"]
         key = brief_key(c)
         if not key:
             raise ApiError(400, brief_no_key(c))
@@ -11779,6 +11856,11 @@ def make_briefing(by="schedule"):
         BRIEF["error"] = e.message
         print("Briefing: failed: %s" % BRIEF["error"], flush=True)
         raise
+    except Exception:   # a fault here, not the AI's: say so, rather than fail without a word
+        traceback.print_exc()
+        BRIEF["error"] = "Something went wrong on the Pi while writing it (the app's log says what). It'll try again."
+        print("Briefing: failed: %s" % BRIEF["error"], flush=True)
+        raise ApiError(500, BRIEF["error"])
     finally:
         BRIEF["busy"] = False
 
@@ -11853,29 +11935,33 @@ def api_briefing_suggestions(body, query):
 @route("PUT", "/api/briefing")
 def api_briefing_put(body, query):
     c = brief_cfg()
+    was = dict(c)
     if "model" in body:
         if body["model"] not in BRIEF_MODELS:
             raise ApiError(400, "Unknown model")
         c["model"] = body["model"]
     if "on" in body:
         c["on"] = bool(body["on"])
+    # 1.22.1: not switched, or another AI chosen, while one's being written (the app greys them out meanwhile).
+    if BRIEF["busy"] and (c["on"], c["model"]) != (was["on"], was["model"]):
+        raise ApiError(409, BRIEF_BUSY)
     if c["on"] and ("on" in body or "model" in body) and not brief_key(c):
         raise ApiError(400, brief_no_key(c))
     if "area" in body:
         c["area"] = clean_text(str(body["area"] or ""), 60) if str(body["area"] or "").strip() else ""
     with tx() as db:
         set_setting_raw(db, "briefing", c)
-        if "on" in body:
+        if "on" in body and c["on"] != was["on"]:
             add_log("settings", "", "Daily briefing switched on" if c["on"] else "Daily briefing switched off")
-    if c["on"] and "on" in body and not BRIEF["busy"] and not any(b["day"] == dt.date.today().isoformat() for b in brief_list()):
-        threading.Thread(target=lambda: _brief_quiet("switched on"), name="briefing-now", daemon=True).start()
+    if c["on"] and not was["on"] and not any(b["day"] == dt.date.today().isoformat() for b in brief_list()):
+        brief_start("switched on")   # today's, straight away
     BRIEF_WAKE.set()
     return brief_public()
 
 
 def _brief_quiet(by):
     try:
-        make_briefing(by)
+        make_briefing(by, claimed=True)
     except ApiError:
         pass
 
@@ -11884,12 +11970,10 @@ def _brief_quiet(by):
 def api_briefing_now(body, query):
     if not brief_cfg()["on"]:
         raise ApiError(400, "Switch the daily briefing on first")
-    if BRIEF["busy"]:
-        raise ApiError(409, "A briefing is already being written")
     if not brief_key():
         raise ApiError(400, brief_no_key(brief_cfg()))
-    threading.Thread(target=lambda: _brief_quiet("by hand"), name="briefing-now", daemon=True).start()
-    time.sleep(0.2)
+    if not brief_start("by hand"):
+        raise ApiError(409, "A briefing is already being written")
     return brief_public()
 
 

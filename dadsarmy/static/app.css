@@ -447,6 +447,7 @@ select {
   background-repeat: no-repeat; background-position: right 10px center; background-size: 18px;
   padding-right: 34px;
 }
+select:disabled, input:disabled:not([type="checkbox"]):not([type="radio"]) { opacity: .55; cursor: not-allowed; }   /* 1.22.1: locked for now */
 input[type="date"] { min-width: 0; }
 input[type="date"]::-webkit-date-and-time-value { text-align: left; }
 textarea { resize: vertical; min-height: 70px; }
