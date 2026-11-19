@@ -2067,8 +2067,12 @@
     var srcs = {};
     pts.forEach(function (p) { if (!isRoutine(p) || MAP_ROUTINE) srcs[p.source] = 1; });
     var credit = Object.keys(srcs).map(function (k) { return srcName(k); }).filter(function (n, i, a) { return a.indexOf(n) === i; });
+    // 1.24.1: OpenStreetMap's tile servers block requests that carry no Referer (their tile usage policy), and the
+    // rest of the app sends none. So the map pictures, and only they, send the address of the site: just that, such
+    // as http://192.168.1.192:8123/, never the page or anything after it.
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 18,
+      referrerPolicy: 'strict-origin',
       attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap contributors</a>' +
         (credit.length ? ' · ' + credit.map(esc).join(', ') : '')
     }).addTo(map);

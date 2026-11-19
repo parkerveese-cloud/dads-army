@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.24.1
+
+**The live alerts map works again**
+
+- **Map pictures were showing "Access blocked".** OpenStreetMap's servers now turn away map pictures asked for without saying which site wants them, and Dads Army deliberately said nothing. The map pictures, and only they, now tell OpenStreetMap the address you opened Dads Army at (such as `http://192.168.1.192:8123/`), never the page or anything after it, as OpenStreetMap's tile usage policy asks. Everything else in the app still sends no address at all. If blocked squares are still showing after the update, refresh the page.
+
 ## 1.24.0
 
 **Read to me, and a shorter briefing card**

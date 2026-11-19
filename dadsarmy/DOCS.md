@@ -429,7 +429,7 @@ Off until you tick **Show a map** in the warnings settings (under **Map**). Then
 - Tap a badge for its details. **🏠** goes back to home. **UK** shows the whole country when a warning is well outside the ring (**All** when one is abroad, such as a disaster).
 - The key under the map lists only what's on it. The map follows the app's dark theme.
 
-The map pictures are OpenStreetMap's, loaded by your phone or browser straight from `tile.openstreetmap.org` (see What leaves your network). Everything on them comes from the feeds the warnings already read, worked out on the Pi: nothing new is fetched or sent for the map. Map data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright). The map is drawn by [Leaflet](https://leafletjs.com) (BSD 2-Clause licence), which comes with the app.
+The map pictures are OpenStreetMap's, loaded by your phone or browser straight from `tile.openstreetmap.org` (see What leaves your network). OpenStreetMap's servers turn away map pictures asked for without saying which site wants them, so (since 1.24.1) the map pictures, and nothing else in the app, tell OpenStreetMap the address you opened Dads Army at. Everything on them comes from the feeds the warnings already read, worked out on the Pi: nothing new is fetched or sent for the map. Map data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright). The map is drawn by [Leaflet](https://leafletjs.com) (BSD 2-Clause licence), which comes with the app.
 
 ### More of the wider picture (1.15.0)
 
@@ -677,7 +677,7 @@ What goes, and when:
 - **The daily briefing (when switched on):** the area name, the day's warnings and wider picture (without postcodes, streets, gauge names or distances), health news and how long your stores would last, once a day, to Anthropic or Google, whichever you chose to write it. Under a Gemini briefing, your phone or browser opens Google only when you tap one of its search suggestions.
 - **Read to me:** nothing. Your phone or computer reads it out with one of its own voices that works offline; voices that need the internet aren't used.
 - **Credits:** two fixed public addresses on GitHub, only when you tap **Check GitHub for new names**.
-- **The live alerts map (when switched on):** your phone or browser loads the map pictures from OpenStreetMap's tile server, `tile.openstreetmap.org`. OpenStreetMap sees your IP address and which map squares you look at, so roughly the area round home, as the map opens there, and nothing else: no cookies, no referrer, nothing from Dads Army. The Pi itself fetches nothing for the map. Switched off (as it starts), the app doesn't load the map at all, and the page's security policy blocks pictures from anywhere but Dads Army itself.
+- **The live alerts map (when switched on):** your phone or browser loads the map pictures from OpenStreetMap's tile server, `tile.openstreetmap.org`. OpenStreetMap sees your IP address, which map squares you look at (so roughly the area round home, as the map opens there), and the address you opened Dads Army at, without the page or anything after it: for example `http://192.168.1.192:8123/`, or your Home Assistant Cloud or own web address if you opened it through that. OpenStreetMap requires that address and blocks the map pictures without it. Nothing else goes: no cookies, nothing from Dads Army. The Pi itself fetches nothing for the map. Switched off (as it starts), the app doesn't load the map at all, and the page's security policy blocks pictures from anywhere but Dads Army itself.
 
 ## Security
 

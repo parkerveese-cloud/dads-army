@@ -231,6 +231,17 @@ class WebTest(AppTest):
         self.assertEqual(js.count("tile.openstreetmap.org"), 1)
         self.assertIn("OpenStreetMap contributors", js)
 
+    def test_map_pictures_say_which_site_asked(self):
+        # 1.24.1: OpenStreetMap blocks map pictures asked for with no Referer. The page sends none, so the tile layer
+        # overrides that with a policy that sends only the site's address (no path), from OpenStreetMap's accepted list.
+        with open(os.path.join(APP_DIR, "static", "app.js"), encoding="utf-8") as f:
+            js = f.read()
+        layer = js[js.index("L.tileLayer('https://tile.openstreetmap.org"):]
+        layer = layer[:layer.index("}).addTo(map)")]
+        self.assertIn("referrerPolicy: 'strict-origin'", layer)
+        status, _, headers = self.web.call("GET", "/", ctype=None)
+        self.assertEqual(headers.get("Referrer-Policy"), "no-referrer")   # everything else still sends nothing
+
     def test_the_state_carries_it(self):
         p_items, p = power()
         seed(p_items, {"power": p})
