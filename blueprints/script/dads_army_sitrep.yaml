@@ -1,0 +1,65 @@
+blueprint:
+  name: "Dads Army: read the sitrep"
+  description: >-
+    Says the Dads Army sitrep out loud on a speaker or display, such as a
+    Google Nest Hub: the same words as **Read to me** in the app. It covers
+    the household alert level, what it means and why, things to watch, the
+    daily briefing, what's affecting you, how long the stores would last,
+    anything expired or below target, checks that are due, and how ready you
+    are.
+
+
+    Run it from a dashboard button, from an automation, or by voice: share
+    the script with Google Assistant or Alexa, then say "Hey Google, activate
+    Sitrep" (or set up your own phrase in the Google Home app).
+
+
+    A daily briefing written by Gemini isn't read out (Google's terms only let
+    it be shown with Google's search suggestions, as Dads Army does): the
+    sitrep says it's ready to read in Dads Army instead.
+
+
+    Needs Dads Army 1.25.0 or later, and a text-to-speech voice in Home
+    Assistant. **Piper** (from the add-on store) makes the voice on your own
+    Home Assistant, so the words never leave the house. Online voices, such as
+    Google Translate or Home Assistant Cloud, send the words to be spoken.
+  domain: script
+  author: Parker Veese Development
+  source_url: https://github.com/parkerveese-cloud/dads-army/blob/main/blueprints/script/dads_army_sitrep.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    speakers:
+      name: Speakers and displays
+      description: Where to say it. Choose one or more.
+      selector:
+        entity:
+          filter:
+            - domain: media_player
+          multiple: true
+    voice:
+      name: Voice
+      description: >-
+        The text-to-speech voice to say it with. Piper keeps the words at
+        home; online voices send them to be spoken.
+      selector:
+        entity:
+          filter:
+            - domain: tts
+
+mode: single
+
+sequence:
+  - action: tts.speak
+    target:
+      entity_id: !input voice
+    data:
+      media_player_entity_id: !input speakers
+      cache: false
+      message: >-
+        {%- set s = 'sensor.dads_army_sitrep' -%}
+        {%- if states(s) in ['unavailable', 'unknown'] or not state_attr(s, 'speech') -%}
+          Dads Army isn't running at the moment, so there's no sitrep to read.
+        {%- else -%}
+          {{ state_attr(s, 'speech') }}
+        {%- endif -%}

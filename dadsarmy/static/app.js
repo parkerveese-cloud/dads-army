@@ -995,64 +995,9 @@
     });
     return out;
   }
-  function endStop(s) { s = String(s || '').trim(); return !s || /[.!?]$/.test(s) ? s : s + '.'; }
-  function levelWord(name) { name = String(name || ''); return name.charAt(0) + name.slice(1).toLowerCase(); }   // MODERATE: Moderate
-
-  // What Read to me says: the alert level, the briefing in full, then what's affecting you, the stores and the plan.
-  function sitrepWords() {
-    var out = [], sit = S.situation, B = S.briefing, w = W();
-    function longDate(d) { return d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }); }   // said in full
-    out.push('Here\'s your sitrep for ' + longDate(new Date()) + '.');
-    if (sit) {
-      out.push('The household alert level is ' + levelWord(sit.name) + ', ' + sit.level + ' of 5. ' + sit.meaning);
-      var why = sit.reasons.map(function (r) { return r.title; });
-      if (why.length) out.push('Why: ' + nameList(why, 4) + '.');
-      if (sit.escalated) out.push('It\'s raised to Severe because ' + (sit.escalated_why || 'the stores wouldn\'t last 3 days') + '.');
-    }
-    var watch = w.on ? (w.trends || []) : [];
-    if (watch.length) out.push('Things to watch: ' + nameList(watch.map(function (x) { return x.title; }), 3) + '.');
-    var b = briefShown() ? B.latest : null;
-    if (b) {
-      out.push('The daily briefing' + (b.day === new Date().toISOString().slice(0, 10) ? '' : ', from ' + longDate(parseYmd(b.day))) + '.');
-      var lv = b.levels || {}, vs = b.vs_usual || {};
-      var rated = [['local', 'Local'], ['national', 'UK'], ['global', 'World']].filter(function (k) { return lv[k[0]]; }).map(function (k) {
-        return k[1] + ': ' + (B.levels[lv[k[0]]] || lv[k[0]]) + (vs[k[0]] === 'higher' ? ', above usual' : vs[k[0]] === 'lower' ? ', below usual' : '');
-      });
-      if (rated.length) out.push(rated.join('. ') + '.');
-      out.push(b.text);
-      if (b.social) out.push('On social media, and unconfirmed: ' + b.social);
-    }
-    if (w.on) {
-      if (w.location) {
-        var yours = ((w.affecting || {}).yours || []).map(function (x) { return x.title; });
-        out.push(yours.length ? 'Affecting you: ' + nameList(yours, 4) + '.' : 'Nothing is affecting your area right now.');
-      } else {
-        var ws = w.items.filter(function (x) { return !(x.source === 'govalerts' && x.severity < 2); }).map(function (x) { return x.title; });
-        out.push(ws.length ? 'Warnings in force: ' + nameList(ws, 3) + '.' : 'No warnings for ' + regionName(w.region) + '.');
-      }
-    }
-    if (S.items.length) {
-      var r = readiness(), cnt = storeCounts(), said = [];
-      if (r.people > 0) {
-        var d = r.hold >= 1000 ? 'over 999' : fmtDays(r.hold);
-        out.push('Your stores would last ' + d + (d === '1' ? ' day' : ' days') + ', against a target of ' + S.settings.target_days + ' days.' +
-          (r.limit ? ' ' + (r.limit === 'food' ? 'Food' : 'Water') + ' runs out first.' : ''));
-      }
-      [[cnt.bad, 'has expired', 'have expired'], [cnt.warn, 'is expiring soon', 'are expiring soon'], [cnt.low, 'is below target', 'are below target']].forEach(function (x) {
-        if (x[0]) said.push(x[0] + (said.length ? ' ' : x[0] === 1 ? ' item ' : ' items ') + (x[0] === 1 ? x[1] : x[2]));
-      });
-      if (said.length) out.push(nameList(said, 3) + '.');
-    }
-    var due = checksDue();
-    if (due) out.push(due + (due === 1 ? ' routine check is due.' : ' routine checks are due.'));
-    var rs = RS();
-    if (rs.areas.length) {
-      var next = rs.next.length ? resById(rs.next[0]) : null;
-      out.push('You\'re ' + rs.pct + '% ready across ' + rs.areas.length + ' areas.' + (next ? ' Next step: ' + endStop(next.title) : ''));
-    }
-    out.push('That\'s the sitrep.');
-    return out;
-  }
+  // What Read to me says comes from the Pi (sitrep_words in server.py, 1.25.0), so it's the same as what Home
+  // Assistant's speakers say: the alert level, the briefing in full, what's affecting you, the stores and the plan.
+  function sitrepWords() { return S.sitrep || []; }
 
   // Reads the words out, a sentence at a time, with this device's offline voice. Pressed again, it stops.
   function readAloud(words, tries) {

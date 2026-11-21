@@ -66,6 +66,7 @@ You can then open it in two ways:
   - when something runs out
   - each morning, anything that went out of date overnight and any check that's due
   - a weekly round-up of what to use first
+- **Spoken sitrep.** Two more blueprints, in [blueprints/script](blueprints/script) and [blueprints/automation](blueprints/automation), have a speaker or display such as a Google Nest Hub say the sitrep out loud: when you ask (by voice too), every morning, and when the alert level goes up. With Piper as the voice, the words never leave the house.
 - **To-do list.** The supply run can stay in step with a Home Assistant to-do list. You can tick things off there and add to it by voice. Turn it on in **HQ → Home Assistant**.
 
 The details are in [DOCS.md](dadsarmy/DOCS.md). Outside Home Assistant, `GET /api/summary` returns the same figures as JSON.

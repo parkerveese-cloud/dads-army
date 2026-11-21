@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.24.1"
+VERSION = "1.25.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -1408,8 +1408,10 @@ def api_state(body, query):
         if home is not None:
             home["config"] = home_cfg()
         items = all_items()
+        warnings, briefing = warn_public(), brief_public()
         return {
             "situation": sm["situation"],
+            "sitrep": sitrep_words(sm, warnings, briefing),   # 1.25.0: what Read to me says
             "pets": sm["pets"],
             "usage": dict((str(k), v) for k, v in usage_rates(items).items()),
             "resilience": sm["resilience"],
@@ -1421,11 +1423,11 @@ def api_state(body, query):
             "checks": all_checks(),
             "check_suggestions": [c[0] for c in CHECK_SUGGESTIONS],
             "plan": get_plan(),
-            "warnings": warn_public(),
+            "warnings": warnings,
             "settings": get_settings(),
             "stock_review": setting_raw("stock_review", None),
             "ai_ready": ai_ready(),
-            "briefing": brief_public(),
+            "briefing": briefing,
             "log": [dict(r) for r in DB.execute("SELECT * FROM log ORDER BY id DESC LIMIT 60")],
             "server": {"version": VERSION, "time": now_iso(), "last_backup": LAST_BACKUP["at"],
                        "backup_dir": BACKUP_DIR, "ha": ha_status()},
@@ -4517,6 +4519,145 @@ def _ha_list(rows):
     return {"items": rows[:LIST_LIMIT], "total": len(rows), "more": max(0, len(rows) - LIST_LIMIT)}
 
 
+# -- The spoken sitrep (1.25.0) ---------------------------------------------------
+# What Read to me says, worked out here so the app and Home Assistant say the same thing. The app reads it out with
+# the phone's or computer's own voice; Home Assistant gets it in sensor.dads_army_sitrep, for a speaker or display to
+# say. Home Assistant's copy leaves out what a Gemini briefing says (Google's terms only let it be shown with Google's
+# search suggestions, as on the Sitrep) and says there's one to read in Dads Army instead.
+SAY_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+SAY_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+              "November", "December")
+SAY_SYMBOLS = re.compile("https?://\\S+|[\U0001F000-\U0001FBFF]|[←-⇿⌀-⏿─-➿⬀-⯿"
+                         "️‍]")
+
+
+def say_date(d):
+    """2026-11-21 -> 'Saturday 21 November', said in full."""
+    return "%s %d %s" % (SAY_DAYS[d.weekday()], d.day, SAY_MONTHS[d.month - 1])
+
+
+def say_num(x):
+    return ("%.2f" % x).rstrip("0").rstrip(".") if isinstance(x, (int, float)) else str(x)
+
+
+def say_days(d):
+    """Days as the Sitrep shows them: whole days from 10, one decimal below (already rounded down by _days)."""
+    if d >= 1000:
+        return "over 999"
+    return str(int(math.floor(d))) if d >= 10 else ("%.1f" % d).rstrip("0").rstrip(".")
+
+
+def say_list(names, limit):
+    """'a, b and c', or 'a, b, c and 2 more' past the limit."""
+    names = list(names)
+    if len(names) > limit:
+        return ", ".join(names[:limit]) + " and %d more" % (len(names) - limit)
+    return and_join(names)
+
+
+def end_stop(s):
+    s = (s or "").strip()
+    return s if not s or s[-1] in ".!?" else s + "."
+
+
+def sayable(t):
+    """Words as they're shown, made easy to say: no links, emoji or arrows, "km" as kilometres, "·" as a pause."""
+    t = SAY_SYMBOLS.sub("", str(t or ""))
+    t = re.sub(r"\s*·\s*", ", ", t)
+    t = re.sub("−(?=\\d)", "minus ", t)
+    t = re.sub(r"°C\b", " degrees", t)
+    t = t.replace("µg/m³", "micrograms per cubic metre").replace("μg/m³", "micrograms per cubic metre")
+    t = re.sub(r"(\d+(?:\.\d+)?)\s?km\b", lambda m: m.group(1) + (" kilometre" if m.group(1) == "1" else " kilometres"), t)
+    t = re.sub(r"\s&\s", " and ", t)
+    t = re.sub(r"\s+([,.;:!?])", r"\1", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def sitrep_words(s, w, b, ha=False, today=None):
+    """What Read to me says, in order: the alert level, things to watch, the daily briefing, what's affecting you, the
+    stores, checks due and resilience. s is a summary(), w warn_public() and b brief_public(). ha: for Home Assistant,
+    so a Gemini briefing is only said to be there."""
+    today = today or dt.date.today()
+    out = ["Here's your sitrep for %s." % say_date(today)]
+    sit = s.get("situation")
+    if sit:
+        name = sit["name"] or ""
+        out.append("The household alert level is %s, %d of 5. %s" % (name[:1] + name[1:].lower(), sit["level"],
+                                                                     sit["meaning"]))
+        why = [r["title"] for r in sit.get("reasons") or []]
+        if why:
+            out.append("Why: %s." % say_list(why, 4))
+        if sit.get("escalated"):
+            out.append("It's raised to Severe because %s." % (sit.get("escalated_why") or "the stores wouldn't last 3 days"))
+    if w.get("on") and w.get("trends"):
+        out.append("Things to watch: %s." % say_list([x["title"] for x in w["trends"]], 3))
+    lb = b.get("latest") if (b.get("config") or {}).get("on") and b.get("available") else None
+    if lb:
+        try:
+            when = "" if lb.get("day") == today.isoformat() else ", from " + say_date(dt.date.fromisoformat(lb["day"][:10]))
+        except (TypeError, ValueError):
+            when = ""
+        if ha and lb.get("ai") == "google":
+            out.append("The daily briefing%s is ready to read in Dads Army." % (when + "," if when else ""))
+        else:
+            out.append("The daily briefing%s." % when)
+            lv, vs = lb.get("levels") or {}, lb.get("vs_usual") or {}
+            rated = []
+            for k, label in (("local", "Local"), ("national", "UK"), ("global", "World")):
+                if lv.get(k):
+                    try:
+                        word = BRIEF_LEVELS.get(int(lv[k]), lv[k])
+                    except (TypeError, ValueError):
+                        word = lv[k]
+                    rated.append("%s: %s%s" % (label, word, ", above usual" if vs.get(k) == "higher"
+                                                else ", below usual" if vs.get(k) == "lower" else ""))
+            if rated:
+                out.append(". ".join(rated) + ".")
+            out.append(lb.get("text") or "")
+            if lb.get("social"):
+                out.append("On social media, and unconfirmed: " + lb["social"])
+    if w.get("on"):
+        if w.get("location"):
+            yours = [x["title"] for x in (w.get("affecting") or {}).get("yours") or []]
+            out.append("Affecting you: %s." % say_list(yours, 4) if yours else "Nothing is affecting your area right now.")
+        else:
+            ws = [x["title"] for x in w.get("items") or []
+                  if not (x.get("source") == "govalerts" and (x.get("severity") or 0) < 2)]
+            region = w.get("region") or "UK"
+            region = "the whole UK" if region == "UK" else next((n for c, n in w.get("regions") or [] if c == region), region)
+            out.append("Warnings in force: %s." % say_list(ws, 3) if ws else "No warnings for %s." % region)
+    if s.get("items_total"):
+        if s.get("people", 0) > 0:
+            d = say_days(s["hold_out_days"])
+            first = {"food": " Food runs out first.", "water": " Water runs out first."}.get(s.get("runs_out_first"), "")
+            out.append("Your stores would last %s %s, against a target of %s days.%s" % (
+                d, "day" if d == "1" else "days", say_num(s["target_days"]), first))
+        said = []
+        for n, one, many in ((len(s["expired"]), "has expired", "have expired"),
+                             (len(s["expiring_soon"]), "is expiring soon", "are expiring soon"),
+                             (len(s["low_stock"]) + len(s["out_of_stock"]), "is below target", "are below target")):
+            if n:
+                said.append("%d%s%s" % (n, " " if said else " item " if n == 1 else " items ", one if n == 1 else many))
+        if said:
+            out.append(say_list(said, 3) + ".")
+    due = len(s.get("checks_due") or [])
+    if due:
+        out.append("%d routine %s." % (due, "check is due" if due == 1 else "checks are due"))
+    rs = s.get("resilience") or {}
+    if rs.get("areas"):
+        first = (rs.get("next") or [None])[0]
+        step = next((m for m in rs.get("items") or [] if m["id"] == first), None)
+        out.append("You're %s%% ready across %d areas.%s" % (say_num(rs["pct"]), len(rs["areas"]),
+                                                              " Next step: " + end_stop(step["title"]) if step else ""))
+    out.append("That's the sitrep.")
+    return [x for x in out if x]
+
+
+def sitrep_speech(s, w, b, ha=False):
+    """The whole sitrep as one stretch of text, ready for a speaker to say."""
+    return " ".join(sayable(x) for x in sitrep_words(s, w, b, ha=ha))
+
+
 def ha_entities(s):
     """Turn a summary() into Home Assistant entity states."""
     ents = {}
@@ -4563,6 +4704,11 @@ def ha_entities(s):
                 "global": (b.get("levels") or {}).get("global"), "social_media": b.get("social") or "",
                 "sources": [x.get("url") for x in b.get("sources") or []]},
             measurement=False)
+    # 1.25.0: the sitrep, as Read to me says it, for a speaker or display to say (the Dads Army: read the sitrep
+    # blueprint). Its state is the day it's for, so it's never yesterday's.
+    put("sensor.dads_army_sitrep", s["date"], "Dads Army sitrep", "mdi:account-voice",
+        attrs={"speech": sitrep_speech(s, warn_public(), brief_public(), ha=True)}, measurement=False,
+        device_class="date")
     put("sensor.dads_army_food_days", s["food_days"], "Dads Army food", "mdi:food-drumstick", "days",
         {"goes_off_first_days": s["food_wasted_days"]})
     put("sensor.dads_army_water_days", s["water_days"], "Dads Army water", "mdi:water", "days")

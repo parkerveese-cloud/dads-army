@@ -29,6 +29,7 @@ While Dads Army is running, it keeps these sensors up to date in Home Assistant.
 | `sensor.dads_army_stores_value` | What the stores are worth, in £, from the prices you've set | `supply_run_cost`, `priced_items`, `items_total` |
 | `sensor.dads_army_warnings` | Official warnings in force for where you live (see **Warnings** below). 0 while warnings are switched off. | `items` (each has `title`, `level`, `severity` 1–3, `source`, `area`, `when`, `url` and `text`), `highest` (yellow, amber or red), `max_severity`, `enabled`, `checked_at`, `health_news` |
 | `sensor.dads_army_alert_level` | The household alert level: LOW, MODERATE, SUBSTANTIAL, SEVERE or CRITICAL (see below) | `level` (1–5), `meaning`, `reasons`, `guidance` (each with `label`, `source` and `text`), `scale`, `escalated`, `escalated_why`, `notes` |
+| `sensor.dads_army_sitrep` | The day the sitrep is for (1.25.0) | `speech`: the sitrep as **Read to me** says it, ready for a speaker to say (see [Hear the sitrep on a speaker or display](#hear-the-sitrep-on-a-speaker-or-display-1250)). A Gemini briefing isn't in it. |
 | `sensor.dads_army_resilience` | How resilient the household is, in %: the average of ten areas, from water and power to communications and safety (see **Resilience** below) | `areas` (each with `name`, `pct`, `dot`, `done`, `total`, `essentials_missing` and `next`), `next_steps`, `measures` (every recommendation, by area), `done`, `total` |
 | `sensor.dads_army_live` | The wider picture: how many of the live feeds have something worth watching (see **The wider picture** below) | `rows` (each with `name`, `emoji`, `text`, `state` good, warn or bad, and `dot`), `enabled`, `checked_at` |
 | `sensor.dads_army_trends` | How many counts in the wider picture are well up on the last two weeks (see **Trends in the wider picture** below). 0 while warnings are off. | `trends` (each with `title`, `text`, `source`, `name`, `value` and `usual`), `enabled` |
@@ -223,6 +224,38 @@ To set one up:
 2. On the **Blueprints** tab, click the blueprint, choose your phone (and change the times if you like), then **Save**.
 
 Tapping a notification opens Dads Army. On Android the notifications have their own **Dads Army** channel, so you can set their sound in the phone's settings. For another phone, make a second automation from the same blueprint.
+
+## Hear the sitrep on a speaker or display (1.25.0)
+
+Home Assistant can say the sitrep out loud on a speaker or display, such as a Google Nest Hub or Nest Mini, in the same words as **Read to me**. Dads Army keeps them up to date in `sensor.dads_army_sitrep` (its `speech` attribute), and two blueprints say them.
+
+| Blueprint | What it does |
+|---|---|
+| **Dads Army: read the sitrep** (a script) | Says the whole sitrep when you run it: from a dashboard button, from an automation, or by voice (*Hey Google, activate Sitrep*). |
+| **Dads Army: spoken sitrep** (an automation) | Says the whole sitrep every morning (7:30 unless you change it), and the new household alert level, what it means and why, when it goes up (or whenever it changes, if you choose). Alert level changes are only said between 7am and 10pm, unless you change the times. |
+
+**A Gemini briefing isn't read out on a speaker.** Google's terms only let it be shown with Google's search suggestions, as the Sitrep does, so the speaker says there's a briefing to read in Dads Army. A briefing written by Claude is read in full.
+
+To set it up:
+
+1. **Give Home Assistant a voice.** **Piper** makes the voice on your own Home Assistant, so the words never leave the house. Go to **Settings → Apps** (called Add-ons in older versions), open the store, install **Piper** and start it. Then add it under **Settings → Devices & services** when Home Assistant finds it. Google Translate and Home Assistant Cloud voices work too, but they send the words away to be spoken.
+2. **Import the blueprints** with their buttons:
+
+   [![Import Dads Army: read the sitrep](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fparkerveese-cloud%2Fdads-army%2Fblob%2Fmain%2Fblueprints%2Fscript%2Fdads_army_sitrep.yaml)
+   [![Import Dads Army: spoken sitrep](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fparkerveese-cloud%2Fdads-army%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Fdads_army_spoken_sitrep.yaml)
+
+   Or go to **Settings → Automations & scenes → Blueprints → Import blueprint** and paste its address:
+   - `https://github.com/parkerveese-cloud/dads-army/blob/main/blueprints/script/dads_army_sitrep.yaml`
+   - `https://github.com/parkerveese-cloud/dads-army/blob/main/blueprints/automation/dads_army_spoken_sitrep.yaml`
+3. **Make a script and an automation from them.** On the **Blueprints** tab, click **Dads Army: read the sitrep**, choose the speakers or displays and the voice, and save it with a short name such as **Sitrep**. Do the same with **Dads Army: spoken sitrep**, changing the times if you like.
+4. **To ask for it by voice** (optional, and it needs Home Assistant Cloud):
+   - Under **Settings → Home Assistant Cloud**, switch on **Google Assistant**.
+   - In the Google Home app, tap **+**, then **Works with Google Home**, and link **Home Assistant Cloud by Nabu Casa**.
+   - Under **Settings → Voice assistants → Expose**, make sure the **Sitrep** script is exposed to Google Assistant.
+   - It appears in Google Home as a scene, so say *Hey Google, activate Sitrep*. To use your own words, such as *Hey Google, what's the sitrep?*, make a routine in the Google Home app that starts with those words and runs the **Sitrep** scene.
+   - Home Assistant can't tell which speaker heard you, so it always answers on the speakers you chose in the script. Make a second script for another room.
+
+A display that's showing a dashboard (cast from Home Assistant) stops showing it while it speaks. If Dads Army isn't running, the speaker says so instead.
 
 ## Supply run on a to-do list
 
@@ -556,6 +589,7 @@ Every morning at 6am, Claude or Gemini (your choice) reads what Dads Army alread
 - **What it reads:** the household alert level, what it means and why; things to watch; the daily briefing in full, with its ratings and **On social media** (said to be unconfirmed); what's affecting you (or the warnings in force); how long the stores would last, and what's expired, expiring soon or below target; checks that are due; and how ready you are, with the next step. About two minutes.
 - **It works without the internet.** Your phone, tablet or computer does the reading, with one of its own voices that works offline, so nothing is sent anywhere. Some voices need the internet (Chrome's "Google" voices and Edge's "Online (Natural)" ones send the words to Google or Microsoft to be spoken), so Dads Army never uses them.
 - **Voice and speed** are in HQ's **Read to me** card: only voices that work offline are listed, English ones first. Each device has its own voices, so it's set on each one. **Try it** plays a sample.
+- **On a speaker or display too:** Home Assistant can say the same words on a Google Nest Hub or another speaker, every morning, when the alert level goes up, or when you ask. See [Hear the sitrep on a speaker or display](#hear-the-sitrep-on-a-speaker-or-display-1250).
 - If a device has no offline voice, the card says so and how to add one (on Windows: Settings, Time & language, Speech; on Android: Settings, Text-to-speech output). If its browser can't read aloud at all, as some apps' built-in browsers can't, the button isn't shown: open Dads Army in Chrome, Edge, Safari or Firefox.
 
 ## Trends
@@ -676,6 +710,7 @@ What goes, and when:
 - **The stores review:** your item names and amounts, to that AI, when you ask.
 - **The daily briefing (when switched on):** the area name, the day's warnings and wider picture (without postcodes, streets, gauge names or distances), health news and how long your stores would last, once a day, to Anthropic or Google, whichever you chose to write it. Under a Gemini briefing, your phone or browser opens Google only when you tap one of its search suggestions.
 - **Read to me:** nothing. Your phone or computer reads it out with one of its own voices that works offline; voices that need the internet aren't used.
+- **The spoken sitrep (when you set it up):** nothing new leaves from Dads Army: the words go to Home Assistant with the other sensors. Home Assistant sends them to the voice you chose: Piper keeps them at home, while Google Translate and Home Assistant Cloud voices send them away to be spoken. A Gemini briefing is never in them. If you ask a Google speaker for the sitrep, Google hears you ask, as with anything you ask it.
 - **Credits:** two fixed public addresses on GitHub, only when you tap **Check GitHub for new names**.
 - **The live alerts map (when switched on):** your phone or browser loads the map pictures from OpenStreetMap's tile server, `tile.openstreetmap.org`. OpenStreetMap sees your IP address, which map squares you look at (so roughly the area round home, as the map opens there), and the address you opened Dads Army at, without the page or anything after it: for example `http://192.168.1.192:8123/`, or your Home Assistant Cloud or own web address if you opened it through that. OpenStreetMap requires that address and blocks the map pictures without it. Nothing else goes: no cookies, nothing from Dads Army. The Pi itself fetches nothing for the map. Switched off (as it starts), the app doesn't load the map at all, and the page's security policy blocks pictures from anywhere but Dads Army itself.
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.25.0
+
+**Hear the sitrep on a speaker or display**
+
+- **The sitrep, out loud, on a Google Nest Hub or another speaker.** Home Assistant can now say the sitrep in the same words as **Read to me**: the alert level and why, things to watch, the daily briefing, what's affecting you, the stores, checks due and how ready you are.
+- **Two new blueprints.** **Dads Army: read the sitrep** is a script that says it when you run it: from a dashboard button, from an automation, or by voice through Google Assistant (*Hey Google, activate Sitrep*, or your own phrase with a Google Home routine). **Dads Army: spoken sitrep** is an automation that says it every morning, and says the new alert level when it goes up, only between the times you choose.
+- **Keep the words at home with Piper**, the voice that runs on your own Home Assistant. Online voices work too, but send the words away to be spoken. A briefing written by Gemini isn't read on a speaker (Google's terms only let it be shown with Google's search suggestions): the speaker says it's ready to read in Dads Army.
+- **Read to me uses the same words**, now worked out on the Pi, so the app and the speakers never disagree.
+- In Home Assistant, the new `sensor.dads_army_sitrep` has the sitrep in its `speech` attribute, and the day it's for as its state. In `GET /api/state`, `sitrep` has the same words, a part at a time.
+
 ## 1.24.1
 
 **The live alerts map works again**

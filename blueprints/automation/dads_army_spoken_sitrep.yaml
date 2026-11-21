@@ -1,0 +1,134 @@
+blueprint:
+  name: "Dads Army: spoken sitrep"
+  description: >-
+    Says Dads Army news out loud on a speaker or display, such as a Google
+    Nest Hub.
+
+
+    - **Morning sitrep:** every morning at the time you choose, the whole
+    sitrep, the same words as **Read to me** in the app.
+
+    - **Alert level:** when the household alert level goes up (or whenever it
+    changes, if you choose), the new level, what it means and why. Only
+    between the times you choose, so nobody is woken in the night (the phone
+    alerts blueprint can still tell your phone).
+
+
+    A daily briefing written by Gemini isn't read out (Google's terms only let
+    it be shown with Google's search suggestions, as Dads Army does): the
+    sitrep says it's ready to read in Dads Army instead.
+
+
+    Needs Dads Army 1.25.0 or later, and a text-to-speech voice in Home
+    Assistant. **Piper** (from the add-on store) makes the voice on your own
+    Home Assistant, so the words never leave the house. Online voices, such as
+    Google Translate or Home Assistant Cloud, send the words to be spoken.
+  domain: automation
+  author: Parker Veese Development
+  source_url: https://github.com/parkerveese-cloud/dads-army/blob/main/blueprints/automation/dads_army_spoken_sitrep.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    speakers:
+      name: Speakers and displays
+      description: Where to say it. Choose one or more.
+      selector:
+        entity:
+          filter:
+            - domain: media_player
+          multiple: true
+    voice:
+      name: Voice
+      description: >-
+        The text-to-speech voice to say it with. Piper keeps the words at
+        home; online voices send them to be spoken.
+      selector:
+        entity:
+          filter:
+            - domain: tts
+    morning:
+      name: Morning sitrep
+      description: Say the whole sitrep every morning.
+      default: true
+      selector:
+        boolean: {}
+    morning_time:
+      name: Time for the morning sitrep
+      default: "07:30:00"
+      selector:
+        time: {}
+    alert_level:
+      name: Household alert level
+      description: Say when Dads Army's household alert level changes.
+      default: up
+      selector:
+        select:
+          options:
+            - label: When it goes up
+              value: up
+            - label: Whenever it changes, up or down
+              value: any
+            - label: Never
+              value: never
+    speak_from:
+      name: Say alert level changes from
+      description: Changes outside these hours aren't said out loud.
+      default: "07:00:00"
+      selector:
+        time: {}
+    speak_until:
+      name: Say alert level changes until
+      default: "22:00:00"
+      selector:
+        time: {}
+
+mode: queued
+max: 3
+
+triggers:
+  - trigger: time
+    at: !input morning_time
+    id: morning
+  - trigger: event
+    event_type: dads_army_alert_level
+    id: level
+
+variables:
+  want_morning: !input morning
+  want_level: !input alert_level
+
+conditions:
+  - condition: template
+    value_template: >-
+      {{ (trigger.id == 'morning' and want_morning)
+         or (trigger.id == 'level' and want_level != 'never'
+             and (want_level == 'any' or trigger.event.data.rising)) }}
+  - condition: or
+    conditions:
+      - condition: trigger
+        id: morning
+      - condition: time
+        after: !input speak_from
+        before: !input speak_until
+
+actions:
+  - action: tts.speak
+    target:
+      entity_id: !input voice
+    data:
+      media_player_entity_id: !input speakers
+      cache: false
+      message: >-
+        {%- if trigger.id == 'level' -%}
+          {%- set d = trigger.event.data -%}
+          {%- set why = (d.reasons | default([]))[:3] -%}
+          Dads Army. The household alert level has gone {{ 'up' if d.rising else 'down' }} to {{ d.name | title }}, {{ d.level }} of 5. {{ d.meaning | default('') }}
+          {%- if why | count %} Why: {{ why[:-1] | join(', ') ~ (' and ' if why | count > 1 else '') ~ why[-1] }}.{% endif %}
+        {%- else -%}
+          {%- set s = 'sensor.dads_army_sitrep' -%}
+          {%- if states(s) in ['unavailable', 'unknown'] or not state_attr(s, 'speech') -%}
+            Dads Army isn't running at the moment, so there's no sitrep to read.
+          {%- else -%}
+            {{ state_attr(s, 'speech') }}
+          {%- endif -%}
+        {%- endif -%}
