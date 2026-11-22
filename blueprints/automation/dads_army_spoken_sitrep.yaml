@@ -13,6 +13,10 @@ blueprint:
     between the times you choose, so nobody is woken in the night (the phone
     alerts blueprint can still tell your phone).
 
+    - **New briefing:** when the alert level changes, Dads Army writes the
+    daily briefing again (if it's on), to say what's changed and why. A minute
+    or two later, when it's ready, it's said too (Dads Army 1.26.0 or later).
+
 
     A daily briefing written by Gemini isn't read out (Google's terms only let
     it be shown with Google's search suggestions, as Dads Army does): the
@@ -70,6 +74,14 @@ blueprint:
               value: any
             - label: Never
               value: never
+    briefing:
+      name: Then the new briefing
+      description: >-
+        After an alert level change that's said, say the daily briefing Dads
+        Army writes again for it, when it's ready (a minute or two later).
+      default: true
+      selector:
+        boolean: {}
     speak_from:
       name: Say alert level changes from
       description: Changes outside these hours aren't said out loud.
@@ -92,16 +104,23 @@ triggers:
   - trigger: event
     event_type: dads_army_alert_level
     id: level
+  - trigger: event
+    event_type: dads_army_briefing
+    id: briefing
 
 variables:
   want_morning: !input morning
   want_level: !input alert_level
+  want_briefing: !input briefing
 
 conditions:
   - condition: template
     value_template: >-
       {{ (trigger.id == 'morning' and want_morning)
          or (trigger.id == 'level' and want_level != 'never'
+             and (want_level == 'any' or trigger.event.data.rising))
+         or (trigger.id == 'briefing' and want_briefing
+             and trigger.event.data.change is mapping and want_level != 'never'
              and (want_level == 'any' or trigger.event.data.rising)) }}
   - condition: or
     conditions:
@@ -124,6 +143,9 @@ actions:
           {%- set why = (d.reasons | default([]))[:3] -%}
           Dads Army. The household alert level has gone {{ 'up' if d.rising else 'down' }} to {{ d.name | title }}, {{ d.level }} of 5. {{ d.meaning | default('') }}
           {%- if why | count %} Why: {{ why[:-1] | join(', ') ~ (' and ' if why | count > 1 else '') ~ why[-1] }}.{% endif %}
+          {%- if d.new_briefing and want_briefing %} A new briefing is being written.{% endif %}
+        {%- elif trigger.id == 'briefing' -%}
+          {{ trigger.event.data.speech }}
         {%- else -%}
           {%- set s = 'sensor.dads_army_sitrep' -%}
           {%- if states(s) in ['unavailable', 'unknown'] or not state_attr(s, 'speech') -%}

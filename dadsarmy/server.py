@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.25.0"
+VERSION = "1.26.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -4573,6 +4573,56 @@ def sayable(t):
     return re.sub(r"\s+", " ", t).strip()
 
 
+def brief_words(lb, ha=False, today=None):
+    """A briefing as it's said: when it's from, why it was written again (1.26.0), its ratings and what it says. For
+    Home Assistant (ha), a Gemini briefing is only said to be there."""
+    today = today or dt.date.today()
+    try:
+        when = "" if lb.get("day") == today.isoformat() else ", from " + say_date(dt.date.fromisoformat(lb["day"][:10]))
+    except (TypeError, ValueError):
+        when = ""
+    ch = lb.get("change") or {}
+    if ch.get("to"):
+        when += ", written again after the alert level went %s to %s" % (
+            "up" if ch.get("rising") else "down", ch["to"][:1] + ch["to"][1:].lower())
+    if ha and lb.get("ai") == "google":
+        return ["The daily briefing%s is ready to read in Dads Army." % (when + "," if when else "")]
+    out = ["The daily briefing%s." % when]
+    lv, vs = lb.get("levels") or {}, lb.get("vs_usual") or {}
+    rated = []
+    for k, label in (("local", "Local"), ("national", "UK"), ("global", "World")):
+        if lv.get(k):
+            try:
+                word = BRIEF_LEVELS.get(int(lv[k]), lv[k])
+            except (TypeError, ValueError):
+                word = lv[k]
+            rated.append("%s: %s%s" % (label, word, ", above usual" if vs.get(k) == "higher"
+                                        else ", below usual" if vs.get(k) == "lower" else ""))
+    if rated:
+        out.append(". ".join(rated) + ".")
+    out.append(lb.get("text") or "")
+    if lb.get("social"):
+        out.append("On social media, and unconfirmed: " + lb["social"])
+    return out
+
+
+def brief_event(entry):
+    """1.26.0: tell Home Assistant a new briefing is written (dads_army_briefing), with it as it's said: for the
+    "Dads Army: spoken sitrep" blueprint, which says one written again after the alert level changed. Never what a
+    Gemini briefing says (see brief_words)."""
+    if not HA_TOKEN:
+        return
+    ch = entry.get("change") or None
+    try:
+        ha_call("POST", "/events/dads_army_briefing", {
+            "day": entry.get("day"), "made_at": entry.get("made_at"), "by": entry.get("by"),
+            "written_by": "Gemini" if entry.get("ai") == "google" else "Claude", "change": ch,
+            "rising": ch.get("rising") if ch else None, "headline": "" if entry.get("ai") == "google" else entry.get("headline", ""),
+            "speech": " ".join(sayable(x) for x in ["Dads Army."] + brief_words(entry, ha=True) if x)})
+    except Exception:
+        pass
+
+
 def sitrep_words(s, w, b, ha=False, today=None):
     """What Read to me says, in order: the alert level, things to watch, the daily briefing, what's affecting you, the
     stores, checks due and resilience. s is a summary(), w warn_public() and b brief_public(). ha: for Home Assistant,
@@ -4593,29 +4643,7 @@ def sitrep_words(s, w, b, ha=False, today=None):
         out.append("Things to watch: %s." % say_list([x["title"] for x in w["trends"]], 3))
     lb = b.get("latest") if (b.get("config") or {}).get("on") and b.get("available") else None
     if lb:
-        try:
-            when = "" if lb.get("day") == today.isoformat() else ", from " + say_date(dt.date.fromisoformat(lb["day"][:10]))
-        except (TypeError, ValueError):
-            when = ""
-        if ha and lb.get("ai") == "google":
-            out.append("The daily briefing%s is ready to read in Dads Army." % (when + "," if when else ""))
-        else:
-            out.append("The daily briefing%s." % when)
-            lv, vs = lb.get("levels") or {}, lb.get("vs_usual") or {}
-            rated = []
-            for k, label in (("local", "Local"), ("national", "UK"), ("global", "World")):
-                if lv.get(k):
-                    try:
-                        word = BRIEF_LEVELS.get(int(lv[k]), lv[k])
-                    except (TypeError, ValueError):
-                        word = lv[k]
-                    rated.append("%s: %s%s" % (label, word, ", above usual" if vs.get(k) == "higher"
-                                                else ", below usual" if vs.get(k) == "lower" else ""))
-            if rated:
-                out.append(". ".join(rated) + ".")
-            out.append(lb.get("text") or "")
-            if lb.get("social"):
-                out.append("On social media, and unconfirmed: " + lb["social"])
+        out += brief_words(lb, ha, today)
     if w.get("on"):
         if w.get("location"):
             yours = [x["title"] for x in (w.get("affecting") or {}).get("yours") or []]
@@ -5855,9 +5883,13 @@ def level_change(sit):
             msg += " " + why + "."
         if todo and rising:
             msg += " %s: %s" % (todo["label"], todo["text"])
+        # 1.26.0: the daily briefing is written again, to say what's changed. new_briefing: it's being written now,
+        # and the dads_army_briefing event follows in a minute or two.
+        soon = brief_redo(sit, last)
         ha_call("POST", "/events/dads_army_alert_level", {
             "level": sit["level"], "name": sit["name"], "previous": last, "previous_name": prev, "rising": rising,
-            "message": msg, "reasons": [r["title"] for r in sit["reasons"][:6]], "meaning": sit["meaning"]})
+            "message": msg, "reasons": [r["title"] for r in sit["reasons"][:6]], "meaning": sit["meaning"],
+            "new_briefing": soon})
     with tx() as db:
         set_setting_raw(db, "alert_level_last", sit["level"])
 
@@ -11666,7 +11698,14 @@ SOCIAL_SITES = {"x.com": "X", "twitter.com": "X", "facebook.com": "Facebook", "f
                 "reddit.com": "Reddit", "bsky.app": "Bluesky", "instagram.com": "Instagram", "threads.net": "Threads",
                 "threads.com": "Threads", "tiktok.com": "TikTok", "nextdoor.co.uk": "Nextdoor",
                 "nextdoor.com": "Nextdoor", "mastodon.social": "Mastodon", "t.me": "Telegram"}
-BRIEF = {"busy": False, "error": "", "day": "", "tries": 0, "last_try": 0.0}
+# 1.26.0: when the household alert level changes, the briefing is written again, told what's changed and why, so the
+# Sitrep, Read to me and a speaker in Home Assistant say what's happening now rather than what was true at 6am. At
+# most once an hour (a change in the meantime is in the next one) and BRIEF_REDO_MAX times a day. Overnight, before
+# BRIEF_HOUR, only when the level is SEVERE or CRITICAL: anything less waits for the morning's, which says what changed.
+BRIEF_REDO_GAP = 60 * 60
+BRIEF_REDO_MAX = 6
+BRIEF = {"busy": False, "error": "", "day": "", "tries": 0, "last_try": 0.0,
+         "redo": None, "redo_day": "", "redos": 0, "last_redo": 0.0}
 BRIEF_LOCK = threading.Lock()
 BRIEF_WAKE = threading.Event()
 
@@ -11684,7 +11723,7 @@ def brief_cfg():
     raw = raw if isinstance(raw, dict) else {}
     model = raw.get("model") if raw.get("model") in BRIEF_MODELS else brief_default_model()
     return {"on": bool(raw.get("on")), "model": model, "area": clean_text(str(raw.get("area")), 60) if raw.get("area") else "",
-            "social": raw.get("social") is not False}
+            "social": raw.get("social") is not False, "on_change": raw.get("on_change") is not False}
 
 
 def brief_searches(c):
@@ -11756,7 +11795,7 @@ Write ONE paragraph of 110 to 170 words, in plain British English, calm and fact
 what matters most to this household, then cover local, national and global, saying plainly when things are normal. \
 Compare with the usual baseline above (say if something is new, rising or easing). Where it helps, say one practical \
 thing to do (for example: top up water, charge power banks, check travel before setting off). No scaremongering, no \
-speculation beyond what the sources say, no markdown, no bullet points, no links, no citation numbers.{social_rules}
+speculation beyond what the sources say, no markdown, no bullet points, no links, no citation numbers.{social_rules}{change}
 
 Reply in exactly this form, and nothing else:
 BRIEFING: <the paragraph>
@@ -11777,6 +11816,10 @@ BRIEF_SOCIAL_RULES = ("\n\nSocial media is early and unconfirmed. Keep the parag
                       "Social media alone never raises a level.")
 BRIEF_SOCIAL_LINE = ("\nSOCIAL: <40 to 80 words: what people locally (and, if it matters, across the UK) are posting on "
                      "social media, and whether official sources back it up; or: Nothing notable on social media.>")
+# 1.26.0: written again because the household alert level changed.
+BRIEF_CHANGE = ("\n\nThis briefing is being written again, at {time}, because the household alert level has just gone "
+                "{way} from {prev} to {now} (why is in what Dads Army knows, above). Open with that: what's changed, "
+                "why, and what to do now; then the rest, as usual.{earlier}")
 
 
 # Titles that name places right by home (a river gauge, a street, a postcode, how far away): the briefing is told
@@ -11824,10 +11867,34 @@ def brief_known(sm=None):
     try:
         sm = sm or summary()
         lines.append("- The household's stores: food for %s days, water for %s days." % (sm.get("food_days"), sm.get("water_days")))
+        sit = sm.get("situation")
+        if sit:   # 1.26.0
+            why = [brief_reason(r) for r in sit.get("reasons") or []]
+            lines.append("- The household alert level (Dads Army's own, from the warnings, the home's sensors and the "
+                         "stores: LOW, MODERATE, SUBSTANTIAL, SEVERE, CRITICAL): %s, %d of 5%s%s." % (
+                             sit["name"], sit["level"], (". Because: " + "; ".join(why[:8])) if why else "",
+                             (". Raised to SEVERE because " + sit["escalated_why"]) if sit.get("escalated") else ""))
     except Exception:
         pass
     text = "\n".join(lines) or "- Nothing from the official feeds (warnings are switched off)."
     return text[:7000]
+
+
+# 1.26.0: the reasons for the household alert level, as the briefing's AI is told them. Warnings as brief_safe has them
+# (they're in the list above it too), and the home's alarms by kind: never which room or sensor.
+LEVEL_REASON_SOURCES = {"emergency_alert": "govalerts", "severe_flood": "floods", "flood_warning": "floods",
+                        "flood_alert": "floods", "met_red": "metoffice", "met_amber": "metoffice",
+                        "met_yellow": "metoffice", "disaster": "gdacs", "fire_near": "fires",
+                        "power_cut_near": "power", "river_high": "rivers", "grid_demand": "grid", "poor_air": "air",
+                        "space_storm": "space"}
+
+
+def brief_reason(r):
+    key, title = r.get("key"), r.get("title") or ""
+    if key in ("gas_alarm", "smoke_alarm", "leak"):
+        return "%s going off at home" % ROLE[key][1]
+    src = LEVEL_REASON_SOURCES.get(key)
+    return brief_safe(src, title) if src else title
 
 
 def brief_baseline(past, today, ai="anthropic"):
@@ -11843,13 +11910,26 @@ def brief_baseline(past, today, ai="anthropic"):
     return "\n".join(out)
 
 
-def brief_prompt(ai, today, c, past):
+def brief_changed(ai, today, past, change):
+    """What the AI's told when it's written again because the alert level changed, with today's earlier one (as long
+    as that AI may see it: see brief_baseline)."""
+    if not change:
+        return ""
+    earlier = [b for b in past if b["day"] == today and (b.get("ai") != "google" or ai == "google")]
+    return BRIEF_CHANGE.format(
+        time=str(change.get("at") or "")[11:16] or "now", way="up" if change.get("rising") else "down",
+        prev=change.get("from") or "?", now=change.get("to") or "?",
+        earlier=(" Today's earlier briefing said: " + str(earlier[-1].get("text", ""))[:900]) if earlier else "")
+
+
+def brief_prompt(ai, today, c, past, change=None, sm=None):
     area, social = brief_area(c), c.get("social")
     p = BRIEF_PROMPT.format(
         today=today.strftime("%A %-d %B %Y"), area=area, searches=brief_searches(c),
-        known=brief_known(), baseline=brief_baseline(past, today.isoformat(), ai),
+        known=brief_known(sm), baseline=brief_baseline(past, today.isoformat(), ai),
         social_search=BRIEF_SOCIAL_SEARCH.format(area=area, n=BRIEF_SOCIAL_SEARCHES) if social else "",
         social_rules=BRIEF_SOCIAL_RULES if social else "", social_line=BRIEF_SOCIAL_LINE if social else "",
+        change=brief_changed(ai, today.isoformat(), past, change),
         sources="8 search results the briefing and SOCIAL rely on" if social else "6 search results the briefing relies on")
     if ai == "google":   # Gemini's sources come back with its answer, from Google, so it isn't asked to name them
         p = p.rsplit("\nSOURCES:", 1)[0]
@@ -12000,8 +12080,9 @@ def brief_start(by):
     return True
 
 
-def make_briefing(by="schedule", claimed=False):
-    """Write today's briefing. Returns it, or raises ApiError. claimed: brief_claim() was already called for it."""
+def make_briefing(by="schedule", claimed=False, change=None):
+    """Write today's briefing. Returns it, or raises ApiError. claimed: brief_claim() was already called for it.
+    change: the household alert level's change it's written for (1.26.0), as brief_redo has it."""
     if not claimed and not brief_claim():
         raise ApiError(409, "Today's briefing is already being written")
     try:   # everything in here, so whatever happens it's no longer "being written" afterwards
@@ -12014,7 +12095,11 @@ def make_briefing(by="schedule", claimed=False):
         ai_limit_check(scan_ai_cfg())
         today = dt.date.today()
         past = brief_list()
-        prompt = brief_prompt(ai, today, c, past)
+        try:
+            sm = summary()
+        except Exception:
+            sm = None
+        prompt = brief_prompt(ai, today, c, past, change, sm)
         suggestions = ""
         try:
             if ai == "google":
@@ -12052,12 +12137,19 @@ def make_briefing(by="schedule", claimed=False):
                      sources=sources, searched=queries, searches=usage.get("searches", 0), cost_usd=cost)
         if suggestions:
             entry["suggestions"] = suggestions
+        if sm and sm.get("situation"):   # the alert level it was written at, so a change back isn't written up twice
+            entry["alert_level"] = sm["situation"]["level"]
+        if change:
+            entry["change"] = change
         keep = [b for b in past if b["day"] != entry["day"]] + [entry]
         with tx() as db:
             set_setting_raw(db, "briefings", keep[-BRIEF_KEEP:])
         BRIEF["error"] = ""
         HA_WAKE.set()
-        print("Briefing: written for %s (%d searches, $%.4f)" % (entry["day"], entry["searches"], cost or 0), flush=True)
+        print("Briefing: written for %s (%d searches, $%.4f)%s" % (
+            entry["day"], entry["searches"], cost or 0,
+            " after the alert level went to %s" % change.get("to") if change else ""), flush=True)
+        brief_event(entry)
         return entry
     except ApiError as e:
         BRIEF["error"] = e.message
@@ -12072,27 +12164,88 @@ def make_briefing(by="schedule", claimed=False):
         BRIEF["busy"] = False
 
 
+def brief_morning_done(day):
+    """Is the day's briefing written? One written before BRIEF_HOUR because the alert level changed overnight doesn't
+    count, so the morning's still comes."""
+    early = "%02d" % BRIEF_HOUR
+    return any(b["day"] == day and not (b.get("change") and str(b.get("made_at") or "")[11:13] < early)
+               for b in brief_list())
+
+
 def brief_due(c, now=None):
     now = now or dt.datetime.now()
     if not c["on"] or BRIEF["busy"] or now.hour < BRIEF_HOUR or not brief_key(c):
         return False
     day = now.date().isoformat()
-    if any(b["day"] == day for b in brief_list()):
+    if brief_morning_done(day):
         return False
     if BRIEF["day"] != day:
         BRIEF["day"], BRIEF["tries"] = day, 0
     return BRIEF["tries"] < BRIEF_TRIES and time.time() - BRIEF["last_try"] >= 20 * 60
 
 
+def brief_redo(sit, previous):
+    """The household alert level has just moved from previous (1 to 5): write the briefing again (brief_tick does,
+    when brief_redo_due says). The latest change is the one kept. True if it's being written straight away."""
+    c = brief_cfg()
+    if not c["on"] or not c["on_change"]:
+        return False
+    BRIEF["redo"] = {"from": LEVELS[previous - 1][0], "to": sit["name"], "previous": previous, "level": sit["level"],
+                     "rising": sit["level"] > previous, "at": now_iso()}
+    soon = brief_redo_due(c)   # before the briefing's thread is woken, which may take it straight away
+    BRIEF_WAKE.set()
+    return soon
+
+
+def brief_redo_due(c, now=None):
+    """Is the briefing to be written again now, for the change brief_redo saved? Not while one's being written, or
+    within 20 minutes of the last try, or an hour of the last time it was written again; at most BRIEF_REDO_MAX times
+    a day; and overnight only for SEVERE or CRITICAL."""
+    r, now = BRIEF["redo"], now or dt.datetime.now()
+    if not r or not c["on"] or not c["on_change"] or BRIEF["busy"] or not brief_key(c):
+        return False
+    day = now.date().isoformat()
+    if BRIEF["redo_day"] != day:
+        BRIEF["redo_day"], BRIEF["redos"] = day, 0
+    if BRIEF["redos"] >= BRIEF_REDO_MAX or time.time() - BRIEF["last_redo"] < BRIEF_REDO_GAP \
+            or time.time() - BRIEF["last_try"] < 20 * 60:
+        return False
+    return now.hour >= BRIEF_HOUR or r["level"] >= 4
+
+
+def _brief_try(by, change):
+    try:
+        make_briefing(by, change=change)
+        return True
+    except ApiError:
+        if change and BRIEF["redo"] is None:
+            BRIEF["redo"] = change   # it didn't get written: the next one says what changed
+        return False
+
+
+def brief_tick(now=None):
+    """One look: the morning's briefing if it's due (saying what changed overnight, if the level did), else a
+    briefing written again because the alert level changed, if one's due."""
+    c = brief_cfg()
+    if brief_due(c, now):
+        BRIEF["tries"] += 1
+        change, BRIEF["redo"] = (BRIEF["redo"] if c["on_change"] else None), None
+        return _brief_try("schedule", change)
+    if not brief_redo_due(c, now):
+        return False
+    change, BRIEF["redo"] = BRIEF["redo"], None
+    latest = (brief_list() or [{}])[-1]
+    if latest.get("day") == (now or dt.datetime.now()).date().isoformat() and latest.get("alert_level") == change["level"]:
+        return False   # back where it was when the latest one was written: nothing new to say
+    BRIEF["redos"] += 1
+    BRIEF["last_redo"] = time.time()
+    return _brief_try("level", change)
+
+
 def briefing_loop():
     while True:
         try:
-            if brief_due(brief_cfg()):
-                BRIEF["tries"] += 1
-                try:
-                    make_briefing()
-                except ApiError:
-                    pass
+            brief_tick()
         except Exception:
             traceback.print_exc()
         BRIEF_WAKE.wait(60)
@@ -12111,7 +12264,7 @@ def brief_public():
             "latest": latest if c["on"] else None, "hour": BRIEF_HOUR, "area_auto": brief_area(dict(c, area="")),
             "models": {k: {"name": v["name"], "about": v["about"], "ai": v["ai"], "key": bool(keys.get(v["ai"]))}
                        for k, v in BRIEF_MODELS.items()},
-            "ais": BRIEF_AIS, "levels": BRIEF_LEVELS,
+            "ais": BRIEF_AIS, "levels": BRIEF_LEVELS, "redo_max": BRIEF_REDO_MAX,
             "history": [{k: b.get(k) for k in ("day", "headline", "levels")} for b in past[-30:]
                         if b.get("ai") != "google"] if c["on"] else []}
 
@@ -12158,12 +12311,19 @@ def api_briefing_put(body, query):
         c["area"] = clean_text(str(body["area"] or ""), 60) if str(body["area"] or "").strip() else ""
     if "social" in body:   # for the next one, like the area, so it can be changed while one's being written
         c["social"] = bool(body["social"])
+    if "on_change" in body:   # 1.26.0
+        c["on_change"] = bool(body["on_change"])
+        if not c["on_change"]:
+            BRIEF["redo"] = None
     with tx() as db:
         set_setting_raw(db, "briefing", c)
         if "on" in body and c["on"] != was["on"]:
             add_log("settings", "", "Daily briefing switched on" if c["on"] else "Daily briefing switched off")
         if "social" in body and c["social"] != was["social"]:
             add_log("settings", "", "Daily briefing: social media " + ("included" if c["social"] else "left out"))
+        if "on_change" in body and c["on_change"] != was["on_change"]:
+            add_log("settings", "", "Daily briefing: " + ("written again" if c["on_change"] else "not written again")
+                    + " when the household alert level changes")
     if c["on"] and not was["on"] and not any(b["day"] == dt.date.today().isoformat() for b in brief_list()):
         brief_start("switched on")   # today's, straight away
     BRIEF_WAKE.set()

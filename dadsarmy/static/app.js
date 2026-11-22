@@ -813,7 +813,10 @@
     // suggestions under a Gemini briefing are always shown with it (Google's terms).
     var part = briefSplit(b.text), key = String(b.made_at || b.day);
     var more = !!(part.rest || b.social || src), open = more && BRIEF_OPEN === key, read = readBtn();
+    var ch = b.change && b.change.to ? b.change : null;   // 1.26.0: written again because the alert level changed
     return '<section class="card brief-card' + (open ? ' open' : '') + '">' + head +
+      (ch ? '<p class="small muted brief-why">Written again after the household alert level went ' + (ch.rising ? 'up' : 'down') + ' to ' +
+        esc(ch.to.charAt(0) + ch.to.slice(1).toLowerCase()) + '.</p>' : '') +
       '<div class="brief-chips">' + briefChip(B, b, 'local', 'Local') + briefChip(B, b, 'national', 'UK') + briefChip(B, b, 'global', 'World') + '</div>' +
       '<p class="brief-text">' + esc(part.head) + (part.rest ? '<span class="brief-x"> ' + esc(part.rest) + '</span>' : '') + '</p>' +
       // 1.23.0: what people are posting, apart from the official picture and marked as unconfirmed
@@ -839,7 +842,7 @@
     var html = '<section class="card" id="briefCard"><div class="card-head"><h2>Daily briefing</h2>' + (c.on && B.available ? pill('good', 'On') : pill('plain', 'Off')) + '</div>' +
       '<p class="small muted">Every morning at ' + B.hour + 'am, Claude or Gemini (your choice) reads your warnings and the wider picture, searches the news, and writes one paragraph on threats and risks to be aware of: ' +
       'locally, across the UK and in the world (weather, conflict, cyber, health, power, supply and more), compared with what\'s been usual lately. ' +
-      'It can add what people near you are saying on social media, too. It\'s shown at the top of the Sitrep.</p>';
+      'It can add what people near you are saying on social media, too. It\'s shown at the top of the Sitrep, and written again if the household alert level changes.</p>';
     if (!B.available) {
       return html + '<p class="small">Needs an Anthropic or Google Gemini API key: choose <b>Anthropic Claude</b> or <b>Google Gemini</b> under Scanning above and paste your key. ' +
         'You can switch Scanning back afterwards: the key stays saved. (The news search runs on Anthropic\'s or Google\'s side, so OpenAI and Home Assistant\'s AI can\'t do this.)</p></section>';
@@ -866,8 +869,13 @@
       '<label class="opt"><input type="checkbox" data-brief="social"' + (c.social ? ' checked' : '') + '><span><b>Social media too</b>' +
       '<span class="small muted">Also searches public posts (Reddit, X, Facebook pages and groups, Bluesky, local forums) for what people near you are reporting. ' +
       'It\'s shown on its own, marked unconfirmed, and never raises the ratings by itself. Up to 2 more searches: a few pence a day more.</span></span></label>' +
+      // 1.26.0
+      '<label class="opt"><input type="checkbox" data-brief="on_change"' + (c.on_change ? ' checked' : '') + '><span><b>Again when the alert level changes</b>' +
+      '<span class="small muted">When the household alert level goes up or down, it\'s written again to say what\'s changed and why. At most once an hour and ' + B.redo_max + ' times a day, ' +
+      'and overnight only for Severe or Critical: anything less waits for the morning\'s. Each one costs about the same as the morning\'s.</span></span></label>' +
       '<label class="field"><span>Local news for</span><input type="text" data-brief="area" autocomplete="off" maxlength="60" value="' + esc(c.area) + '" placeholder="' + esc(B.area_auto) + '">' +
-      '<div class="hint">A town or county. Left empty, it\'s ' + esc(B.area_auto) + ' (your Met Office region). This name, the day\'s warnings and wider picture, and how long your stores last are sent to ' + who + '.</div></label>';
+      '<div class="hint">A town or county. Left empty, it\'s ' + esc(B.area_auto) + ' (your Met Office region). This name, the day\'s warnings and wider picture, how long your stores last, ' +
+      'and the household alert level and why (such as how warm the warmest room is, but never which room or sensor) are sent to ' + who + '.</div></label>';
     if (c.on) {
       var b = B.latest;
       html += '<p class="small muted">' + (B.busy ? 'Writing one now: it takes a minute or two. The switch and the choice of AI come back when it\'s done.' :
@@ -899,7 +907,8 @@
     api('PUT', 'api/briefing', body).then(function (r) {
       S.briefing = r; redrawBrief();
       toast(k === 'on' ? (r.config.on ? (r.busy ? 'On: writing today\'s briefing now' : 'Daily briefing on') : 'Daily briefing off') :
-        k === 'social' ? (r.config.social ? 'Social media included from the next briefing' : 'Social media left out from the next briefing') : 'Saved');
+        k === 'social' ? (r.config.social ? 'Social media included from the next briefing' : 'Social media left out from the next briefing') :
+        k === 'on_change' ? (r.config.on_change ? 'It\'ll be written again when the alert level changes' : 'Just the morning\'s from now on') : 'Saved');
     }, function (err) {
       toast(err.message, { error: true });
       reloadBrief().catch(function () { t.disabled = false; if (t.type === 'checkbox') t.checked = !t.checked; });   // back as it is on the Pi

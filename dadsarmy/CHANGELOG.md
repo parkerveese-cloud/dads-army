@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.26.0
+
+**The briefing is written again when the alert level changes**
+
+- **A fresh briefing after a change.** Until now, the daily briefing was written once, at 6am, so after the household alert level changed, the Sitrep, **Read to me** and the speaker still gave the morning's. Now, when the level goes up or down, the briefing is written again. It's told what changed and why, and what the earlier one said, and it opens with what's changed and what to do now. The Sitrep's card says why it was written again.
+- **Kept in check.** At most once an hour (a change in the meantime is in the next one, and nothing's written if the level is back where it was) and 6 times a day. Overnight, only for Severe or Critical: anything less waits for the morning's briefing, which says what changed. Each one costs about the same as the morning's. Switch it off in HQ with **Again when the alert level changes**.
+- **Heard on the speaker too.** The **Dads Army: spoken sitrep** blueprint now says the new briefing a minute or two after the alert level change, when it's ready, and the level change says a new briefing is being written. Re-import the blueprint to get this (Blueprints tab, ⋮ menu, **Re-import blueprint**). A briefing written by Gemini is still only said to be ready to read in Dads Army (Google's terms).
+- **Every briefing knows the household alert level** and why, so it can lead with what matters most at home. The AI is told things like *Warmest room 30°C* or *Smoke or heat alarm going off at home*, never which room or sensor, and still nothing that says where home is.
+- For your own automations: a new `dads_army_briefing` event when a briefing is written, with the words ready to say, and `new_briefing` in the `dads_army_alert_level` event.
+
 ## 1.25.0
 
 **Hear the sitrep on a speaker or display**
