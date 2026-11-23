@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.27.0
+
+**Gemini's briefing shows what it searched for**
+
+- **Gemini was searching all along.** A briefing written by Gemini said it had run no searches, listed no sources, and showed none of Google's search suggestions. It was searching: its briefings had that week's news, which only a search could have found. But Google's older way of asking Gemini (`generateContent`) doesn't report the searches Gemini runs while it's thinking, and Gemini 4 does all its searching then.
+- **Now it asks through Google's Interactions API**, which does report them. Under a Gemini briefing you'll see Google's search suggestions again, a row for each round of searches, as Google's terms ask. Its searches (about 8 a day) are counted in the spending stats and the monthly limit. Dads Army also asks Google not to store the request or its answer.
+- **No list of sources for Gemini.** Gemini 4 doesn't say which pages it used, so there's nothing to list. Claude's briefing still lists its sources.
+- **Costs, with the searches counted:** Gemini 4 Hydrogen is about 15p a day and Gemini 4 Argon about 25p. Google's first 5,000 searches a month are free, so while they last you pay less than half of that.
+
 ## 1.26.0
 
 **The briefing is written again when the alert level changes**

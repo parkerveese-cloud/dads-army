@@ -822,7 +822,9 @@
       // 1.23.0: what people are posting, apart from the official picture and marked as unconfirmed
       (b.social ? '<div class="brief-social brief-x"><div class="brief-social-head">On social media <span class="muted">· unconfirmed</span></div>' +
         '<p>' + esc(b.social) + '</p></div>' : '') +
+      // 1.27.0: one of Google's widgets for each round of searches, one under another (b.suggestions says how many)
       (gemini && b.suggestions ? '<iframe class="brief-google" src="api/briefing/suggestions?day=' + encodeURIComponent(b.day) + '" title="Google Search suggestions" ' +
+        (b.suggestions > 1 ? 'style="height:' + (56 * Math.min(+b.suggestions, 8)) + 'px" ' : '') +
         'sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" loading="lazy"></iframe>' : '') +
       (B.busy ? '<p class="small muted">Writing a new one…</p>' : stale && B.error ? '<p class="small err">Today\'s didn\'t come through: ' + esc(B.error) + '</p>' : '') +
       (src ? '<details class="brief-src brief-x"><summary>Sources (' + (b.sources || []).length + (nsocial ? ', ' + nsocial + ' from social media' : '') + ')' +

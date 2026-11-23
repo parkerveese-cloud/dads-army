@@ -12,9 +12,10 @@ REPLY = ("BRIEFING: Overnight things are quiet near home, with a yellow wind war
 
 
 def gemini(text=REPLY):
-    return {"candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": "STOP",
-                            "groundingMetadata": {"webSearchQueries": ["London news today"]}}],
-            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 10}}
+    return {"status": "completed",
+            "steps": [{"type": "google_search_call", "id": "c1", "arguments": {"queries": ["London news today"]}},
+                      {"type": "model_output", "content": [{"type": "text", "text": text}]}],
+            "usage": {"total_input_tokens": 10, "total_output_tokens": 10}}
 
 
 class DatabaseTest(AppTest):

@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.26.0"
+VERSION = "1.27.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -11682,11 +11682,13 @@ BRIEF_MODELS = {
                          "about": "Claude Haiku 5.5: about 7p a day", "tool": "web_search_20250305"},
     "claude-sonnet-5-5": {"ai": "anthropic", "name": "Thorough", "label": "Claude Sonnet 5.5",
                           "about": "Claude Sonnet 5.5: about 25p a day", "tool": "web_search_20260209"},
-    # Searches counted at $14 per 1,000 (see above): while the free ones last, about 5p and 15p.
+    # Searches counted at $14 per 1,000 (see above). 1.27.0, measured: Hydrogen reads about 1k tokens, writes 7k-12k
+    # with its thinking and runs 8 searches, so $0.17-0.21; Argon's tokens cost 2.7 times as much. While Google's free
+    # searches last, about 6p and 15p.
     "gemini-4-hydrogen": {"ai": "google", "name": "Standard", "label": "Gemini 4 Hydrogen",
-                          "about": "Gemini 4 Hydrogen: about 10p a day"},
+                          "about": "Gemini 4 Hydrogen: about 15p a day"},
     "gemini-4-argon": {"ai": "google", "name": "Thorough", "label": "Gemini 4 Argon",
-                       "about": "Gemini 4 Argon: about 20p a day"},
+                       "about": "Gemini 4 Argon: about 25p a day"},
 }
 BRIEF_LEVELS = {1: "Quiet", 2: "Normal", 3: "Raised", 4: "High", 5: "Severe"}
 BRIEF_SEARCHES = 6                 # searches at most, for the news
@@ -12009,9 +12011,7 @@ def brief_call(key, model, prompt, usage, searches=BRIEF_SEARCHES):
     return "".join(final), sources[:10], queries[:10], results
 
 
-# Why Gemini stopped without an answer worth showing, from the candidate's finishReason.
-GEMINI_DECLINED = ("SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "LANGUAGE")
-SUGGESTIONS_MAX = 60000   # characters of Google's search suggestions kept (a few kB, normally)
+SUGGESTIONS_MAX = 60000   # characters of Google's search suggestions kept (a few kB each, normally)
 # Google's free tier for Gemini doesn't include Grounding with Google Search.
 BRIEF_GOOGLE_PAID = ("(If your key is on Google's free tier: searching the news needs billing switched on for it, in "
                      "Google AI Studio.)")
@@ -12023,40 +12023,85 @@ def gemini_link(u):
     return u if len(u) <= 2048 and re.match(r"^https?://[^\s\"'<>]+$", u) else ""
 
 
+# 1.27.0: the briefing goes to Gemini through Google's Interactions API. Through generateContent, a search Gemini ran
+# while it was thinking came back with no groundingMetadata at all: it searched (and Google billed the searches), but
+# Dads Army was told no sources, no searches, and none of the search suggestions Google's terms say go with the answer.
+GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+GEMINI_API_REVISION = "2026-05-20"
+GEMINI_UNFINISHED = ("failed", "cancelled", "requires_action", "requires_continuation", "in_progress")
+
+
+def gemini_steps(out, kind):
+    return [s for s in out.get("steps") or [] if isinstance(s, dict) and s.get("type") == kind]
+
+
+def gemini_interaction_usage(out):
+    """Tokens in and out of one interaction as Google bills them (search results read count in, thinking out), and
+    how many searches it ran."""
+    u = out.get("usage") if isinstance(out.get("usage"), dict) else {}
+
+    def n(k):
+        v = u.get(k)
+        return int(v) if isinstance(v, (int, float)) else 0
+    ran = sum(g["count"] for g in u.get("grounding_tool_count") or []
+              if isinstance(g, dict) and g.get("type") == "google_search" and isinstance(g.get("count"), int))
+    return {"in": n("total_input_tokens") + n("total_tool_use_tokens"),
+            "out": n("total_output_tokens") + n("total_thought_tokens")}, ran
+
+
 def brief_call_gemini(key, model, prompt, usage):
-    """One generateContent call with Grounding with Google Search: Google runs the searches itself. Only the prompt
-    goes, with no location. Returns (the answer, the sources it rests on, what it searched for, {url: title} of every
-    result, Google's search suggestions: HTML that Google's terms say is shown with the answer)."""
-    out = _post_json(GEMINI_URL % urllib.parse.quote(model), {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"maxOutputTokens": 16384}}, {"x-goog-api-key": key}, timeout=240)
-    cand = (out.get("candidates") or [{}])[0] or {}
-    meta = cand.get("groundingMetadata") or {}
-    queries = [clean_text(q, 120) for q in meta.get("webSearchQueries") or [] if isinstance(q, str) and q.strip()]
-    u = gemini_usage(out)
+    """One interaction with Google Search as its tool: Google runs the searches itself. Only the prompt goes, with no
+    location, and Google is asked not to keep it (store: false). Returns (the answer, the sources it rests on, what it
+    searched for, {url: title} of every result, Google's search suggestions: a list of HTML widgets, one for each
+    round of searches, that Google's terms say are shown with the answer)."""
+    out = _post_json(GEMINI_INTERACTIONS_URL, {
+        "model": model, "input": prompt, "tools": [{"type": "google_search"}],
+        "generation_config": {"max_output_tokens": 16384}, "store": False},
+        {"x-goog-api-key": key, "Api-Revision": GEMINI_API_REVISION}, timeout=240)
+    queries, results, html = [], {}, []
+    for s in gemini_steps(out, "google_search_call"):
+        a = s.get("arguments") if isinstance(s.get("arguments"), dict) else {}
+        for q in a.get("queries") if isinstance(a.get("queries"), list) else [a.get("query")]:
+            q = clean_text(q, 120) if isinstance(q, str) else ""
+            if q and q not in queries:
+                queries.append(q)
+    for s in gemini_steps(out, "google_search_result"):
+        found = s.get("result") if isinstance(s.get("result"), list) else []
+        for x in [s] + found:   # the suggestions come with the step, or with its results
+            if not isinstance(x, dict):
+                continue
+            h = x.get("search_suggestions")
+            if isinstance(h, str) and h.strip() and h not in html:
+                html.append(h)
+            url = gemini_link(x.get("url"))
+            if url and url not in results:
+                results[url] = clean_text(x.get("title") or "", 160) or "Source"
+    u, ran = gemini_interaction_usage(out)
     usage.update({"in": usage.get("in", 0) + u["in"], "out": usage.get("out", 0) + u["out"],
-                  "searches": usage.get("searches", 0) + len(queries)})   # Google bills each search it runs
-    if (out.get("promptFeedback") or {}).get("blockReason") or cand.get("finishReason") in GEMINI_DECLINED:
-        raise IOError("Gemini declined to write the briefing")
-    text = "".join(p.get("text", "") for p in (cand.get("content") or {}).get("parts") or []
-                   if isinstance(p, dict) and not p.get("thought"))
-    chunks = []
-    for ch in meta.get("groundingChunks") or []:
-        web = (ch.get("web") if isinstance(ch, dict) else None) or {}
-        url = gemini_link(web.get("uri"))
-        chunks.append({"url": url, "title": clean_text(web.get("title") or "", 160) or "Source"} if url else None)
-    results = dict((x["url"], x["title"]) for x in chunks if x)
-    # The sources the answer rests on (Google's groundingSupports), first used first; else every one it found.
-    used = []
-    for s in meta.get("groundingSupports") or []:
-        for i in (s.get("groundingChunkIndices") or []) if isinstance(s, dict) else []:
-            if isinstance(i, int) and 0 <= i < len(chunks) and chunks[i] and chunks[i] not in used:
-                used.append(chunks[i])
-    sources = used or [x for x in chunks if x]
-    html = (meta.get("searchEntryPoint") or {}).get("renderedContent") or ""
-    html = html if isinstance(html, str) and len(html) <= SUGGESTIONS_MAX else ""
-    return text, sources[:10], queries[:10], results, html
+                  "searches": usage.get("searches", 0) + max(ran, len(queries))})   # Google bills each search
+    text, cited = [], []
+    for s in gemini_steps(out, "model_output"):
+        for c in s.get("content") or []:
+            if not isinstance(c, dict) or c.get("type") != "text" or not isinstance(c.get("text"), str):
+                continue
+            text.append(c["text"])
+            # The sources the answer rests on (its citations), first cited first, with Google's links as they came
+            for a in c.get("annotations") or []:
+                url = gemini_link(a.get("url")) if isinstance(a, dict) and a.get("type") == "url_citation" else ""
+                if url and url not in [x["url"] for x in cited]:
+                    cited.append({"url": url, "title": clean_text(a.get("title") or "", 160) or results.get(url) or "Source"})
+    text = "\n".join(text).strip()
+    if out.get("status") in GEMINI_UNFINISHED or not text:
+        why = "; ".join(str(e.get("message")) for e in out.get("errors") or [] if isinstance(e, dict) and e.get("message"))
+        raise IOError("no briefing came back" + (": " + why[:100] if why else ""))
+    # Gemini 4 sends no citations or result links (checked 23 Nov 2026): then there are no sources, only what it
+    # searched for, which its search suggestions show.
+    sources = cited or [{"url": k, "title": v} for k, v in results.items()]
+    kept = []   # whole widgets only, as many as fit
+    for h in html:
+        if sum(map(len, kept)) + len(h) <= SUGGESTIONS_MAX:
+            kept.append(h)
+    return text, sources[:10], queries[:10], results, kept
 
 
 BRIEF_BUSY = "A briefing is being written: you can change this when it's done, in a minute or two"
@@ -12100,7 +12145,7 @@ def make_briefing(by="schedule", claimed=False, change=None):
         except Exception:
             sm = None
         prompt = brief_prompt(ai, today, c, past, change, sm)
-        suggestions = ""
+        suggestions = []
         try:
             if ai == "google":
                 reply, sources, queries, results, suggestions = brief_call_gemini(key, model, prompt, usage)
@@ -12256,8 +12301,9 @@ def brief_public():
     c = brief_cfg()
     past = brief_list()
     keys = scan_ai_cfg()["keys"]
-    # Google's search suggestions are fetched by their own frame (/api/briefing/suggestions), not sent every time.
-    latest = dict(past[-1], suggestions=bool(past[-1].get("suggestions"))) if past else None
+    # Google's search suggestions are fetched by their own frame (/api/briefing/suggestions), not sent every time: just
+    # how many widgets there are, so the frame's tall enough for them all.
+    latest = dict(past[-1], suggestions=len(brief_widgets(past[-1]))) if past else None
     ready = bool(keys.get(BRIEF_MODELS[c["model"]]["ai"]))
     return {"config": c, "available": any(keys.get(a) for a in BRIEF_AIS), "ready": ready,
             "need_key": "" if ready else brief_no_key(c), "busy": BRIEF["busy"], "error": BRIEF["error"],
@@ -12276,19 +12322,26 @@ def api_briefing(body, query):
 
 # The page Google's search suggestions are shown in, under a Gemini briefing. Google's HTML goes in as it came (its
 # terms: shown with the answer, unchanged), in a sandboxed frame: no scripts run, nothing loads from elsewhere, and its
-# links open Google in a new tab.
+# links open Google in a new tab. 1.27.0: one widget for each round of searches, one under another.
 SUGGESTIONS_PAGE = ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="color-scheme" '
                     'content="light dark"><base target="_blank"><style>html,body{margin:0;padding:0;background:'
-                    'transparent;overflow:hidden}</style></head><body>%s</body></html>')
+                    'transparent;overflow:hidden}.g{padding:1px 1px 7px}</style></head><body>%s</body></html>')
+
+
+def brief_widgets(b):
+    """A Gemini briefing's search suggestions: a list of Google's widgets (one HTML string, before 1.27.0)."""
+    s = (b or {}).get("suggestions")
+    return [h for h in (s if isinstance(s, list) else [s]) if isinstance(h, str) and h]
 
 
 @route("GET", "/api/briefing/suggestions")
 def api_briefing_suggestions(body, query):
     day = (query.get("day") or [""])[0]
     b = next((x for x in reversed(brief_list()) if not day or x["day"] == day), None)
-    if not b or not b.get("suggestions") or not brief_cfg()["on"]:
+    if not brief_widgets(b) or not brief_cfg()["on"]:
         raise ApiError(404, "No search suggestions for that briefing")
-    return Raw((SUGGESTIONS_PAGE % b["suggestions"]).encode("utf-8"), "text/html; charset=utf-8",
+    page = SUGGESTIONS_PAGE % "".join('<div class="g">%s</div>' % h for h in brief_widgets(b))
+    return Raw(page.encode("utf-8"), "text/html; charset=utf-8",
                headers={"Content-Security-Policy": "sandbox allow-popups allow-popups-to-escape-sandbox"})
 
 

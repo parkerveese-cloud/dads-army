@@ -126,11 +126,9 @@ class SocialMediaTest(AppTest):
         with server.tx() as db:
             server.set_setting_raw(db, "scan_ai", {"provider": "google", "keys": {"google": "AIza-test-key-0123456789"}})
         self.switch_on()
-        a = gemini_answer(text=SOCIAL_REPLY.rsplit("\nSOURCES:", 1)[0])
-        a["candidates"][0]["groundingMetadata"]["groundingChunks"][0]["web"]["title"] = "reddit.com"
-        self.fake([a])
+        self.fake([gemini_answer(text=SOCIAL_REPLY.rsplit("\nSOURCES:", 1)[0], titles=("reddit.com", "ncsc.gov.uk"))])
         b = server.make_briefing("test")
-        prompt = self.calls[0]["contents"][0]["parts"][0]["text"]
+        prompt = self.calls[0]["input"]
         self.assertIn("Also check social media", prompt)
         self.assertTrue(b["social"].startswith("People in a Greenwich community group"))
         self.assertEqual([(x["title"], x.get("social")) for x in b["sources"]], [("ncsc.gov.uk", None), ("reddit.com", "Reddit")])

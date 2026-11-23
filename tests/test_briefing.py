@@ -169,20 +169,38 @@ CHIPS = ('<style>.container{display:flex}</style><div class="container"><a class
          'href="https://www.google.com/search?q=London+news+today">London news today</a></div>')
 
 
-def gemini_answer(text=GEMINI_REPLY, finish="STOP", queries=("London news today", "UK cyber news"), chips=CHIPS):
-    return {"candidates": [{"content": {"role": "model", "parts": [{"text": "Thinking it over", "thought": True},
-                                                                  {"text": text}]},
-                            "finishReason": finish,
-                            "groundingMetadata": {
-                                "webSearchQueries": list(queries),
-                                "searchEntryPoint": {"renderedContent": chips},
-                                "groundingChunks": [{"web": {"uri": REDIRECT + "1", "title": "bbc.co.uk"}},
-                                                    {"web": {"uri": REDIRECT + "2", "title": "ncsc.gov.uk"}},
-                                                    {"web": {"uri": "javascript:alert(1)", "title": "bad"}}],
-                                "groundingSupports": [{"segment": {"startIndex": 0, "endIndex": 40}, "groundingChunkIndices": [1]},
-                                                      {"segment": {"startIndex": 41, "endIndex": 90}, "groundingChunkIndices": [1, 0, 2]}]}}],
-            "usageMetadata": {"promptTokenCount": 2000, "toolUsePromptTokenCount": 3000, "candidatesTokenCount": 300,
-                              "thoughtsTokenCount": 700, "totalTokenCount": 6000}}
+CHIPS2 = CHIPS.replace("London+news+today", "UK+cyber+news").replace(">London news today<", ">UK cyber news<")
+
+
+def gemini_answer(text=GEMINI_REPLY, queries=("London news today", "UK cyber news"), chips=(CHIPS, CHIPS2), cited=True,
+                  titles=("bbc.co.uk", "ncsc.gov.uk")):
+    """1.27.0: an Interactions reply, the shape Gemini 4 Hydrogen's real one had (23 Nov 2026): rounds of searches,
+    each with Google's search suggestions, its thinking, then the answer. That one had no citations or result links:
+    cited=True adds them as Google's docs show them."""
+    rounds, steps = [list(queries[:1]), list(queries[1:])], []
+    for n, qs in enumerate(rounds):
+        found = [{"search_suggestions": chips[n]}] if n < len(chips) and chips[n] else []
+        if cited and n == 0:
+            found += [{"url": REDIRECT + "1", "title": titles[0], "snippet": "..."},
+                      {"url": REDIRECT + "2", "title": titles[1], "snippet": "..."},
+                      {"url": "javascript:alert(1)", "title": "bad"}]
+        steps += [{"type": "google_search_call", "id": "call%d" % n, "signature": "x", "search_type": "web_search",
+                   "arguments": {"queries": qs}},
+                  {"type": "google_search_result", "call_id": "call%d" % n, "signature": "x", "is_error": False,
+                   "result": found}]
+    out = [{"type": "text", "text": text}]
+    if cited:
+        out[0]["annotations"] = [
+            {"type": "url_citation", "url": REDIRECT + "2", "title": titles[1], "start_index": 0, "end_index": 40},
+            {"type": "url_citation", "url": REDIRECT + "1", "title": titles[0], "start_index": 41, "end_index": 90},
+            {"type": "url_citation", "url": "javascript:alert(1)", "title": "bad", "start_index": 41, "end_index": 90}]
+    steps += [{"type": "thought", "signature": "x", "summary": [{"type": "text", "text": "Thinking it over"}]},
+              {"type": "model_output", "content": out}]
+    return {"created": "2026-11-23T00:52:28Z", "model": "gemini-4-hydrogen", "object": "interaction",
+            "service_tier": "standard", "status": "completed", "steps": steps, "updated": "2026-11-23T00:52:28Z",
+            "usage": {"total_tokens": 6000, "total_input_tokens": 2000, "total_tool_use_tokens": 3000,
+                      "total_output_tokens": 300, "total_thought_tokens": 700,
+                      "grounding_tool_count": [{"type": "google_search", "count": len(queries)}]}}
 
 
 class GeminiBriefingTest(AppTest):
@@ -232,14 +250,19 @@ class GeminiBriefingTest(AppTest):
         self.fake([gemini_answer()])
         b = server.make_briefing("test")
         call = self.calls[0]
-        self.assertIn("/models/gemini-4-hydrogen:generateContent", call["url"])
-        self.assertEqual(call["headers"], {"x-goog-api-key": "AIza-test-key-0123456789"})   # in a header, not the URL
+        # 1.27.0: Google's Interactions API, which says what was searched even when Gemini searched while thinking
+        self.assertEqual(call["url"], "https://generativelanguage.googleapis.com/v1beta/interactions")
+        self.assertEqual(call["headers"], {"x-goog-api-key": "AIza-test-key-0123456789",   # in a header, not the URL
+                                           "Api-Revision": "2026-05-20"})
         self.assertNotIn("key=", call["url"])
-        self.assertEqual(call["body"]["tools"], [{"google_search": {}}])
-        prompt = call["body"]["contents"][0]["parts"][0]["text"]
+        self.assertEqual(call["body"]["tools"], [{"type": "google_search"}])
+        self.assertEqual(call["body"]["model"], "gemini-4-hydrogen")
+        self.assertIs(call["body"]["store"], False)   # Google doesn't keep it for later
+        # No location goes with it, and nothing else: just the prompt
+        self.assertEqual(sorted(call["body"]), ["generation_config", "input", "model", "store", "tools"])
+        prompt = call["body"]["input"]
         self.assertIn("Greenwich", prompt)
         self.assertNotIn("SOURCES:", prompt)   # Google says what the sources were
-        self.assertNotIn("toolConfig", call["body"])   # no location goes with it
         self.assertTrue(b["text"].startswith("Overnight things are quiet"))
         self.assertNotIn("Thinking it over", b["text"])
         self.assertEqual(b["headline"], "Wind warning tomorrow; router security update advised")
@@ -248,14 +271,35 @@ class GeminiBriefingTest(AppTest):
         # The sources it rests on, first used first, with Google's links exactly as they came; never a script link
         self.assertEqual([(x["title"], x["url"]) for x in b["sources"]], [("ncsc.gov.uk", REDIRECT + "2"), ("bbc.co.uk", REDIRECT + "1")])
         self.assertEqual(b["searched"], ["London news today", "UK cyber news"])
-        self.assertEqual(b["suggestions"], CHIPS)
+        self.assertEqual(b["suggestions"], [CHIPS, CHIPS2])   # one widget for each round of searches
         # Hydrogen: 5000 in (prompt and search results), 1000 out (answer and thinking), and 2 searches at 1.4 cents
         self.assertAlmostEqual(b["cost_usd"], 5000 * 1.50 / 1e6 + 1000 * 7.50 / 1e6 + 2 * 0.014, places=6)
         row = server.DB.execute("SELECT ai, model, tokens_in, tokens_out FROM ai_calls").fetchone()
         self.assertEqual(tuple(row), ("google", "gemini-4-hydrogen", 5000, 1000))
         self.assertEqual(server.ai_stats()["tasks"]["briefing"], 1)
         latest = server.brief_public()["latest"]
-        self.assertIs(latest["suggestions"], True)   # the HTML itself comes from its own page
+        self.assertEqual(latest["suggestions"], 2)   # how many widgets: the HTML itself comes from its own page
+
+    def test_as_gemini_4_answers(self):
+        """Gemini 4's real reply had no citations or result links: no sources, but what it searched for, its search
+        suggestions and the searches it ran are all there (through generateContent they were all lost)."""
+        self.switch_on()
+        a = gemini_answer(cited=False)
+        a["usage"]["grounding_tool_count"] = [{"type": "google_search", "count": 8}]   # Google's count, if it's more
+        self.fake([a])
+        b = server.make_briefing("test")
+        self.assertEqual((b["sources"], b["searched"], b["searches"]), ([], ["London news today", "UK cyber news"], 8))
+        self.assertEqual(b["suggestions"], [CHIPS, CHIPS2])
+        self.assertTrue(b["text"].startswith("Overnight things are quiet"))
+
+    def test_nothing_came_back(self):
+        self.switch_on()
+        a = gemini_answer()
+        a["steps"] = [s for s in a["steps"] if s["type"] != "model_output"]
+        self.fake([a])
+        with self.assertRaises(server.ApiError) as e:
+            server.make_briefing()
+        self.assertEqual(e.exception.message, "Gemini couldn't answer (no briefing came back)")
 
     def test_the_search_suggestions_page(self):
         self.switch_on()
@@ -264,14 +308,32 @@ class GeminiBriefingTest(AppTest):
         page = server.api_briefing_suggestions({}, {"day": [b["day"]]})
         self.assertIsInstance(page, server.Raw)
         self.assertTrue(page.content_type.startswith("text/html"))
-        self.assertIn(CHIPS, page.data.decode("utf-8"))   # as Google made it
-        self.assertIn('<base target="_blank">', page.data.decode("utf-8"))
+        html = page.data.decode("utf-8")
+        # As Google made them, one under another
+        self.assertIn('<div class="g">%s</div><div class="g">%s</div>' % (CHIPS, CHIPS2), html)
+        self.assertIn('<base target="_blank">', html)
         self.assertEqual(page.headers["Content-Security-Policy"], "sandbox allow-popups allow-popups-to-escape-sandbox")
         with self.assertRaises(server.ApiError):
             server.api_briefing_suggestions({}, {"day": ["2001-01-01"]})
         self.switch_on(on=False)
         with self.assertRaises(server.ApiError):
             server.api_briefing_suggestions({}, {"day": [b["day"]]})
+
+    def test_suggestions_kept_before_1_27(self):
+        """One widget, kept as a string: still shown, as one."""
+        self.switch_on()
+        with server.tx() as db:
+            server.set_setting_raw(db, "briefings", [{"day": "2026-11-22", "ai": "google", "text": "x", "suggestions": CHIPS}])
+        self.assertEqual(server.brief_public()["latest"]["suggestions"], 1)
+        page = server.api_briefing_suggestions({}, {"day": ["2026-11-22"]}).data.decode("utf-8")
+        self.assertIn('<div class="g">%s</div></body>' % CHIPS, page)
+
+    def test_too_many_suggestions(self):
+        """Whole widgets only, as many as fit."""
+        one, two = "<div>" + "x" * 35000 + "</div>", "<div>" + "y" * 35000 + "</div>"
+        self.fake([gemini_answer(chips=(one, two))])
+        kept = server.brief_call_gemini("k", "gemini-4-hydrogen", "prompt", {})[4]
+        self.assertEqual(kept, [one])
 
     def test_the_suggestions_page_over_http(self):
         """Through the real server: the page's own sandbox policy, on top of the app's."""
@@ -314,10 +376,12 @@ class GeminiBriefingTest(AppTest):
 
     def test_declined(self):
         self.switch_on()
-        self.fake([gemini_answer(finish="SAFETY")])
+        a = gemini_answer()
+        a.update(status="failed", errors=[{"code": "https://example/blocked", "message": "Blocked for safety"}])
+        self.fake([a])
         with self.assertRaises(server.ApiError) as e:
             server.make_briefing()
-        self.assertIn("Gemini", e.exception.message)
+        self.assertEqual(e.exception.message, "Gemini couldn't answer (no briefing came back: Blocked for safety)")
         self.assertEqual(server.DB.execute("SELECT ok FROM ai_calls").fetchone()[0], 0)
 
     def test_the_free_tier(self):
@@ -346,11 +410,14 @@ class GeminiBriefingTest(AppTest):
         self.assertEqual(server.brief_cfg()["model"], "claude-haiku-5-5")
         server.api_briefing_put({"model": "gemini-4-argon"}, {})
         self.assertEqual(server.brief_cfg()["model"], "gemini-4-argon")
-        self.assertEqual(server.brief_public()["models"]["gemini-4-argon"]["about"], "Gemini 4 Argon: about 20p a day")
+        self.assertEqual(server.brief_public()["models"]["gemini-4-argon"]["about"], "Gemini 4 Argon: about 25p a day")
 
     def test_scanning_counts_geminis_thinking(self):
-        """Gemini's thinking is billed as output, for scanning too."""
-        self.fake([gemini_answer(text="2027-03-31")])
+        """Gemini's thinking is billed as output, for scanning too (still through generateContent)."""
+        self.fake([{"candidates": [{"content": {"parts": [{"text": "Thinking it over", "thought": True},
+                                                          {"text": "2027-03-31"}]}, "finishReason": "STOP"}],
+                    "usageMetadata": {"promptTokenCount": 2000, "toolUsePromptTokenCount": 3000,
+                                      "candidatesTokenCount": 300, "thoughtsTokenCount": 700}}])
         usage = {}
         self.assertEqual(server.ai_direct("google", "k", "", "prompt", usage=usage), "2027-03-31")
         self.assertEqual(usage, {"in": 5000, "out": 1000})
