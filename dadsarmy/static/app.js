@@ -368,10 +368,24 @@
     }
     return { days: t, wasted: wasted / perDay };
   }
+  // Everyone at home, adults first, as the Pi has it (household() in server.py): 1.28.0 adds each one's sex and diet,
+  // and a man's or a woman's calories.
+  function household(st) {
+    var det = st.people || {}, out = [];
+    [['adults', st.adults], ['children', st.children]].forEach(function (g) {
+      var rows = det[g[0]] || [];
+      for (var i = 0; i < g[1]; i++) {
+        var p = rows[i] || {}, adult = g[0] === 'adults', sex = p.sex || '';
+        out.push({ adult: adult, sex: sex, diet: p.diet || '', avoid: p.avoid || [], name: p.name || '',
+          kcal: adult ? (sex === 'male' ? st.kcal_man : sex === 'female' ? st.kcal_woman : st.kcal_adult) : st.kcal_child });
+      }
+    });
+    return out;
+  }
   function readiness() {
     var st = S.settings;
     var people = st.adults + st.children;
-    var kcalDay = st.adults * st.kcal_adult + st.children * st.kcal_child;
+    var kcalDay = household(st).reduce(function (t, p) { return t + p.kcal; }, 0);
     var petWater = petsWater(st);
     var waterDay = people * st.water_per_person + petWater;
     var r = { petWater: petWater, people: people, kcalDay: kcalDay, waterDay: waterDay, kcal: 0, kcalOld: 0, litres: 0, litresOld: 0, drinkLitres: 0, coldKcal: 0, noKcal: 0 };
@@ -2791,6 +2805,9 @@
       '<p class="small">The level is the most serious of these. If it\'s SUBSTANTIAL and you\'d be less able to cope, it goes up to SEVERE: ' +
       'when your food or water wouldn\'t last 3 days, when there\'s a power cut and you have no torches or power bank, ' +
       'or when the home is cold and you have no blankets or warm clothes. Only real danger makes it CRITICAL. UKHSA advises heating the rooms you use to at least 18°C, so below that you get cold-weather advice even at LOW.</p>' +
+      '<p class="small">It goes up at once, but only comes down once what raised it has been gone, or lower, for half an hour. ' +
+      'A reading also has to come back past its line before it stops counting: by a degree for temperatures, and by 5 for humidity, PM2.5 and the backup battery. ' +
+      'So a room hovering at 30°C doesn\'t switch the level back and forth. Alarms going off, and your stores, count as they are now.</p>' +
       '<h3>The UK\'s own levels</h3>' +
       '<p class="small">The names are the UK\'s five national threat levels, the nearest British equivalent to America\'s DEFCON. They\'re set by MI5\'s Joint Terrorism Analysis Centre: ' +
       esc(scale.slice().reverse().map(function (x) { return x.name + ' (' + x.mi5 + ')'; }).join('; ')) + '. ' +
@@ -3057,14 +3074,62 @@
       }).join('') + '</details>';
   }
 
+  // 1.28.0: each person's sex, diet and what they avoid, for the calories, the starter list and Resilience.
+  var DIETS = [['', 'Meat-eater'], ['pescatarian', 'Pescatarian'], ['vegetarian', 'Vegetarian'], ['vegan', 'Vegan'], ['halal', 'Halal'], ['kosher', 'Kosher']];
+  var AVOIDS = [['gluten', 'Gluten'], ['dairy', 'Dairy'], ['nuts', 'Nuts']];
+  function optSel(cur) {
+    return function (o) { return '<option value="' + o[0] + '"' + (o[0] === cur ? ' selected' : '') + '>' + esc(o[1]) + '</option>'; };
+  }
+  function peopleHtml(st) {
+    var hh = household(st), n = { adults: 0, children: 0 };
+    if (!hh.length) return '';
+    var set = hh.filter(function (p) { return p.sex || p.diet || p.avoid.length; }).length;
+    return '<details class="warncat people"' + (set ? ' open' : '') + '><summary>Each person: man or woman, and diet' + (set ? ' · ' + set + ' set' : '') + '</summary>' +
+      '<p class="small muted">So the calories, the starter list and Resilience suit everyone. A name is just to tell people apart, and stays on the Pi.</p>' +
+      hh.map(function (p) {
+        var g = p.adult ? 'adults' : 'children', i = n[g]++, id = g + ':' + i, who = (p.adult ? 'Adult ' : 'Child ') + (i + 1);
+        return '<div class="person">' +
+          '<input type="text" data-person="' + id + '" data-pf="name" value="' + esc(p.name) + '" placeholder="' + who + '" maxlength="40" autocomplete="off" aria-label="' + who + ': name (if you like)">' +
+          '<div class="grid2"><select data-person="' + id + '" data-pf="sex" aria-label="' + who + ': man or woman">' +
+          [['', 'Not said'], ['male', p.adult ? 'Man' : 'Boy'], ['female', p.adult ? 'Woman' : 'Girl']].map(optSel(p.sex)).join('') + '</select>' +
+          '<select data-person="' + id + '" data-pf="diet" aria-label="' + who + ': diet">' + DIETS.map(optSel(p.diet)).join('') + '</select></div>' +
+          '<div class="chips avoid" role="group" aria-label="' + who + ' avoids"><span class="small muted">Avoids</span>' +
+          AVOIDS.map(function (a) {
+            return '<button type="button" class="chip" data-act="person-avoid" data-person="' + id + '" data-val="' + a[0] + '" aria-pressed="' + (p.avoid.indexOf(a[0]) >= 0) + '">' + a[1] + '</button>';
+          }).join('') + '</div></div>';
+      }).join('') + '</details>';
+  }
+  // Calories for men and women once someone's said which they are; "per adult" for anyone who hasn't.
+  function kcalRows(st) {
+    var adults = household(st).filter(function (p) { return p.adult; });
+    function has(sex) { return adults.some(function (p) { return p.sex === sex; }); }
+    var said = has('male') || has('female');
+    return (has('male') ? setRow('kcal_man', 'Calories per man', 'kcal a day: the NHS says about 2,500', st.kcal_man, 100) : '') +
+      (has('female') ? setRow('kcal_woman', 'Calories per woman', 'kcal a day: the NHS says about 2,000', st.kcal_woman, 100) : '') +
+      (!adults.length || has('') ? setRow('kcal_adult', 'Calories per adult', said ? 'kcal a day, for anyone not said' : 'kcal a day', st.kcal_adult, 100) : '') +
+      setRow('kcal_child', 'Calories per child', 'kcal a day', st.kcal_child, 100);
+  }
+  function setPerson(id, field, value) {
+    var g = id.split(':')[0], i = +id.split(':')[1], cur = S.settings.people || {};
+    function copy(p) { return { name: p.name || '', sex: p.sex || '', diet: p.diet || '', avoid: (p.avoid || []).slice() }; }
+    var people = { adults: (cur.adults || []).map(copy), children: (cur.children || []).map(copy) };
+    while (people[g].length <= i) people[g].push(copy({}));
+    var p = people[g][i];
+    if (field === 'avoid') {
+      var k = p.avoid.indexOf(value);
+      if (k >= 0) p.avoid.splice(k, 1); else p.avoid.push(value);
+    } else p[field] = value;
+    S.settings.people = people;   // straight away, so quick changes add up
+    queueSetting('people', people);
+  }
+
   function renderHQ(el) {
     var st = S.settings, r = readiness(), target = st.target_days;
     var theme = document.documentElement.dataset.theme || 'auto';
     var html = '<section class="card"><div class="card-head"><h2>Household</h2></div>' +
       setRow('adults', 'Adults', '', st.adults, 1) +
       setRow('children', 'Children', '', st.children, 1) +
-      setRow('kcal_adult', 'Calories per adult', 'kcal a day', st.kcal_adult, 100) +
-      setRow('kcal_child', 'Calories per child', 'kcal a day', st.kcal_child, 100) +
+      peopleHtml(st) + kcalRows(st) +
       setRow('water_per_person', 'Water per person', 'litres a day (drinking & cooking)', st.water_per_person, 0.5) +
       '<h3 class="plan-h">Pets</h3>' +
       setRow('dogs', 'Dogs', '', st.dogs, 1) +
@@ -3103,8 +3168,8 @@
       (S.server.last_backup ? ' (last one ' + esc(ago(S.server.last_backup)) + ')' : '') + '.</p></section>';
 
     html += '<section class="card"><div class="card-head"><h2>Starter list</h2></div>' +
-      '<p class="small muted">Adds about 95 suggested essentials at zero stock (and pet food, if you have pets), with targets sized for your household and ' + target + '-day goal. ' +
-      'When the household or the goal changes, those targets change with it, unless you\'ve set one yourself. ' +
+      '<p class="small muted">Adds about 95 suggested essentials at zero stock (and pet food, if you have pets), with targets sized for your household and ' + target + '-day goal, and food that suits everyone\'s diet. ' +
+      'When the household or the goal changes, those targets change with it, unless you\'ve set one yourself, and anything the household now needs is added. ' +
       'Anything you already have is skipped. To clear out what you don\'t need, use <b>Select to delete</b> in Stores.</p>' +
       '<button class="btn block" data-act="seed">Load starter list</button></section>';
 
@@ -3186,12 +3251,23 @@
       run(function () {
         return api('PUT', 'api/settings', body).then(function (res) {
           return refresh().then(function () {
-            toast(res.rescaled ? 'Saved. Targets for ' + res.rescaled + ' starter-list item' + (res.rescaled === 1 ? '' : 's') + ' changed to suit' : 'Saved',
-              res.rescaled ? { ms: 4500 } : {});
+            var said = settingsSaid(res);
+            toast(said ? 'Saved. ' + said : 'Saved', said ? { ms: res.added && res.added.length ? 7000 : 4500 } : {});
           });
         });
       });
     }, 450);
+  }
+
+  // What changed in the stores when the household did. 1.28.0: things added from the starter list to suit it (lentils
+  // for a vegetarian, say), and things nobody at home needs now.
+  function settingsSaid(res) {
+    function names(a) { return a.length > 3 ? a.slice(0, 2).join(', ') + ' and ' + (a.length - 2) + ' more' : a.length > 1 ? a.slice(0, -1).join(', ') + ' and ' + a[a.length - 1] : a[0]; }
+    var bits = [], added = res.added || [], dropped = res.dropped || [];
+    if (added.length) bits.push('Added ' + names(added) + ' to the stores, for the supply run.');
+    if (dropped.length) bits.push(names(dropped) + (dropped.length === 1 ? ' isn\'t' : ' aren\'t') + ' needed now.');
+    if (!bits.length && res.rescaled) bits.push('Targets for ' + res.rescaled + ' starter-list item' + (res.rescaled === 1 ? '' : 's') + ' changed to suit.');
+    return bits.join(' ');
   }
 
   function setTheme(t) {
@@ -4745,6 +4821,9 @@
         queueSetting(a.dataset.key, +a.dataset.val);
         $$('[data-key="' + a.dataset.key + '"]').forEach(function (b) { b.setAttribute('aria-pressed', String(b === a)); });
         return;
+      case 'person-avoid':
+        a.setAttribute('aria-pressed', String(a.getAttribute('aria-pressed') !== 'true'));
+        return setPerson(a.dataset.person, 'avoid', a.dataset.val);
       case 'theme':
         return setTheme(a.dataset.val);
       case 'print':
@@ -5139,6 +5218,7 @@
       return;
     }
     if (t.dataset.setting) { queueSetting(t.dataset.setting, num(t.value)); return; }
+    if (t.dataset.pf) { setPerson(t.dataset.person, t.dataset.pf, t.dataset.pf === 'name' ? t.value.trim() : t.value); return; }
     if (t.dataset.warncat) {
       var by = {};
       Object.keys(S.settings.warn_by_cat || {}).forEach(function (k) { by[k] = S.settings.warn_by_cat[k]; });

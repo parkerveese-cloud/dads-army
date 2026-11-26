@@ -45,6 +45,7 @@ class AppTest(unittest.TestCase):
         server.RAN_OUT_PENDING.clear()
         server.HA_REBASE.clear()
         server.HA_HOME.update(lat=None, lon=None, at=0.0)
+        server.ALERT_MEM.update(band={}, held={})   # 1.28.0: the level's memory of the last look
         # Every feed points nowhere (a closed port on this machine), so no test can reach the internet.
         # Tests that need a feed point it at FakeFeeds.
         server.FEED_URLS.clear()

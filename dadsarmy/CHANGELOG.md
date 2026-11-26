@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.28.0
+
+**Each person's diet and needs, and a calmer alert level**
+
+- **Say who's who, in HQ → Household.** For each adult and child: man or woman, their diet (meat-eater, pescatarian, vegetarian, vegan, halal or kosher), and whether they avoid gluten, dairy or nuts. A name too, if you like, to tell people apart; it stays on the Pi. Nothing changes until you say.
+- **Calories for men and women.** About 2,500 kcal a day for a man and 2,000 for a woman, the NHS's figures, which you can change. Anyone you haven't said still uses **Calories per adult**. How long the food lasts follows.
+- **A starter list that suits everyone.**
+  - Each person's share of a food they can't eat goes to one they can, so the calories still add up. For example: halal or kosher tinned meat, or lentils, instead of corned beef; vegetable chilli instead of a meat one; soya or oat milk; seed butter instead of peanut butter; gluten-free pasta and oats; dark chocolate.
+  - A vegan gets vitamin B12, as the NHS advises.
+  - Sanitary products: about 2 packs a month for each woman, and none for a household of men and boys.
+- **The stores follow the household.**
+  - If you use the starter list, anything it now needs is added at zero, so it's on the supply run (that includes food for a new dog or cat).
+  - Anything nobody needs any more has its target set to none, and the app tells you. Nothing is deleted.
+- **Resilience and the stores review know about it.**
+  - A new recommendation, **Food that suits everyone's diet**, looks for those foods in your stores, whatever you've called them.
+  - **Bathroom basics** leaves out sanitary products for a household of men and boys.
+  - The AI's stores review is told each person's sex, diet and what they avoid, and keeps to what they can eat. It's never told their names.
+- **The household alert level is less twitchy.**
+  - It goes up at once, but only comes down once what raised it has been gone, or lower, for half an hour, shown as, say, *Warmest room 30.2°C (until 10 minutes ago)*.
+  - A reading also has to come back past its line before it stops counting: a degree for temperatures, and 5 for humidity, PM2.5 and the backup battery.
+  - Without this, a room hovering at 30°C with water for under 3 days switched it between Moderate and Severe every few seconds. Each switch set off a phone alert, the speaker and a new briefing.
+  - Alarms going off, and your stores, still count as they are now.
+
 ## 1.27.0
 
 **Gemini's briefing shows what it searched for**

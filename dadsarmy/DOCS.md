@@ -299,6 +299,8 @@ It's worked out from three things:
 
 If it's SUBSTANTIAL and you'd be less able to cope, it goes up to SEVERE: when the food or water wouldn't last 3 days, when there's a power cut and you have no torches or power bank, or when the home is cold and you have no blankets or warm clothes. Only real danger makes it CRITICAL.
 
+**It goes up at once, but comes down slowly.** From 1.28.0, the level only comes down once what raised it has been gone, or lower, for half an hour. Until then it's listed with when it was last seen, for example *Warmest room 30.2°C (until 10 minutes ago)*. A reading also has to come back past its line before it stops counting: by a degree for temperatures, and by 5 for humidity, PM2.5 and the backup battery. So a room hovering at 30°C, or a warning that's missing from one check and back in the next, no longer switches the level (and the phone alerts, the spoken sitrep and the briefing) back and forth. Alarms going off, and your stores, count as they are now: when an alarm stops, or you stock up, it shows straight away.
+
 The exact rules are on the dashboard's **What the levels mean** page, and behind the **i** next to the level in the app.
 
 Each level comes with **what to do now**, worst problem first. Each piece of advice is labelled with where it comes from:
@@ -633,7 +635,7 @@ The reader knows the usual shop barcodes (EAN and UPC), plus GS1 DataBar (the wi
 
 **Calories and how long the food lasts.** Calories are for **one whole unit as you count it**: the whole tin, the whole bag, the whole 6-pack, never a serving. Dads Army adds up the calories in date, then eats them in date order, a day at a time, against what the household needs a day (HQ → Household). Food that would go off before you got to it doesn't count, and the Sitrep says how much that is. **Drinks** (juice, milk, squash) count as food, and stand in for drinking water only: up to 1.5 litres a person a day, while cooking, washing and the pets' water have to come from plain water. A water item with no "litres in one" set takes it from its size (a 5000 ml bottle is 5 litres). Things with no calories set don't count at all: **Fill in missing details** in **HQ → Scanning** has the AI estimate them from their names, for you to check, marked **AI estimate** until you change them.
 
-**Stores review.** With an AI set up, the Sitrep has a **Stores review** card. Tap **Review my stores** and the AI looks at your food as if there were no mains water, power, gas or fridge: can it be eaten cold or with a little heat from what's stored, does it need water to cook, will it keep once opened, is it a balanced diet for your household, and will it keep. Then a line on the rest of the stores. It suggests up to six things to add, each one tap onto the supply run. Only item names, amounts and your household's make-up are sent. About 0.3p a go.
+**Stores review.** With an AI set up, the Sitrep has a **Stores review** card. Tap **Review my stores** and the AI looks at your food as if there were no mains water, power, gas or fridge: can it be eaten cold or with a little heat from what's stored, does it need water to cook, will it keep once opened, is it a balanced diet for your household, and will it keep. Then a line on the rest of the stores. It suggests up to six things to add, each one tap onto the supply run. If you've said each person's sex and diet (HQ → Household), it keeps to what they can eat. Only item names, amounts and your household's make-up are sent: how many adults, children and pets, and each person's sex, diet and what they avoid if you've said, never their names. About 0.3p a go.
 
 Without an AI set up, the buttons that need one are hidden, and adding an item says what an AI would add.
 
@@ -672,7 +674,33 @@ Dads Army also notices how fast you actually use things. Once you've tapped **�
 
 **Pets.** In **HQ → Household**, say how many dogs, cats and other pets you have. Their drinking water is added to the household's (about a litre a day for a medium dog and a quarter for a cat; you can change these). Set **Used a day** on their food, and the Sitrep shows how long it lasts. The starter list then adds dog or cat food, pet medicines and a carrier.
 
-**Starter list targets follow the household.** Targets from the starter list are sized for your household and readiness target. Change either, and those targets change with them, unless you've set one yourself.
+**Each person (1.28.0).** In **HQ → Household**, open **Each person: man or woman, and diet**. For each adult and child, you can say:
+
+- **Man or woman** (boy or girl). Adults' calories then follow the NHS's figures: about **2,500 kcal a day for a man and 2,000 for a woman**. You can change both, and anyone you haven't said uses **Calories per adult**. Children use **Calories per child** either way, as what they need depends more on their age. Water is the same for everyone.
+- **Diet:** meat-eater, pescatarian, vegetarian, vegan, halal or kosher.
+- **Avoids:** gluten, dairy or nuts.
+- **A name**, if you like, to tell people apart. It stays on the Pi.
+
+What changes:
+
+- **The food on the starter list suits everyone.** Each person's share of a food they can't eat goes to something they can, so the calories still add up:
+  - corned beef → halal or kosher tinned meat, or lentils or beans;
+  - tinned chilli or stew → vegetable chilli or curry;
+  - tinned fish → lentils or beans;
+  - milk → long-life soya or oat milk;
+  - peanut butter and nuts → seed butter, and seeds and dried fruit;
+  - pasta, oats, noodles, crackers and cereal bars → gluten-free pasta and oats, rice noodles and rice cakes;
+  - chocolate → dark chocolate.
+- **A vegan** gets vitamin B12 on the list, as the NHS advises.
+- **Sanitary products:** about 2 packs a month for each woman, and none for a household of men and boys. Add more if a girl at home has periods. Until anyone's said who's a man or a woman, it stays at 2 packs, as before.
+- **Resilience:**
+  - **Food that suits everyone's diet** (under Food & cooking) looks for those things in your stores, whatever you've called them.
+  - **Bathroom basics** leaves out sanitary products for a household of men and boys.
+- **The stores review** is told each person's diet and sex, never their names.
+
+Check labels: a tin's halal or kosher mark, gelatine in sweets and vitamins, and "may contain nuts".
+
+**Starter list targets follow the household.** Targets from the starter list are sized for your household and readiness target. Change either, and those targets change with them, unless you've set one yourself. From 1.28.0, anything on the starter list the household now needs, and didn't before, is added at zero, so it's on the supply run: lentils when someone becomes vegetarian, say, or dog food for a new dog. Anything nobody needs now has its target set to none, and the app says so. Nothing is deleted, so use **Select to delete** in Stores if you don't want it. This only happens if you've loaded the starter list, and anything you deleted that was needed all along isn't put back.
 
 **Expiry warnings by category.** In **HQ → Expiry warning**, you can warn earlier (or later) for some categories: 90 days for medicines, say, so there's time to get a new prescription.
 
@@ -717,7 +745,7 @@ What goes, and when:
 - **Rainfall near you (off until you tick it):** each of the three nearest rain gauges' readings is asked for by the gauge's id, at the Environment Agency, SEPA or Natural Resources Wales. That says home is within 25 km of those gauges.
 - **Groundwater near you (off until you tick it):** the readings of up to three of the nearest boreholes are asked for by their ids, at the Environment Agency. That says home is within 30 km of them.
 - **Scanning:** a new barcode goes to Open Food Facts (only the barcode), unless you use the offline list. A photo of a date or label goes to the AI you choose.
-- **The stores review:** your item names and amounts, to that AI, when you ask.
+- **The stores review:** your item names and amounts, and the household's make-up (how many adults, children and pets, and each person's sex, diet and what they avoid if you've said, never their names), to that AI, when you ask.
 - **The daily briefing (when switched on):** the area name, the day's warnings and wider picture (without postcodes, streets, gauge names or distances), health news, how long your stores would last, and the household alert level and why (without which room or sensor), to Anthropic or Google, whichever you chose to write it. That's once a day, and again when the alert level changes (at most once an hour and 6 times a day). Under a Gemini briefing, your phone or browser opens Google only when you tap one of its search suggestions.
 - **Read to me:** nothing. Your phone or computer reads it out with one of its own voices that works offline; voices that need the internet aren't used.
 - **The spoken sitrep (when you set it up):** nothing new leaves from Dads Army: the words go to Home Assistant with the other sensors. Home Assistant sends them to the voice you chose: Piper keeps them at home, while Google Translate and Home Assistant Cloud voices send them away to be spoken. A Gemini briefing is never in them. If you ask a Google speaker for the sitrep, Google hears you ask, as with anything you ask it.

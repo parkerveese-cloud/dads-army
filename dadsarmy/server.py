@@ -51,7 +51,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-VERSION = "1.27.0"
+VERSION = "1.28.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(APP_DIR, "static"))
 DATA_DIR = os.path.abspath(os.environ.get("DADSARMY_DATA", os.path.join(APP_DIR, "data")))
@@ -68,8 +68,14 @@ CATEGORIES = ["food", "water", "drinks", "medical", "power", "cooking", "hygiene
 DEFAULT_SETTINGS = {
     "adults": 2,
     "children": 0,
-    "kcal_adult": 2200,
+    "kcal_adult": 2200,   # an adult who hasn't said if they're a man or a woman
     "kcal_child": 1600,
+    # 1.28.0: the NHS's figures for a day: about 2,500 kcal for a man and 2,000 for a woman.
+    "kcal_man": 2500,
+    "kcal_woman": 2000,
+    # 1.28.0: each person's sex, diet and what they avoid, adults first (see clean_people). A list can be shorter than
+    # the count (the rest haven't said) or longer (kept, for when the count goes back up).
+    "people": {"adults": [], "children": []},
     "water_per_person": 3,
     "target_days": 30,
     "warn_days": 30,
@@ -90,6 +96,8 @@ SETTING_RULES = {
     "children": (0, 50, True),
     "kcal_adult": (500, 6000, True),
     "kcal_child": (300, 4000, True),
+    "kcal_man": (500, 6000, True),
+    "kcal_woman": (500, 6000, True),
     "water_per_person": (0.5, 20, False),
     "target_days": (1, 3650, True),
     "warn_days": (1, 365, True),
@@ -101,13 +109,15 @@ SETTING_RULES = {
     "water_per_other_pet": (0, 5, False),
 }
 SETTING_LABELS = {"adults": "Adults", "children": "Children", "kcal_adult": "Calories per adult",
-                  "kcal_child": "Calories per child", "water_per_person": "Water per person",
+                  "kcal_child": "Calories per child", "kcal_man": "Calories per man", "kcal_woman": "Calories per woman",
+                  "water_per_person": "Water per person",
                   "target_days": "The readiness target", "warn_days": "The expiry warning", "dogs": "Dogs", "cats": "Cats",
                   "other_pets": "Other pets", "water_per_dog": "Water per dog", "water_per_cat": "Water per cat",
                   "water_per_other_pet": "Water per pet"}
 # Settings that change what the starter list's targets should be.
-SCALES_TARGETS = ("adults", "children", "kcal_adult", "kcal_child", "water_per_person", "target_days",
-                  "dogs", "cats", "other_pets", "water_per_dog", "water_per_cat", "water_per_other_pet")
+SCALES_TARGETS = ("adults", "children", "kcal_adult", "kcal_child", "kcal_man", "kcal_woman", "people",
+                  "water_per_person", "target_days", "dogs", "cats", "other_pets", "water_per_dog", "water_per_cat",
+                  "water_per_other_pet")
 
 
 def clean_warn_by_cat(value):
@@ -136,6 +146,81 @@ def pets_water(st):
 
 def pets_count(st):
     return st["dogs"] + st["cats"] + st["other_pets"]
+
+
+# -- Each person (1.28.0): man or woman, diet, and what they avoid --------------------------------
+SEXES = ("male", "female")
+DIETS = (("", "Meat-eater"), ("pescatarian", "Pescatarian"), ("vegetarian", "Vegetarian"), ("vegan", "Vegan"),
+         ("halal", "Halal"), ("kosher", "Kosher"))
+DIET_IDS = tuple(d[0] for d in DIETS)
+AVOIDS = (("gluten", "Gluten"), ("dairy", "Dairy"), ("nuts", "Nuts"))
+AVOID_IDS = tuple(a[0] for a in AVOIDS)
+PEOPLE_MAX = 50
+
+
+def clean_people(value):
+    """{"adults": [...], "children": [...]}, each person {"name", "sex", "diet", "avoid"}. The name is only for
+    telling them apart in HQ: it stays on the Pi."""
+    if not isinstance(value, dict):
+        raise ApiError(400, "Each person's details should be a list of adults and a list of children")
+    out = {}
+    for group in ("adults", "children"):
+        rows = value.get(group)
+        if rows is None:
+            rows = []
+        if not isinstance(rows, list):
+            raise ApiError(400, "Each person's details should be a list of adults and a list of children")
+        clean = []
+        for p in rows[:PEOPLE_MAX]:
+            if not isinstance(p, dict):
+                raise ApiError(400, "Each person's details should be a list of adults and a list of children")
+            sex, diet, avoid = p.get("sex") or "", p.get("diet") or "", p.get("avoid") or []
+            if sex not in ("",) + SEXES:
+                raise ApiError(400, "Say male, female or nothing")
+            if diet not in DIET_IDS:
+                raise ApiError(400, "%s isn't a diet Dads Army knows" % clean_text(diet if isinstance(diet, str) else "That", 30))
+            if not isinstance(avoid, list) or any(a not in AVOID_IDS for a in avoid):
+                raise ApiError(400, "Someone can avoid gluten, dairy or nuts")
+            clean.append({"name": clean_text(p.get("name"), 40).strip(), "sex": sex, "diet": diet,
+                          "avoid": [a for a in AVOID_IDS if a in avoid]})
+        out[group] = clean
+    return out
+
+
+def household(st):
+    """Everyone at home, adults first: man or woman ("" if not said), diet, what they avoid, and the calories they
+    need a day. No names: this is what the stores review may send."""
+    det = st.get("people") or {}
+    out = []
+    for group, n in (("adults", st["adults"]), ("children", st["children"])):
+        rows = det.get(group) or []
+        for i in range(int(n)):
+            p = rows[i] if i < len(rows) else {}
+            sex, adult = p.get("sex") or "", group == "adults"
+            kcal = (st["kcal_man"] if sex == "male" else st["kcal_woman"] if sex == "female" else st["kcal_adult"]) \
+                if adult else st["kcal_child"]
+            out.append({"adult": adult, "sex": sex, "diet": p.get("diet") or "", "avoid": list(p.get("avoid") or []),
+                        "kcal": kcal})
+    return out
+
+
+def household_kcal(st):
+    """Calories the household needs a day: each adult's as a man, a woman or (not said) an adult, and each child's."""
+    return sum(p["kcal"] for p in household(st))
+
+
+def can_eat(p, has):
+    """Can this person eat a food with these in it? ("meat", "fish", "dairy", "egg", "honey", "gluten", "nuts", and
+    "halal" or "kosher" for meat that's certified.)"""
+    has = set(has)
+    if has & set(p["avoid"]):
+        return False
+    d = p["diet"]
+    if "meat" in has and d and not (d in ("halal", "kosher") and d in has):
+        return False
+    if "fish" in has and d in ("vegetarian", "vegan"):
+        return False
+    return not (d == "vegan" and has & {"dairy", "egg", "honey"})
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -307,7 +392,22 @@ STARTER = [
     ("Tea bags (80)", "food", "box", 0, 0, PD(.025), ""),
     ("Coffee", "food", "jar", 0, 0, 2, ""),
     ("Salt", "food", "tub", 0, 0, 1, ""),
-    ("Stock cubes", "food", "pack", 0, 0, 2, ""),
+    ("Stock cubes", "food", "pack", 0, 0, 2, "Vegetable ones suit everyone."),
+    # 1.28.0: instead of what someone at home can't eat (see INSTEAD). Only wanted when someone needs them: each
+    # takes the share of the food it stands in for, for those people.
+    ("Tinned lentils or mixed beans (400g)", "food", "tin", 260, 0, K(0), "Protein instead of meat or fish."),
+    ("Vegetable chilli or curry (400g)", "food", "tin", 300, 0, K(0), "Check the label if anyone's vegan."),
+    ("Halal tinned meat (400g)", "food", "tin", 450, 0, K(0), "Chicken, or a meat curry, with a halal mark."),
+    ("Kosher tinned meat (400g)", "food", "tin", 450, 0, K(0), "With a kosher mark."),
+    ("Long-life soya or oat milk (1L)", "food", "carton", 420, 0, K(0),
+     "One with calcium added (and B12, for vegans). Soya if anyone avoids gluten."),
+    ("Dark chocolate (100g bar)", "food", "bar", 560, 0, K(0), "Many are dairy-free: check the label."),
+    ("Seed butter (sunflower or pumpkin)", "food", "jar", 1500, 0, K(0), "Instead of peanut butter."),
+    ("Seeds & dried fruit (500g)", "food", "bag", 1900, 0, K(0), "Instead of nuts. Check the label for \"may contain\"."),
+    ("Gluten-free pasta (500g)", "food", "pack", 1750, 0, K(0), ""),
+    ("Gluten-free oats (450g)", "food", "bag", 1700, 0, K(0), ""),
+    ("Rice cakes", "food", "pack", 500, 0, K(0), "Instead of crackers and cereal bars."),
+    ("Rice noodles (250g)", "food", "pack", 900, 0, K(0), ""),
 
     ("Bottled water (5L)", "water", "bottle", 0, 5, ("water", 1.0),
      "Store somewhere cool and dark, and rotate it."),
@@ -326,6 +426,8 @@ STARTER = [
     ("Prescription medicines (spare)", "medical", "supply", 0, 0, 1,
      "Ask your GP or pharmacist about holding a spare supply."),
     ("Multivitamins", "medical", "tub", 0, 0, P(1), ""),
+    ("Vitamin B12 supplement", "medical", "tub", 0, 0, ("vegans", 1),
+     "The NHS advises vegans to take B12, or eat foods with it added."),
     ("Digital thermometer", "medical", "each", 0, 0, 1, ""),
     ("Disposable gloves", "medical", "box", 0, 0, 1, ""),
 
@@ -354,7 +456,8 @@ STARTER = [
     ("Toothpaste", "hygiene", "tube", 0, 0, P(1), ""),
     ("Spare toothbrushes", "hygiene", "each", 0, 0, P(1), ""),
     ("Bin bags", "hygiene", "roll", 0, 0, 4, ""),
-    ("Sanitary products", "hygiene", "pack", 0, 0, 2, ""),
+    ("Sanitary products", "hygiene", "pack", 0, 0, ("periods", 2),
+     "About 2 packs a month for each woman. A menstrual cup or washable pads last for years."),
     ("Bleach (unscented)", "hygiene", "bottle", 0, 0, 2, "For cleaning and disinfecting."),
     ("Bucket with lid", "hygiene", "each", 0, 0, 1, "Emergency toilet if water or sewage fails."),
 
@@ -405,6 +508,81 @@ STARTER = [
 ]
 STARTER_BY_NAME = {s[0]: s for s in STARTER}
 PET_SPECS = ("dogday", "catday", "pets")
+
+# 1.28.0: what's in the foods on the starter list, for who can eat them (see can_eat). Anything not here suits
+# everyone. Cereal bars often have nuts or honey in them, so they're counted as having both.
+FOOD_HAS = {
+    "Pasta (500g)": ("gluten",),
+    "Porridge oats (1kg)": ("gluten",),
+    "Tinned fish (mackerel, sardines)": ("fish",),
+    "Corned beef (340g)": ("meat",),
+    "Tinned chilli or stew (400g)": ("meat",),
+    "Peanut butter (340g)": ("nuts",),
+    "Crackers or crispbread": ("gluten",),
+    "Cereal bars (multipack)": ("gluten", "nuts", "honey"),
+    "Nuts & dried fruit (500g)": ("nuts",),
+    "UHT milk (1L)": ("dairy",),
+    "Dried milk powder (400g)": ("dairy",),
+    "Instant noodles": ("gluten",),
+    "Chocolate (100g bar)": ("dairy",),
+    "Halal tinned meat (400g)": ("meat", "halal"),
+    "Kosher tinned meat (400g)": ("meat", "kosher"),
+}
+# What someone who can't eat a food has instead: the first of these that suits them. Halal or kosher meat stands in
+# for corned beef, for those who eat it; lentils or beans for everyone else.
+INSTEAD = {
+    "Pasta (500g)": ("Gluten-free pasta (500g)",),
+    "Porridge oats (1kg)": ("Gluten-free oats (450g)",),
+    "Tinned fish (mackerel, sardines)": ("Tinned lentils or mixed beans (400g)",),
+    "Corned beef (340g)": ("Halal tinned meat (400g)", "Kosher tinned meat (400g)",
+                           "Tinned lentils or mixed beans (400g)"),
+    "Tinned chilli or stew (400g)": ("Vegetable chilli or curry (400g)",),
+    "Peanut butter (340g)": ("Seed butter (sunflower or pumpkin)",),
+    "Crackers or crispbread": ("Rice cakes",),
+    "Cereal bars (multipack)": ("Rice cakes",),
+    "Nuts & dried fruit (500g)": ("Seeds & dried fruit (500g)",),
+    "UHT milk (1L)": ("Long-life soya or oat milk (1L)",),
+    "Dried milk powder (400g)": ("Long-life soya or oat milk (1L)",),
+    "Instant noodles": ("Rice noodles (250g)",),
+    "Chocolate (100g bar)": ("Dark chocolate (100g bar)",),
+}
+FOOD_ALTS = set(a for alts in INSTEAD.values() for a in alts)
+FOOD_FALLBACK = "Rice (1kg bag)"   # if nothing else suits (it suits everyone)
+# How Resilience spots each of them in the stores, whatever you've called it.
+ALT_FIND = {
+    "Tinned lentils or mixed beans (400g)": ("lentils or beans", r"lentil|mixed bean|kidney bean|black bean|butter bean|cannellini|borlotti"),
+    "Vegetable chilli or curry (400g)": ("vegetable chilli or curry", r"(veg|vegetable|vegan|bean|lentil).*(chilli|curry)|\bdh?al\b|dahl"),
+    "Halal tinned meat (400g)": ("halal meat", r"halal"),
+    "Kosher tinned meat (400g)": ("kosher meat", r"kosher"),
+    "Long-life soya or oat milk (1L)": ("plant milk", r"(soya?|oat|rice|coconut|pea|hemp)\b.*\b(milk|drink)|plant.?milk"),
+    "Dark chocolate (100g bar)": ("dark chocolate", r"dark choc|vegan choc|dairy.?free choc|plain choc"),
+    "Seed butter (sunflower or pumpkin)": ("seed butter", r"seed (butter|spread)|sunflower.*(butter|spread)|tahini"),
+    "Seeds & dried fruit (500g)": ("seeds or dried fruit", r"\bseeds\b|dried fruit|raisin|sultana|apricot"),
+    "Gluten-free pasta (500g)": ("gluten-free pasta", r"(gluten.?free|\bgf\b|rice|corn|lentil|chickpea).*pasta"),
+    "Gluten-free oats (450g)": ("gluten-free oats", r"(gluten.?free|\bgf\b).*(oat|porridge)"),
+    "Rice cakes": ("rice cakes", r"rice cake|corn cake|corn thin"),
+    "Rice noodles (250g)": ("rice noodles", r"rice noodle|vermicelli"),
+    "Vitamin B12 supplement": ("vitamin B12", r"\bb-?12\b"),
+}
+
+
+def food_split(people, days):
+    """The calories of each food on the starter list the household needs for the target (1.28.0). Each person's
+    share of a food they can't eat goes to what they'd have instead. When everyone eats everything, it's the
+    household's calories times the food's share, as it always was."""
+    people = people or [{"diet": "", "avoid": [], "kcal": 1}]   # nobody at home: a token amount, as before
+    out = {}
+    for name, _, _, _, _, spec, _ in STARTER:
+        if not (isinstance(spec, tuple) and spec[0] == "kcal") or name in FOOD_ALTS:
+            continue
+        groups = {}
+        for p in people:
+            pick = name if can_eat(p, FOOD_HAS.get(name, ())) else next(
+                (a for a in INSTEAD.get(name, ()) if can_eat(p, FOOD_HAS.get(a, ()))), FOOD_FALLBACK)
+            groups[pick] = groups.get(pick, 0) + p["kcal"]
+        for pick, k in groups.items():
+            out[pick] = out.get(pick, 0.0) + (max(1, k) * days) * spec[1]
+    return out
 
 
 class ApiError(Exception):
@@ -538,6 +716,7 @@ def init_db():
         DB.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(value)))
     with tx() as db:
         mark_starter_items(db)
+        starter_follows_128(db)
 
 
 # --------------------------------------------------------------------------
@@ -741,6 +920,7 @@ def add_log(action, item="", detail=""):
 def get_settings():
     out = dict(DEFAULT_SETTINGS)
     out["warn_by_cat"] = {}
+    out["people"] = {"adults": [], "children": []}
     for row in DB.execute("SELECT key, value FROM settings"):
         if row["key"] in out:
             try:
@@ -751,6 +931,10 @@ def get_settings():
         out["warn_by_cat"] = clean_warn_by_cat(out["warn_by_cat"])
     except ApiError:
         out["warn_by_cat"] = {}
+    try:
+        out["people"] = clean_people(out["people"])
+    except ApiError:
+        out["people"] = {"adults": [], "children": []}
     return out
 
 
@@ -981,7 +1165,7 @@ def summary():
         plan = get_plan()
     warn = st["warn_days"]
     people = st["adults"] + st["children"]
-    kcal_day = st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]
+    kcal_day = household_kcal(st)   # 1.28.0: as a man, a woman or an adult, and each child
     pet_water = pets_water(st)
     water_day = people * st["water_per_person"] + pet_water
     kcal = litres = drink_litres = cold_kcal = 0.0
@@ -2834,7 +3018,10 @@ REVIEW_PROMPT = (
     "at one meal for this family (a large tin or jar that has to be refrigerated after opening); (3) is it a "
     "reasonably balanced diet for these people for that long: protein, carbohydrate, fruit and vegetables, fats, "
     "fibre, salt and sugar, and enough variety that people keep eating, including anything the children or pets "
-    "need; (4) does enough of it keep (dates). Only then, briefly, the wider stores (water, light, heat for "
+    "need. If the household lists \"people\", respect each one's diet (vegetarian, vegan, halal, kosher...) and "
+    "anything they avoid: food a person can't eat doesn't feed them, and suggestions must suit whoever they're for; "
+    "\"kcal_needed_a_day\" allows for men and women needing different amounts; "
+    "(4) does enough of it keep (dates). Only then, briefly, the wider stores (water, light, heat for "
     "cooking, can opener, first aid, hygiene). Be practical and kind, British English, no lecturing, no brand "
     "names. Each food has \"kept\": how it's stored before opening, as the household recorded it. Trust it: cupboard "
     "(ambient) food needs no fridge until opened, so don't say a tinned or canned item needs chilling. Where it's "
@@ -2878,6 +3065,18 @@ def review_input():
     head = {"adults": st["adults"], "children": st["children"], "pets": pets_count(st), "target_days": st["target_days"],
             "food_days": s_.get("food_days"), "water_days": s_.get("water_days"),
             "stored_water_litres": s_.get("water_litres"), "water_litres_needed_a_day": (st["adults"] + st["children"]) * st["water_per_person"] + pets_water(st)}
+    hh = household(st)
+    if any(p["sex"] or p["diet"] or p["avoid"] for p in hh):
+        # 1.28.0: each person's sex, diet and what they avoid, so the review can say what suits them. Never names.
+        head["kcal_needed_a_day"] = sum(p["kcal"] for p in hh)
+        head["people"] = []
+        for p in hh:
+            q = {"age": "adult" if p["adult"] else "child", "diet": p["diet"] or "eats anything"}
+            if p["sex"]:
+                q["sex"] = p["sex"]
+            if p["avoid"]:
+                q["avoids"] = p["avoid"]
+            head["people"].append(q)
     return head, lines
 
 
@@ -3356,14 +3555,17 @@ def _rx(p):
     return re.compile(p, re.I)
 
 
-def I(label, rx, add=None, cats=None, excl=None):
-    """Something in the stores: what it is, how to spot it by name, and what to add if it's missing."""
-    return {"label": label, "rx": _rx(rx), "add": add, "cats": cats, "excl": _rx(excl) if excl else None}
+def I(label, rx, add=None, cats=None, excl=None, when=None):
+    """Something in the stores: what it is, how to spot it by name, and what to add if it's missing. when="periods":
+    only if someone at home may need it (1.28.0)."""
+    return {"label": label, "rx": _rx(rx), "add": add, "cats": cats, "excl": _rx(excl) if excl else None,
+            "when": when}
 
 
-def R(mid, area, pri, title, brief, why, src, test, when=None):
+def R(mid, area, pri, title, brief, why, src, test, when=None, without=None):
+    """without: the title and why to use when an item in the test doesn't apply to this household (1.28.0)."""
     return {"id": mid, "area": area, "priority": pri, "title": title, "brief": brief, "why": why, "src": src,
-            "test": test, "when": when}
+            "test": test, "when": when, "without": without}
 
 
 MANUAL = ("manual",)
@@ -3406,6 +3608,10 @@ RECOMMENDATIONS = [
     R("food_baby", "food", RECOMMENDED, "For a baby: ready-to-feed formula, nappies and wipes", "Baby supplies",
       "Ready-to-feed formula needs no clean water. Say it's not for you if you don't have a baby.", "bready",
       ("any", [MANUAL, ("items", [I("formula or nappies", r"formula|napp(y|ies)", None)])]), when="children"),
+    # 1.28.0: when someone at home is vegetarian, halal, avoids nuts and so on (HQ → Household). What it looks for
+    # comes from their diets (see diet_specs), and so does the why.
+    R("food_diets", "food", RECOMMENDED, "Food that suits everyone's diet", "Food for every diet", "", "tip",
+      ("diets",), when="diets"),
     # Power & light
     R("power_torch", "power", ESSENTIAL, "A torch for everyone, and spare batteries", "Torches and batteries",
       "Torches are safer than candles.", "bready",
@@ -3511,7 +3717,8 @@ RECOMMENDATIONS = [
     R("hyg_rest", "hygiene", RECOMMENDED, "Soap, toothpaste and sanitary products", "Bathroom basics",
       "Everyday bathroom products, for a few days at least.", "bready",
       ("items", [I("soap", r"soap", "Soap"), I("toothpaste", r"toothpaste", "Toothpaste"),
-                 I("sanitary products", r"sanitary|period|tampon", "Sanitary products")])),
+                 I("sanitary products", r"sanitary|period|tampon|menstrual", "Sanitary products", when="periods")]),
+      without="Soap and toothpaste"),
     R("hyg_bleach", "hygiene", EXTRA, "Unscented bleach, for cleaning and disinfecting", "Bleach", "", "tip",
       ("items", [I("bleach", r"bleach|disinfect", "Bleach (unscented)")])),
     # Fire & home safety
@@ -3621,9 +3828,12 @@ def res_test(test, c):
     kind = test[0]
     if kind == "manual":
         return 0.0, "", {"kind": "manual"}
+    if kind == "diets":
+        specs = diet_specs(c["starter"])
+        return res_test(("items", specs), c) if specs else (1.0, "Nothing else needed", None)
     if kind == "items":
         parts, missing, none, short, first, addable = [], [], [], [], None, False
-        for spec in test[1]:
+        for spec in [s for s in test[1] if spec_applies(s, c)]:
             found = _found(c["items"], spec)
             f = _items_frac(found)
             parts.append(f)
@@ -3724,7 +3934,40 @@ def res_test(test, c):
 def res_applies(r, c):
     w = r["when"]
     return (not w or (w == "ha" and c["ha"]) or (w == "children" and c["children"] > 0)
-            or (w == "pets" and c["pets"]) or (w == "target>3" and c["target"] > 3))
+            or (w == "pets" and c["pets"]) or (w == "target>3" and c["target"] > 3)
+            or (w == "diets" and bool(c["starter"]["diets"])))
+
+
+def spec_applies(spec, c):
+    """Sanitary products only if someone at home may need them: not if everyone's said they're a man or a child."""
+    return spec.get("when") != "periods" or c["starter"]["periods"] != 0
+
+
+def diet_specs(ctx):
+    """What Resilience looks for in the stores for the household's diets (1.28.0): whatever the starter list has
+    them eat instead (lentils, plant milk, gluten-free pasta...), and B12 for a vegan."""
+    names = [r[0] for r in STARTER if r[0] in FOOD_ALTS and ctx["food"].get(r[0], 0) > 0]
+    if ctx["vegans"]:
+        names.append("Vitamin B12 supplement")
+    return [I(ALT_FIND[n][0], ALT_FIND[n][1], n) for n in names]
+
+
+def diets_words(diets):
+    """[{"diet": "vegan", "avoid": ["nuts"]}, ...] -> "a vegan and someone who avoids nuts"."""
+    bits = []
+    for d, label in DIETS[1:]:
+        n, word = len([p for p in diets if p["diet"] == d]), label.lower()
+        if not n:
+            continue
+        if d in ("halal", "kosher"):
+            bits.append("someone who eats %s" % d if n == 1 else "%d people who eat %s" % (n, d))
+        else:
+            bits.append(("an " if word[0] in "aeiou" else "a ") + word if n == 1 else "%d %ss" % (n, word))
+    for a in AVOID_IDS:
+        n = len([p for p in diets if a in p["avoid"]])
+        if n:
+            bits.append("someone who avoids %s" % a if n == 1 else "%d people who avoid %s" % (n, a))
+    return and_list(bits, 5)
 
 
 def resilience(c):
@@ -3746,8 +3989,14 @@ def resilience(c):
             # 1.21.0: home's part of the network loses power more often, or for longer, than most: a step up.
             prio = min(ESSENTIAL, prio + 1)
             why += " " + supply_why(sup)
+        title = r["title"]
+        if r["without"] and r["test"][0] == "items" and not all(spec_applies(s, c) for s in r["test"][1]):
+            title = r["without"]   # 1.28.0: "Soap and toothpaste", for a household with no woman in it
+        if r["test"][0] == "diets":
+            why = ("For %s: the starter list has things they can eat instead of what's on the usual list. Check the "
+                   "labels." % diets_words(c["starter"]["diets"]))
         m = {"id": r["id"], "area": r["area"], "priority": prio, "priority_word": PRIORITY_WORD[prio],
-             "title": r["title"].format(target=c["target"]), "brief": r["brief"].format(target=c["target"]),
+             "title": title.format(target=c["target"]), "brief": r["brief"].format(target=c["target"]),
              "why": why, "source": src, "label": src + (" · " + body if body else ""),
              "frac": round(frac, 3), "status": status, "detail": detail, "answer": ans,
              "act": None if status in ("done", "na") else act, "manual": r["test"] == MANUAL}
@@ -3803,7 +4052,8 @@ def res_context(items, st, plan, checks, warnings_on, food_days, water_days, tod
     return {"items": items, "plan": plan, "checks": checks, "warnings_on": warnings_on, "home": home,
             "ha": bool(HA_TOKEN), "answers": answers, "supply": supply, "food_days": food_days, "water_days": water_days,
             "target": st["target_days"], "children": st["children"], "today": today,
-            "pets": bool(plan.get("pets")) or pets_count(st) > 0 or any(it["category"] == "pets" for it in items)}
+            "pets": bool(plan.get("pets")) or pets_count(st) > 0 or any(it["category"] == "pets" for it in items),
+            "starter": starter_ctx(st)}   # 1.28.0: who eats what, and who may need period products
 
 
 @route("POST", "/api/resilience/answer")
@@ -3845,6 +4095,9 @@ def api_res_add(body, query):
     rows = starter_rows()
     with tx() as db:
         ctx = starter_ctx(get_settings())
+        if r["test"][0] == "diets":
+            specs = diet_specs(ctx)   # 1.28.0: what the household's diets need
+        specs = [s for s in specs if spec_applies(s, {"starter": ctx})]
         items = all_items()
         names = set(it["name"].lower() for it in items)
         ts = now_iso()
@@ -3877,7 +4130,7 @@ def api_res_add(body, query):
 @route("PUT", "/api/settings")
 def api_settings(body, query):
     changed = []
-    rescaled = 0
+    follow = {"rescaled": 0, "added": [], "dropped": []}
     with tx() as db:
         before = get_settings()
         for key, (lo, hi, integer) in SETTING_RULES.items():
@@ -3893,30 +4146,48 @@ def api_settings(body, query):
             set_setting_raw(db, "warn_by_cat", v)
             if v != before["warn_by_cat"]:
                 changed.append("warn_by_cat")
+        if "people" in body:   # 1.28.0
+            v = clean_people(body.get("people"))
+            set_setting_raw(db, "people", v)
+            if v != before["people"]:
+                changed.append("people")
         if changed:
             add_log("settings", "", "Household settings updated")
         if any(k in SCALES_TARGETS for k in changed):
-            rescaled = rescale_targets(db, before, get_settings())
-            if rescaled:
-                add_log("settings", "", "Targets for %d thing%s from the starter list now suit the household"
-                        % (rescaled, "" if rescaled == 1 else "s"))
-    return {"changed": changed, "rescaled": rescaled}
+            follow = follow_household(db, before, get_settings())
+    return dict(follow, changed=changed)
 
 
 def starter_ctx(st):
-    people = max(1, st["adults"] + st["children"])
+    hh = household(st)
+    people = max(1, len(hh))
     days = st["target_days"]
     return {"people": people, "days": days, "dogs": st["dogs"], "cats": st["cats"], "pets": pets_count(st),
-            "kcal": max(1, st["adults"] * st["kcal_adult"] + st["children"] * st["kcal_child"]) * days,
-            "litres": (people * st["water_per_person"] + pets_water(st)) * days}
+            "kcal": max(1, sum(p["kcal"] for p in hh)) * days,
+            "litres": (people * st["water_per_person"] + pets_water(st)) * days,
+            # 1.28.0: each food's calories, as each person's diet has it; vegans; and who may need period products
+            # (women, and adults who haven't said). None: nobody's said, so it's as it was before.
+            "food": food_split(hh, days),
+            "vegans": len([p for p in hh if p["diet"] == "vegan"]),
+            "periods": len([p for p in hh if p["adult"] and p["sex"] != "male"]) if any(p["sex"] for p in hh) else None,
+            "diets": [{"diet": p["diet"], "avoid": p["avoid"]} for p in hh if p["diet"] or p["avoid"]]}
 
 
-def resolve_target(spec, kcal, litres, ctx):
+def resolve_target(spec, kcal, litres, ctx, name=None):
     if isinstance(spec, (int, float)):
         return spec
     kind, v = spec
     if kind == "kcal":
-        return max(1, int(math.ceil(ctx["kcal"] * v / kcal))) if kcal else 1
+        # 1.28.0: the calories of it the household needs, as each person's diet has it. None if nobody eats it.
+        need = ctx["food"].get(name, 0.0) if name else ctx["kcal"] * v
+        if need <= 0:
+            return 0
+        return max(1, int(math.ceil(need / kcal))) if kcal else 1
+    if kind == "vegans":
+        return int(math.ceil(ctx["vegans"] * v - 1e-9))
+    if kind == "periods":
+        # So many packs a month for each woman; as before (a fixed number) if nobody's said who's a woman.
+        return v if ctx["periods"] is None else int(math.ceil(ctx["periods"] * v * ctx["days"] / 30.0 - 1e-9))
     if kind == "water":
         return max(1, int(math.ceil(ctx["litres"] * v / litres))) if litres else 1
     if kind == "people":
@@ -3941,17 +4212,25 @@ def starter_per_day(spec, ctx):
     return round(n * spec[1], 3) if n is not None else 0
 
 
-def starter_wanted(spec, ctx):
-    """Pet food only when there are pets of that kind."""
-    if isinstance(spec, tuple) and spec[0] in PET_SPECS:
-        return {"dogday": ctx["dogs"], "catday": ctx["cats"], "pets": ctx["pets"]}[spec[0]] > 0
+def starter_wanted(spec, ctx, name=None):
+    """Pet food only when there are pets of that kind. 1.28.0: food only if someone at home eats it (lentils for a
+    vegetarian, corned beef for a meat-eater), B12 for vegans, and sanitary products unless nobody's a woman."""
+    if isinstance(spec, tuple):
+        if spec[0] in PET_SPECS:
+            return {"dogday": ctx["dogs"], "catday": ctx["cats"], "pets": ctx["pets"]}[spec[0]] > 0
+        if spec[0] == "kcal" and name:
+            return ctx["food"].get(name, 0) > 0
+        if spec[0] == "vegans":
+            return ctx["vegans"] > 0
+        if spec[0] == "periods":
+            return ctx["periods"] != 0
     return True
 
 
 def add_starter(db, row, ctx, ts):
     name, cat, unit, kcal, litres, target, notes = row
     item_id = insert_item(db, {"name": name, "category": cat, "unit": unit, "kcal_per_unit": kcal,
-                               "litres_per_unit": litres, "target_qty": resolve_target(target, kcal, litres, ctx),
+                               "litres_per_unit": litres, "target_qty": resolve_target(target, kcal, litres, ctx, name),
                                "per_day": starter_per_day(target, ctx), "price": 0, "notes": notes}, ts, ts)
     db.execute("UPDATE items SET starter = ?, auto_target = ? WHERE id = ?",
                (name, 1 if isinstance(target, tuple) else 0, item_id))
@@ -3962,22 +4241,25 @@ def starter_rows():
     return dict((r[0], r) for r in STARTER + EXTRA_ITEMS)
 
 
-def rescale_targets(db, old_st, new_st):
-    """The household or the readiness target changed: targets from the starter list that you haven't
-    changed yourself follow it. So do their daily use, if that's still what the starter list set."""
+def rescale_targets(db, old, new):
+    """The household or the readiness target changed (old and new: their starter_ctx): targets from the starter
+    list that you haven't changed yourself follow it. So do their daily use, if that's still what the starter list
+    set. Returns how many changed, and the names of those no longer needed (a target of none now)."""
     rows = starter_rows()
-    old, new = starter_ctx(old_st), starter_ctx(new_st)
-    n = 0
-    for it in db.execute("SELECT id, starter, target_qty, per_day, auto_target FROM items WHERE starter != ''").fetchall():
+    n, dropped = 0, []
+    for it in db.execute("SELECT id, name, starter, target_qty, per_day, auto_target FROM items "
+                         "WHERE starter != ''").fetchall():
         row = rows.get(it["starter"])
         if not row or not isinstance(row[5], tuple):
             continue
         spec, kcal, litres = row[5], row[3], row[4]
         sets = {}
         if it["auto_target"]:
-            t = resolve_target(spec, kcal, litres, new)
+            t = resolve_target(spec, kcal, litres, new, row[0])
             if abs(t - it["target_qty"]) > 1e-9:
                 sets["target_qty"] = t
+                if t == 0:
+                    dropped.append(it["name"])
         if it["per_day"] and abs(it["per_day"] - starter_per_day(spec, old)) < 1e-6:
             p = starter_per_day(spec, new)
             if abs(p - it["per_day"]) > 1e-9:
@@ -3986,7 +4268,31 @@ def rescale_targets(db, old_st, new_st):
             db.execute("UPDATE items SET %s, updated_at = ?, rev = rev + 1 WHERE id = ?"
                        % ", ".join("%s = ?" % k for k in sets), list(sets.values()) + [now_iso(), it["id"]])
             n += 1
-    return n
+    return n, dropped
+
+
+def follow_household(db, old_st, new_st):
+    """The household or the readiness target changed: things from the starter list follow it (rescale_targets).
+    1.28.0: and if you use the starter list, anything on it the household didn't need before but does now (lentils
+    for a new vegetarian, sanitary products for a woman, food for a new dog) is added at zero, so it's on the supply
+    run. Something you've deleted that was needed all along isn't put back."""
+    old, new = starter_ctx(old_st), starter_ctx(new_st)
+    rescaled, dropped = rescale_targets(db, old, new)
+    added = []
+    if any(r[0] in STARTER_BY_NAME for r in db.execute("SELECT DISTINCT starter FROM items WHERE starter != ''")):
+        names = set(r[0].lower() for r in db.execute("SELECT name FROM items"))
+        ts = now_iso()
+        for row in STARTER:
+            if row[0].lower() not in names and not starter_wanted(row[5], old, row[0]) \
+                    and starter_wanted(row[5], new, row[0]):
+                add_starter(db, row, new, ts)
+                added.append(row[0])
+    if rescaled:
+        add_log("settings", "", "Targets for %d thing%s from the starter list now suit the household"
+                % (rescaled, "" if rescaled == 1 else "s"))
+    if added:
+        add_log("added", ", ".join(added), "From the starter list, to suit the household: on the supply run")
+    return {"rescaled": rescaled, "added": added, "dropped": dropped}
 
 
 def guess_starter(name, target, ctx, rows=None):
@@ -3995,7 +4301,7 @@ def guess_starter(name, target, ctx, rows=None):
     row = (rows or starter_rows()).get(name)
     if not row:
         return "", 0
-    auto = isinstance(row[5], tuple) and abs(resolve_target(row[5], row[3], row[4], ctx) - target) < 1e-9
+    auto = isinstance(row[5], tuple) and abs(resolve_target(row[5], row[3], row[4], ctx, row[0]) - target) < 1e-9
     return row[0], 1 if auto else 0
 
 
@@ -4011,6 +4317,16 @@ def mark_starter_items(db):
     set_setting_raw(db, "starter_marked", True)
 
 
+def starter_follows_128(db):
+    """1.28.0: sanitary products follow the household now (about 2 packs a month for each woman). From the starter
+    list at its old fixed target of 2, it follows from now on; one you've changed stays yours. Once."""
+    if setting_raw("starter_128", False):
+        return
+    db.execute("UPDATE items SET auto_target = 1 WHERE starter = 'Sanitary products' AND auto_target = 0 "
+               "AND target_qty = 2")
+    set_setting_raw(db, "starter_128", True)
+
+
 @route("POST", "/api/seed")
 def api_seed(body, query):
     """Add the suggested starter list (at zero stock), skipping names that already exist."""
@@ -4020,7 +4336,7 @@ def api_seed(body, query):
         ts = now_iso()
         added = 0
         for row in STARTER:
-            if row[0].lower() in existing or not starter_wanted(row[5], ctx):
+            if row[0].lower() in existing or not starter_wanted(row[5], ctx, row[0]):
                 continue
             add_starter(db, row, ctx, ts)
             added += 1
@@ -4145,6 +4461,7 @@ def api_restore(body, query):
             v = clean_num(settings.get(key), DEFAULT_SETTINGS[key], lo, hi, SETTING_LABELS.get(key, key))
             settings_in[key] = int(round(v)) if integer else v
     warn_by_cat = clean_warn_by_cat(settings["warn_by_cat"]) if isinstance(settings.get("warn_by_cat"), dict) else None
+    people = clean_people(settings["people"]) if isinstance(settings.get("people"), dict) else None   # 1.28.0 on
     history = None
     if isinstance(body.get("history"), list):
         history = []
@@ -4193,6 +4510,8 @@ def api_restore(body, query):
             db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(v)))
         if warn_by_cat is not None:
             set_setting_raw(db, "warn_by_cat", warn_by_cat)
+        if people is not None:
+            set_setting_raw(db, "people", people)
         ctx, rows = starter_ctx(get_settings()), starter_rows()
         for data, created, bl, used, starter in clean_items:
             new_id = insert_item(db, data, created, ts)
@@ -5601,6 +5920,8 @@ Dads Army works out a household alert level from the warnings in force where you
 ### How Dads Army decides
 
 The level is the most serious of these. If it's SUBSTANTIAL and you'd be less able to cope, it goes up to SEVERE: when your food or water wouldn't last 3 days, when there's a power cut and you have no torches or power bank, or when the home is cold and you have no blankets or warm clothes. Only real danger makes it CRITICAL.
+
+It goes up at once, but only comes down once what raised it has been gone, or lower, for half an hour. A reading also has to come back past its line before it stops counting: by a degree for temperatures, and by 5 for humidity, PM2.5 and the backup battery. So a room hovering at 30°C doesn't switch the level back and forth. Alarms going off, and your stores, count as they are now.
 
 | Level | Warnings | At home (your sensors) | Stores |
 |:--|:--|:--|:--|
@@ -11262,8 +11583,62 @@ def disaster_reaches_uk(w):
     return d <= 300 or (w.get("event") == "VO" and d <= GDACS_VOLCANO_KM)
 
 
-def assess(s, home):
-    """Where the household stands, LOW (1) to CRITICAL (5), why, and what to do."""
+# 1.28.0: less twitchy. Sensors are read every 15 seconds and warnings checked every few minutes, so a room at 29.9 and
+# 30°C in turn, or a warning missing from one check and back in the next, switched the level back and forth (and with
+# it the phone alerts, the spoken sitrep and the briefing). Now a reading has to come back past its line by a margin
+# before it stops counting (band), and the level goes up at once but only comes down once what raised it has been gone,
+# or lower, for ALERT_EASE seconds (ease). Alarms going off, and the stores, count as they are now: when an alarm stops
+# or you stock up, it shows straight away.
+ALERT_EASE = float(os.environ.get("DADSARMY_ALERT_EASE", "1800"))
+ALERT_NOW_ONLY = ("gas_alarm", "smoke_alarm", "leak")
+ALERT_MEM = {"band": {}, "held": {}}   # the last look: each reading's level, and what's raised the level lately
+ALERT_LOCK = threading.Lock()
+
+
+def band(v, steps, was, margin, how):
+    """The level a reading puts the household at: the first of steps [(line, level)] that v is past ("how": ">=",
+    "<" or "<=" the line), or 0. A level in force last time (was) holds until v is margin back the other side."""
+    for line, lvl in steps:
+        m = margin if was >= lvl else 0
+        if (v >= line - m) if how == ">=" else (v < line + m) if how == "<" else (v <= line + m):
+            return lvl
+    return 0
+
+
+def ago_words(secs):
+    m = int(secs // 60)
+    return "just now" if m < 1 else "a minute ago" if m == 1 else "%d minutes ago" % m
+
+
+def ease(factors, mem, now):
+    """The level goes up at once, but comes down slowly: what raised it (a warning, a reading) keeps counting, at its
+    highest, until it's been gone or lower for ALERT_EASE seconds, marked "(until 5 minutes ago)"."""
+    top = {}
+    for f in factors:
+        if f["level"] >= 2 and f["key"] not in ALERT_NOW_ONLY and f["level"] > top.get(f["key"], {"level": 0})["level"]:
+            top[f["key"]] = f
+    out = list(factors)
+    with ALERT_LOCK:
+        held = mem["held"]
+        for key, f in top.items():
+            h = held.get(key)
+            if h is None or f["level"] >= h["level"] or now - h["seen"] > ALERT_EASE:
+                held[key] = {"level": f["level"], "title": f["title"], "extra": f["extra"], "seen": now}
+        for key, h in list(held.items()):
+            if now - h["seen"] > ALERT_EASE:
+                del held[key]
+            elif key not in top or top[key]["level"] < h["level"]:
+                out = [f for f in out if f["key"] != key]
+                out.append({"level": h["level"], "key": key, "extra": h["extra"], "easing": True,
+                            "title": "%s (until %s)" % (h["title"], ago_words(now - h["seen"]))})
+    return out
+
+
+def assess(s, home, mem=None, now=None):
+    """Where the household stands, LOW (1) to CRITICAL (5), why, and what to do. mem: the last look (ALERT_MEM), so
+    readings and the level are slow to come down (1.28.0); now: the time, for tests."""
+    mem = ALERT_MEM if mem is None else mem
+    now = time.time() if now is None else now
     factors = []
 
     def add(level, key, title, extra=None):
@@ -11299,8 +11674,16 @@ def assess(s, home):
         elif src == "space":
             add(2, "space_storm", title)
 
-    # Home sensors.
+    # Home sensors. A reading past a line holds until it's a degree back (5 for humidity, PM2.5 and the battery).
     r = home.get("readings") or {}
+    with ALERT_LOCK:
+        was = dict(mem["band"])
+    bands = {}
+
+    def reading(name, v, steps, margin, how):
+        bands[name] = band(v, steps, was.get(name, 0), margin, how)
+        return bands[name]
+
     for role, lvl in (("gas_alarm", 5), ("smoke_alarm", 5), ("leak", 3)):
         for x in r.get(role, []):
             if alarm_on(x):
@@ -11308,22 +11691,22 @@ def assess(s, home):
     temps = [v for v in (number(x) for x in r.get("indoor_temp", [])) if v is not None]
     if temps:
         lo, hi = min(temps), max(temps)
-        for limit, lvl in ((9, 4), (12, 3), (16, 2), (18, 1)):
-            if lo < limit:
-                add(lvl, "cold_indoor" if lvl > 1 else "cool_indoor", "Coldest room %s°C" % _f(lo))
-                break
-        for limit, lvl in ((33, 4), (30, 3), (27, 2)):
-            if hi >= limit:
-                add(lvl, "hot_indoor", "Warmest room %s°C" % _f(hi))
-                break
+        lvl = reading("cold_in", lo, ((9, 4), (12, 3), (16, 2), (18, 1)), 1, "<")
+        if lvl:
+            add(lvl, "cold_indoor" if lvl > 1 else "cool_indoor", "Coldest room %s°C" % _f(lo))
+        lvl = reading("hot_in", hi, ((33, 4), (30, 3), (27, 2)), 1, ">=")
+        if lvl:
+            add(lvl, "hot_indoor", "Warmest room %s°C" % _f(hi))
     out = number((r.get("outdoor_temp") or [None])[0])
     if out is not None:
-        if out <= -5:
-            add(3 if out <= -10 else 2, "freezing_out", "%s°C outside" % _f(out))
-        elif out >= 30:
-            add(3 if out >= 35 else 2, "hot_out", "%s°C outside" % _f(out))
+        lvl = reading("cold_out", out, ((-10, 3), (-5, 2)), 1, "<=")
+        if lvl:
+            add(lvl, "freezing_out", "%s°C outside" % _f(out))
+        lvl = reading("hot_out", out, ((35, 3), (30, 2)), 1, ">=")
+        if lvl:
+            add(lvl, "hot_out", "%s°C outside" % _f(out))
     hums = [v for v in (number(x) for x in r.get("humidity", [])) if v is not None]
-    if hums and max(hums) >= 80:
+    if hums and reading("damp", max(hums), ((80, 2),), 5, ">="):
         add(2, "damp", "Humidity %s%% indoors" % _f(max(hums)))
     off = power_is_off((r.get("power") or [None])[0])
     if off:
@@ -11340,17 +11723,19 @@ def assess(s, home):
         else:
             add(3, "power_cut", "Power cut %s" % length)
         batt = number((r.get("battery") or [None])[0])
-        if batt is not None and batt < 20:
+        if batt is not None and reading("battery", batt, ((20, 4),), 5, "<"):
             add(4, "battery_low", "Backup battery at %d%%" % int(batt))
     net = (r.get("internet") or [None])[0]
     if net and net["ok"] and str(net["state"]).lower() == "off":
         add(2, "internet_down", "Internet down")
     pm = number((r.get("air") or [None])[0])
     if pm is not None:
-        for limit, lvl in ((75, 4), (55, 3), (35, 2)):
-            if pm >= limit:
-                add(lvl, "poor_air", "Air pollution: PM2.5 at %s µg/m³" % _f(pm))
-                break
+        lvl = reading("pm", pm, ((75, 4), (55, 3), (35, 2)), 5, ">=")
+        if lvl:
+            add(lvl, "poor_air", "Air pollution: PM2.5 at %s µg/m³" % _f(pm))
+    with ALERT_LOCK:
+        mem["band"] = bands   # a reading not taken this time starts afresh next time
+    factors[:] = ease(factors, mem, now)
 
     # The stores.
     weak = []
@@ -11403,7 +11788,8 @@ def assess(s, home):
             "escalated": escalated,
             # Why it went up to SEVERE: "the stores wouldn't last 3 days", "there's little backup power or light"...
             "escalated_why": " and ".join(weak) if escalated else "",
-            "reasons": [{"level": f["level"], "name": LEVELS[f["level"] - 1][0], "title": f["title"], "key": f["key"]}
+            "reasons": [dict({"level": f["level"], "name": LEVELS[f["level"] - 1][0], "title": f["title"], "key": f["key"]},
+                             **({"easing": True} if f.get("easing") else {}))   # 1.28.0: gone, but counted a while
                         for f in reasons],
             "notes": [f["title"] for f in factors if f["level"] < 2],
             "guidance": guidance[:12],
